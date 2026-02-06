@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2025-2026 CEMAXECUTER LLC
 """
-Generate CurveZMQ keypair for ice9-bluetooth-sniffer encrypted streaming.
+Generate CurveZMQ keypair for blue-dragon encrypted streaming.
 
 Creates a server key file (for the sniffer) and prints the server public
 key that subscribers need.
@@ -49,7 +49,7 @@ def main():
 
     # Write server key file (secret + public, Z85-encoded)
     with open(args.keyfile, "w") as f:
-        f.write(f"# CurveZMQ server keypair for ice9-bluetooth-sniffer\n")
+        f.write(f"# CurveZMQ server keypair for blue-dragon\n")
         f.write(f"# Keep this file secret!\n")
         f.write(f"secret_key={secret_key.decode()}\n")
         f.write(f"public_key={public_key.decode()}\n")

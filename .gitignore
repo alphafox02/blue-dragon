@@ -1,2 +1,22 @@
 /target
 Cargo.lock
+
+# CurveZMQ key files
+*.key
+*.key.pub
+
+# Capture files
+*.pcap
+*.pcapng
+
+# IQ recordings
+*.ci8
+*.ci16
+*.cf32
+
+# SQLite databases
+*.db
+*.sqlite
+
+# Environment / credentials
+.env

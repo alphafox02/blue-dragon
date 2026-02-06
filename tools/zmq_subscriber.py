@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2025-2026 CEMAXECUTER LLC
 """
-ZMQ subscriber test harness for ice9-bluetooth-sniffer.
+ZMQ subscriber test harness for blue-dragon.
 
 Binds a SUB socket and receives BLE/BT packets as PCAP records from
 connecting sensors. Can display live packet info, write to a PCAP file,
@@ -209,7 +209,7 @@ def parse_server_pubkey(path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ZMQ subscriber for ice9-bluetooth-sniffer")
+        description="ZMQ subscriber for blue-dragon")
     parser.add_argument("endpoints", nargs="+",
                         help="ZMQ endpoints (e.g. tcp://localhost:5555)")
     parser.add_argument("-w", "--write", metavar="FILE",

@@ -197,7 +197,7 @@ pub fn list_devices() -> Result<Vec<UsrpInfo>, String> {
     }
 }
 
-/// Extract serial number from interface string like "usrp-B210-FCO2P05"
+/// Extract serial number from interface string like "usrp-B210-SERIAL"
 fn parse_serial(iface: &str) -> Option<String> {
     let parts: Vec<&str> = iface.splitn(3, '-').collect();
     if parts.len() == 3 && parts[0] == "usrp" {
