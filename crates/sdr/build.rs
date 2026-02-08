@@ -20,5 +20,11 @@ fn main() {
     #[cfg(feature = "soapysdr")]
     {
         println!("cargo:rustc-link-lib=SoapySDR");
+
+        // Compile C shim for SoapySDR (works around FFI ABI issue with SoapyUHD)
+        cc::Build::new()
+            .file("csrc/soapy_shim.c")
+            .include("/usr/include")
+            .compile("soapy_shim");
     }
 }

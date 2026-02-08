@@ -8,6 +8,9 @@ license.workspace = true
 crossbeam.workspace = true
 log.workspace = true
 
+[build-dependencies]
+cc = "1"
+
 [features]
 default = ["usrp"]
 hackrf = []

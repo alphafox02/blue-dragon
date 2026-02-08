@@ -3,118 +3,42 @@
 use crossbeam::channel::Sender;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_double, c_int, c_void};
-use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::{SampleBuf, SdrSource};
 
-type SoapyDevice = c_void;
-type SoapyStream = c_void;
+// All SoapySDR calls go through the C shim (csrc/soapy_shim.c) to avoid
+// an ABI incompatibility between Rust FFI and the SoapyUHD module that
+// causes segfaults in readStream when setupStream is called via Rust FFI.
+extern "C" {
+    fn soapy_shim_make(args: *const c_char) -> *mut c_void;
+    fn soapy_shim_unmake(dev: *mut c_void);
+    fn soapy_shim_set_sample_rate(dev: *mut c_void, rate: c_double) -> c_int;
+    fn soapy_shim_set_frequency(dev: *mut c_void, freq: c_double) -> c_int;
+    fn soapy_shim_set_gain(dev: *mut c_void, gain: c_double) -> c_int;
+    fn soapy_shim_set_bandwidth(dev: *mut c_void, bw: c_double) -> c_int;
+    fn soapy_shim_setup_stream(dev: *mut c_void, format: *const c_char) -> *mut c_void;
+    fn soapy_shim_activate(dev: *mut c_void, stream: *mut c_void) -> c_int;
+    fn soapy_shim_deactivate(dev: *mut c_void, stream: *mut c_void);
+    fn soapy_shim_close(dev: *mut c_void, stream: *mut c_void);
+    fn soapy_shim_get_mtu(dev: *mut c_void, stream: *mut c_void) -> usize;
+    fn soapy_shim_read(
+        dev: *mut c_void,
+        stream: *mut c_void,
+        buf: *mut c_void,
+        num_samples: usize,
+    ) -> c_int;
+    fn soapy_shim_get_full_scale(dev: *mut c_void) -> c_double;
+    fn soapy_shim_enumerate(
+        labels: *mut [c_char; 64],
+        drivers: *mut [c_char; 32],
+        max_devices: usize,
+    ) -> usize;
+}
 
-// SoapySDR constants
-const SOAPY_SDR_RX: c_int = 0;
 const SOAPY_SDR_TIMEOUT: c_int = -1;
 const SOAPY_SDR_OVERFLOW: c_int = -4;
-
-// SoapySDRKwargs
-#[repr(C)]
-struct SoapyKwargs {
-    size: usize,
-    keys: *mut *mut c_char,
-    vals: *mut *mut c_char,
-}
-
-extern "C" {
-    fn SoapySDRDevice_enumerate(args: *const SoapyKwargs, length: *mut usize) -> *mut SoapyKwargs;
-    fn SoapySDRDevice_make(args: *const SoapyKwargs) -> *mut SoapyDevice;
-    fn SoapySDRDevice_unmake(device: *mut SoapyDevice) -> c_int;
-    fn SoapySDRDevice_setSampleRate(
-        dev: *mut SoapyDevice,
-        direction: c_int,
-        channel: usize,
-        rate: c_double,
-    ) -> c_int;
-    fn SoapySDRDevice_setFrequency(
-        dev: *mut SoapyDevice,
-        direction: c_int,
-        channel: usize,
-        frequency: c_double,
-        args: *const SoapyKwargs,
-    ) -> c_int;
-    fn SoapySDRDevice_setGain(
-        dev: *mut SoapyDevice,
-        direction: c_int,
-        channel: usize,
-        value: c_double,
-    ) -> c_int;
-    fn SoapySDRDevice_setBandwidth(
-        dev: *mut SoapyDevice,
-        direction: c_int,
-        channel: usize,
-        bw: c_double,
-    ) -> c_int;
-    fn SoapySDRDevice_setupStream(
-        dev: *mut SoapyDevice,
-        direction: c_int,
-        format: *const c_char,
-        channels: *const usize,
-        num_chans: usize,
-        args: *const SoapyKwargs,
-    ) -> *mut SoapyStream;
-    fn SoapySDRDevice_activateStream(
-        dev: *mut SoapyDevice,
-        stream: *mut SoapyStream,
-        flags: c_int,
-        time_ns: i64,
-        num_elems: usize,
-    ) -> c_int;
-    fn SoapySDRDevice_deactivateStream(
-        dev: *mut SoapyDevice,
-        stream: *mut SoapyStream,
-        flags: c_int,
-        time_ns: i64,
-    ) -> c_int;
-    fn SoapySDRDevice_closeStream(
-        dev: *mut SoapyDevice,
-        stream: *mut SoapyStream,
-    ) -> c_int;
-    fn SoapySDRDevice_readStream(
-        dev: *mut SoapyDevice,
-        stream: *mut SoapyStream,
-        buffs: *const *mut c_void,
-        num_elems: usize,
-        flags: *mut c_int,
-        time_ns: *mut i64,
-        timeout_us: i64,
-    ) -> c_int;
-    fn SoapySDRDevice_getStreamMTU(
-        dev: *mut SoapyDevice,
-        stream: *mut SoapyStream,
-    ) -> usize;
-    fn SoapySDRDevice_getStreamFormats(
-        dev: *mut SoapyDevice,
-        direction: c_int,
-        channel: usize,
-        length: *mut usize,
-    ) -> *mut *mut c_char;
-    fn SoapySDRDevice_lastError() -> *const c_char;
-    fn SoapySDRKwargsList_clear(info: *mut SoapyKwargs, length: usize);
-    fn SoapySDRStrings_clear(strings: *mut *mut c_char, length: usize);
-}
-
-fn last_error() -> String {
-    unsafe {
-        let p = SoapySDRDevice_lastError();
-        if p.is_null() {
-            "unknown error".to_string()
-        } else {
-            std::ffi::CStr::from_ptr(p)
-                .to_string_lossy()
-                .to_string()
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct SoapyInfo {
@@ -124,37 +48,25 @@ pub struct SoapyInfo {
 }
 
 pub fn list_devices() -> Result<Vec<SoapyInfo>, String> {
-    let mut length: usize = 0;
-    let results = unsafe { SoapySDRDevice_enumerate(ptr::null(), &mut length) };
+    const MAX_DEVS: usize = 16;
+    let mut labels = [[0 as c_char; 64]; MAX_DEVS];
+    let mut drivers = [[0 as c_char; 32]; MAX_DEVS];
 
-    if results.is_null() || length == 0 {
-        return Ok(Vec::new());
-    }
+    let count =
+        unsafe { soapy_shim_enumerate(labels.as_mut_ptr(), drivers.as_mut_ptr(), MAX_DEVS) };
 
     let mut devices = Vec::new();
-    for i in 0..length {
-        let kw = unsafe { &*results.add(i) };
-        let mut driver = String::new();
-        let mut label = String::new();
-
-        for j in 0..kw.size {
-            let key = unsafe {
-                std::ffi::CStr::from_ptr(*kw.keys.add(j))
-                    .to_string_lossy()
-                    .to_string()
-            };
-            let val = unsafe {
-                std::ffi::CStr::from_ptr(*kw.vals.add(j))
-                    .to_string_lossy()
-                    .to_string()
-            };
-            match key.as_str() {
-                "driver" => driver = val,
-                "label" => label = val,
-                _ => {}
-            }
-        }
-
+    for i in 0..count {
+        let label = unsafe {
+            std::ffi::CStr::from_ptr(labels[i].as_ptr())
+                .to_string_lossy()
+                .to_string()
+        };
+        let driver = unsafe {
+            std::ffi::CStr::from_ptr(drivers[i].as_ptr())
+                .to_string_lossy()
+                .to_string()
+        };
         devices.push(SoapyInfo {
             index: i,
             driver,
@@ -162,12 +74,10 @@ pub fn list_devices() -> Result<Vec<SoapyInfo>, String> {
         });
     }
 
-    unsafe { SoapySDRKwargsList_clear(results, length) };
     Ok(devices)
 }
 
 fn parse_index(iface: &str) -> Option<usize> {
-    // "soapy-0" -> 0
     if iface.starts_with("soapy-") {
         iface[6..].parse().ok()
     } else {
@@ -175,31 +85,97 @@ fn parse_index(iface: &str) -> Option<usize> {
     }
 }
 
-/// Check if device supports CS8 format
-fn supports_cs8(dev: *mut SoapyDevice) -> bool {
-    let mut length: usize = 0;
-    let formats =
-        unsafe { SoapySDRDevice_getStreamFormats(dev, SOAPY_SDR_RX, 0, &mut length) };
+/// Open a SoapySDR device via the C shim. Returns (dev, stream, use_cs8, mtu, cs16_shift).
+/// cs16_shift is the right-shift amount to convert CS16 samples to i8 range.
+fn open_device(
+    index: usize,
+    sample_rate: u32,
+    center_freq: u64,
+    gain: f64,
+) -> Result<(*mut c_void, *mut c_void, bool, usize, u32), String> {
+    // Enumerate to get the driver name for this index
+    const MAX_DEVS: usize = 16;
+    let mut labels = [[0 as c_char; 64]; MAX_DEVS];
+    let mut drivers = [[0 as c_char; 32]; MAX_DEVS];
+    let count =
+        unsafe { soapy_shim_enumerate(labels.as_mut_ptr(), drivers.as_mut_ptr(), MAX_DEVS) };
 
-    if formats.is_null() || length == 0 {
-        return false;
+    if index >= count {
+        return Err(format!(
+            "SoapySDR device index {} not found ({} devices)",
+            index, count
+        ));
     }
 
-    let mut found = false;
-    for i in 0..length {
-        let fmt = unsafe {
-            std::ffi::CStr::from_ptr(*formats.add(i))
-                .to_string_lossy()
-                .to_string()
-        };
-        if fmt == "CS8" {
-            found = true;
-            break;
+    let driver = unsafe {
+        std::ffi::CStr::from_ptr(drivers[index].as_ptr())
+            .to_string_lossy()
+            .to_string()
+    };
+
+    let args = CString::new(format!("driver={}", driver))
+        .map_err(|e| format!("CString error: {}", e))?;
+    let dev = unsafe { soapy_shim_make(args.as_ptr()) };
+    if dev.is_null() {
+        return Err("SoapySDR make failed".to_string());
+    }
+
+    unsafe {
+        soapy_shim_set_sample_rate(dev, sample_rate as f64);
+        soapy_shim_set_frequency(dev, center_freq as f64);
+        soapy_shim_set_gain(dev, gain);
+        soapy_shim_set_bandwidth(dev, sample_rate as f64);
+    }
+
+    // Query native full-scale to compute CS16->i8 shift amount.
+    // bladeRF SC16_Q11: fullScale=2048, shift=4. USRP int16: fullScale=32768, shift=8.
+    let full_scale = unsafe { soapy_shim_get_full_scale(dev) };
+    let cs16_shift = (full_scale.log2() as u32).saturating_sub(7);
+
+    // Try CS16 first (native for most devices), fall back to CS8
+    let cs16 = CString::new("CS16").unwrap();
+    let cs8 = CString::new("CS8").unwrap();
+
+    let (stream, use_cs8) = unsafe {
+        let s = soapy_shim_setup_stream(dev, cs16.as_ptr());
+        if !s.is_null() {
+            (s, false)
+        } else {
+            let s = soapy_shim_setup_stream(dev, cs8.as_ptr());
+            if !s.is_null() {
+                (s, true)
+            } else {
+                soapy_shim_unmake(dev);
+                return Err("SoapySDR setupStream failed (tried CS16, CS8)".to_string());
+            }
         }
+    };
+
+    let mtu = unsafe { soapy_shim_get_mtu(dev, stream) };
+    let mtu = if mtu == 0 || mtu > 262144 { 65536 } else { mtu };
+
+    let r = unsafe { soapy_shim_activate(dev, stream) };
+    if r != 0 {
+        unsafe {
+            soapy_shim_close(dev, stream);
+            soapy_shim_unmake(dev);
+        }
+        return Err("SoapySDR activateStream failed".to_string());
     }
 
-    unsafe { SoapySDRStrings_clear(formats, length) };
-    found
+    log::info!(
+        "SoapySDR open (index={}, driver={}, {} MHz, {} MS/s, gain={}, {}, mtu={}, fullScale={})",
+        index,
+        driver,
+        center_freq / 1_000_000,
+        sample_rate / 1_000_000,
+        gain,
+        if use_cs8 { "CS8" } else { "CS16" },
+        mtu,
+        full_scale,
+    );
+
+    Ok((dev, stream, use_cs8, mtu, cs16_shift))
 }
 
 pub struct SoapySource {
@@ -242,99 +218,14 @@ impl SdrSource for SoapySource {
     fn start(&mut self, tx: Sender<SampleBuf>) -> Result<(), String> {
         self.running.store(true, Ordering::SeqCst);
 
-        let mut length: usize = 0;
-        let results = unsafe { SoapySDRDevice_enumerate(ptr::null(), &mut length) };
-        if results.is_null() || self.index >= length {
-            if !results.is_null() {
-                unsafe { SoapySDRKwargsList_clear(results, length) };
-            }
-            return Err(format!(
-                "SoapySDR device index {} not found ({} devices)",
-                self.index, length
-            ));
-        }
-
-        let dev = unsafe { SoapySDRDevice_make(results.add(self.index)) };
-        unsafe { SoapySDRKwargsList_clear(results, length) };
-
-        if dev.is_null() {
-            return Err(format!("SoapySDR make failed: {}", last_error()));
-        }
-
-        unsafe {
-            SoapySDRDevice_setSampleRate(dev, SOAPY_SDR_RX, 0, self.sample_rate as f64);
-            SoapySDRDevice_setFrequency(
-                dev,
-                SOAPY_SDR_RX,
-                0,
-                self.center_freq as f64,
-                ptr::null(),
-            );
-            let _ = SoapySDRDevice_setGain(dev, SOAPY_SDR_RX, 0, self.gain);
-            let _ = SoapySDRDevice_setBandwidth(dev, SOAPY_SDR_RX, 0, self.sample_rate as f64);
-        }
-
-        let use_cs8 = supports_cs8(dev);
-        let fmt_str = if use_cs8 {
-            CString::new("CS8").unwrap()
-        } else {
-            CString::new("CS16").unwrap()
-        };
-
-        let channel: usize = 0;
-        let stream = unsafe {
-            SoapySDRDevice_setupStream(
-                dev,
-                SOAPY_SDR_RX,
-                fmt_str.as_ptr(),
-                &channel,
-                1,
-                ptr::null(),
-            )
-        };
-        if stream.is_null() {
-            unsafe { SoapySDRDevice_unmake(dev) };
-            return Err(format!("SoapySDR setupStream failed: {}", last_error()));
-        }
-
-        let mtu = unsafe { SoapySDRDevice_getStreamMTU(dev, stream) };
-        let mtu = if mtu == 0 { 65536 } else { mtu };
-
-        let r = unsafe { SoapySDRDevice_activateStream(dev, stream, 0, 0, 0) };
-        if r != 0 {
-            unsafe {
-                SoapySDRDevice_closeStream(dev, stream);
-                SoapySDRDevice_unmake(dev);
-            }
-            return Err(format!("SoapySDR activateStream failed: {}", last_error()));
-        }
-
-        log::info!(
-            "SoapySDR streaming (index={}, {} MHz, {} MS/s, gain={}, {})",
-            self.index,
-            self.center_freq / 1_000_000,
-            self.sample_rate / 1_000_000,
-            self.gain,
-            if use_cs8 { "CS8" } else { "CS16" },
-        );
+        let (dev, stream, use_cs8, mtu, _cs16_shift) =
+            open_device(self.index, self.sample_rate, self.center_freq, self.gain)?;
 
         if use_cs8 {
             let mut cs8_buf = vec![0i8; mtu * 2];
             while self.running.load(Ordering::SeqCst) {
-                let mut flags: c_int = 0;
-                let mut time_ns: i64 = 0;
-                let mut buf_ptr = cs8_buf.as_mut_ptr() as *mut c_void;
-
                 let ret = unsafe {
-                    SoapySDRDevice_readStream(
-                        dev,
-                        stream,
-                        &mut buf_ptr,
-                        mtu,
-                        &mut flags,
-                        &mut time_ns,
-                        100_000,
-                    )
+                    soapy_shim_read(dev, stream, cs8_buf.as_mut_ptr() as *mut c_void, mtu)
                 };
 
                 if ret == SOAPY_SDR_TIMEOUT || ret == SOAPY_SDR_OVERFLOW {
@@ -358,20 +249,8 @@ impl SdrSource for SoapySource {
         } else {
             let mut cs16_buf = vec![0i16; mtu * 2];
             while self.running.load(Ordering::SeqCst) {
-                let mut flags: c_int = 0;
-                let mut time_ns: i64 = 0;
-                let mut buf_ptr = cs16_buf.as_mut_ptr() as *mut c_void;
-
                 let ret = unsafe {
-                    SoapySDRDevice_readStream(
-                        dev,
-                        stream,
-                        &mut buf_ptr,
-                        mtu,
-                        &mut flags,
-                        &mut time_ns,
-                        100_000,
-                    )
+                    soapy_shim_read(dev, stream, cs16_buf.as_mut_ptr() as *mut c_void, mtu)
                 };
 
                 if ret == SOAPY_SDR_TIMEOUT || ret == SOAPY_SDR_OVERFLOW {
@@ -383,10 +262,7 @@ impl SdrSource for SoapySource {
                 }
 
                 let num_samples = ret as usize;
-                let mut data = Vec::with_capacity(num_samples * 2);
-                for i in 0..num_samples * 2 {
-                    data.push(cs16_buf[i]);
-                }
+                let data = cs16_buf[..num_samples * 2].to_vec();
 
                 if tx.send(SampleBuf { data, num_samples }).is_err() {
                     break;
@@ -395,9 +271,9 @@ impl SdrSource for SoapySource {
         }
 
         unsafe {
-            SoapySDRDevice_deactivateStream(dev, stream, 0, 0);
-            SoapySDRDevice_closeStream(dev, stream);
-            SoapySDRDevice_unmake(dev);
+            soapy_shim_deactivate(dev, stream);
+            soapy_shim_close(dev, stream);
+            soapy_shim_unmake(dev);
         }
 
         log::info!("SoapySDR streaming stopped");
@@ -419,11 +295,12 @@ impl SdrSource for SoapySource {
 
 /// Direct SoapySDR handle for zero-copy recv_into path.
 pub struct SoapyHandle {
-    dev: *mut SoapyDevice,
-    stream: *mut SoapyStream,
+    dev: *mut c_void,
+    stream: *mut c_void,
     use_cs8: bool,
     mtu: usize,
     cs16_buf: Vec<i16>,
+    cs16_shift: u32,
     pub running: Arc<AtomicBool>,
     overflow_count: u64,
 }
@@ -440,63 +317,8 @@ impl SoapyHandle {
         let index = parse_index(iface)
             .ok_or_else(|| format!("invalid SoapySDR interface: '{}'", iface))?;
 
-        let mut length: usize = 0;
-        let results = unsafe { SoapySDRDevice_enumerate(ptr::null(), &mut length) };
-        if results.is_null() || index >= length {
-            if !results.is_null() {
-                unsafe { SoapySDRKwargsList_clear(results, length) };
-            }
-            return Err(format!("SoapySDR device index {} not found", index));
-        }
-
-        let dev = unsafe { SoapySDRDevice_make(results.add(index)) };
-        unsafe { SoapySDRKwargsList_clear(results, length) };
-
-        if dev.is_null() {
-            return Err(format!("SoapySDR make failed: {}", last_error()));
-        }
-
-        unsafe {
-            SoapySDRDevice_setSampleRate(dev, SOAPY_SDR_RX, 0, sample_rate as f64);
-            SoapySDRDevice_setFrequency(dev, SOAPY_SDR_RX, 0, center_freq as f64, ptr::null());
-            let _ = SoapySDRDevice_setGain(dev, SOAPY_SDR_RX, 0, gain);
-            let _ = SoapySDRDevice_setBandwidth(dev, SOAPY_SDR_RX, 0, sample_rate as f64);
-        }
-
-        let use_cs8 = supports_cs8(dev);
-        let fmt_str = if use_cs8 {
-            CString::new("CS8").unwrap()
-        } else {
-            CString::new("CS16").unwrap()
-        };
-
-        let channel: usize = 0;
-        let stream = unsafe {
-            SoapySDRDevice_setupStream(
-                dev,
-                SOAPY_SDR_RX,
-                fmt_str.as_ptr(),
-                &channel,
-                1,
-                ptr::null(),
-            )
-        };
-        if stream.is_null() {
-            unsafe { SoapySDRDevice_unmake(dev) };
-            return Err(format!("SoapySDR setupStream failed: {}", last_error()));
-        }
-
-        let mtu = unsafe { SoapySDRDevice_getStreamMTU(dev, stream) };
-        let mtu = if mtu == 0 { 65536 } else { mtu };
-
-        let r = unsafe { SoapySDRDevice_activateStream(dev, stream, 0, 0, 0) };
-        if r != 0 {
-            unsafe {
-                SoapySDRDevice_closeStream(dev, stream);
-                SoapySDRDevice_unmake(dev);
-            }
-            return Err(format!("SoapySDR activateStream failed: {}", last_error()));
-        }
+        let (dev, stream, use_cs8, mtu, cs16_shift) =
+            open_device(index, sample_rate, center_freq, gain)?;
 
         let cs16_buf = if !use_cs8 {
             vec![0i16; mtu * 2]
@@ -510,6 +332,7 @@ impl SoapyHandle {
             use_cs8,
             mtu,
             cs16_buf,
+            cs16_shift,
             running: Arc::new(AtomicBool::new(true)),
             overflow_count: 0,
         })
@@ -517,20 +340,14 @@ impl SoapyHandle {
 
     pub fn recv_into(&mut self, buf: &mut [i8]) -> usize {
         let max_samps = (buf.len() / 2).min(self.mtu);
-        let mut flags: c_int = 0;
-        let mut time_ns: i64 = 0;
 
         if self.use_cs8 {
-            let mut buf_ptr = buf.as_mut_ptr() as *mut c_void;
             let ret = unsafe {
-                SoapySDRDevice_readStream(
+                soapy_shim_read(
                     self.dev,
                     self.stream,
-                    &mut buf_ptr,
+                    buf.as_mut_ptr() as *mut c_void,
                     max_samps,
-                    &mut flags,
-                    &mut time_ns,
-                    100_000,
                 )
             };
 
@@ -543,16 +360,12 @@ impl SoapyHandle {
             }
             ret as usize
         } else {
-            let mut buf_ptr = self.cs16_buf.as_mut_ptr() as *mut c_void;
             let ret = unsafe {
-                SoapySDRDevice_readStream(
+                soapy_shim_read(
                     self.dev,
                     self.stream,
-                    &mut buf_ptr,
+                    self.cs16_buf.as_mut_ptr() as *mut c_void,
                     max_samps,
-                    &mut flags,
-                    &mut time_ns,
-                    100_000,
                 )
             };
 
@@ -565,17 +378,17 @@ impl SoapyHandle {
             }
 
             let n = ret as usize;
+            let shift = self.cs16_shift;
             for i in 0..n * 2 {
-                buf[i] = (self.cs16_buf[i] >> 8) as i8;
+                buf[i] = (self.cs16_buf[i] >> shift) as i8;
             }
             n
         }
     }
 
-    /// Set RX gain at runtime (thread-safe FFI call).
     pub fn set_gain(&self, gain: f64) {
         unsafe {
-            SoapySDRDevice_setGain(self.dev, SOAPY_SDR_RX, 0, gain);
+            soapy_shim_set_gain(self.dev, gain);
         }
     }
 
@@ -591,9 +404,9 @@ impl SoapyHandle {
 impl Drop for SoapyHandle {
     fn drop(&mut self) {
         unsafe {
-            SoapySDRDevice_deactivateStream(self.dev, self.stream, 0, 0);
-            SoapySDRDevice_closeStream(self.dev, self.stream);
-            SoapySDRDevice_unmake(self.dev);
+            soapy_shim_deactivate(self.dev, self.stream);
+            soapy_shim_close(self.dev, self.stream);
+            soapy_shim_unmake(self.dev);
         }
     }
 }
