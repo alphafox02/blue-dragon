@@ -169,18 +169,19 @@ impl SdrSource for BladerfSource {
                 return Err(format!("bladerf_open failed: {}", r));
             }
 
-            // Try oversample mode (SC8_Q7)
-            let use_sc8 = bladerf_enable_feature(dev, BLADERF_FEATURE_OVERSAMPLE, true) == 0;
+            // Only use oversample (SC8_Q7) when sample rate exceeds normal mode max (61.44 MHz)
+            let use_sc8 = if self.sample_rate > 61_440_000 {
+                bladerf_enable_feature(dev, BLADERF_FEATURE_OVERSAMPLE, true) == 0
+            } else {
+                false
+            };
             let format = if use_sc8 {
                 BLADERF_FORMAT_SC8_Q7
             } else {
-                BLADERF_FORMAT_SC16_Q11
-            };
-
-            if !use_sc8 {
                 let bw = self.sample_rate.min(56_000_000);
                 bladerf_set_bandwidth(dev, BLADERF_CHANNEL_RX_0, bw, ptr::null_mut());
-            }
+                BLADERF_FORMAT_SC16_Q11
+            };
             bladerf_set_frequency(dev, BLADERF_CHANNEL_RX_0, self.center_freq);
             bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_MGC);
             bladerf_set_gain(dev, BLADERF_CHANNEL_RX_0, self.gain);
@@ -321,18 +322,19 @@ impl BladerfHandle {
                 return Err(format!("bladerf_open failed: {}", r));
             }
 
-            let use_sc8 = bladerf_enable_feature(dev, BLADERF_FEATURE_OVERSAMPLE, true) == 0;
+            // Only use oversample (SC8_Q7) when sample rate exceeds normal mode max (61.44 MHz)
+            let use_sc8 = if sample_rate > 61_440_000 {
+                bladerf_enable_feature(dev, BLADERF_FEATURE_OVERSAMPLE, true) == 0
+            } else {
+                false
+            };
             let format = if use_sc8 {
                 BLADERF_FORMAT_SC8_Q7
             } else {
-                BLADERF_FORMAT_SC16_Q11
-            };
-
-            // Only set bandwidth when NOT in oversample mode
-            if !use_sc8 {
                 let bw = sample_rate.min(56_000_000);
                 bladerf_set_bandwidth(dev, BLADERF_CHANNEL_RX_0, bw, ptr::null_mut());
-            }
+                BLADERF_FORMAT_SC16_Q11
+            };
             bladerf_set_frequency(dev, BLADERF_CHANNEL_RX_0, center_freq);
             bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_MGC);
             bladerf_set_gain(dev, BLADERF_CHANNEL_RX_0, gain);
