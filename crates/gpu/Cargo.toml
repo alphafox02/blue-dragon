@@ -1,0 +1,9 @@
+[package]
+name = "bt-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+num-complex.workspace = true
+log.workspace = true

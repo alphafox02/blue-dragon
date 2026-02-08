@@ -1,0 +1,18 @@
+[package]
+name = "bt-output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+byteorder.workspace = true
+bt-protocol = { path = "../protocol" }
+
+[features]
+default = []
+zmq = ["dep:zmq"]
+gps = []
+
+[dependencies.zmq]
+version = "0.10"
+optional = true

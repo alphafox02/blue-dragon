@@ -1,0 +1,20 @@
+[package]
+name = "bluetooth-sniffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bluetooth-sniffer"
+path = "src/main.rs"
+
+[dependencies]
+bt-protocol = { path = "../protocol" }
+bt-dsp = { path = "../dsp" }
+bt-output = { path = "../output" }
+bt-sdr = { path = "../sdr" }
+crossbeam.workspace = true
+num-complex.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true

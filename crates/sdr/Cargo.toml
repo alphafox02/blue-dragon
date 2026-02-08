@@ -1,0 +1,16 @@
+[package]
+name = "bt-sdr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam.workspace = true
+log.workspace = true
+
+[features]
+default = ["usrp"]
+hackrf = []
+bladerf = []
+usrp = []
+soapysdr = []

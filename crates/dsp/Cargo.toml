@@ -1,0 +1,11 @@
+[package]
+name = "bt-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+num-complex.workspace = true
+rustfft.workspace = true
+crossbeam.workspace = true
+bt-protocol = { path = "../protocol" }
