@@ -17,7 +17,7 @@ struct Cli {
     #[arg(short = 'f', long)]
     file: Option<PathBuf>,
 
-    /// SDR interface (e.g., usrp-B210-FCO2P05)
+    /// SDR interface (e.g., usrp-B210-SERIAL)
     #[arg(short = 'i', long, alias = "extcap-interface")]
     interface: Option<String>,
 
@@ -76,6 +76,10 @@ struct Cli {
     /// Enable gpsd GPS tagging
     #[arg(long)]
     gpsd: bool,
+
+    /// Enable HCI GATT probing (opt-in active queries via system Bluetooth adapter)
+    #[arg(long)]
+    hci: bool,
 
     /// Verbose output
     #[arg(short = 'v', long)]
@@ -296,7 +300,7 @@ fn main() {
         }
     } else if cli.live {
         let iface = cli.interface.as_deref().unwrap_or_else(|| {
-            eprintln!("error: live mode requires -i <interface> (e.g., -i usrp-B210-FCO2P05)");
+            eprintln!("error: live mode requires -i <interface> (e.g., -i usrp-B210-SERIAL)");
             eprintln!("use --list to see available interfaces");
             std::process::exit(1);
         });
@@ -327,6 +331,7 @@ fn main() {
             cli.zmq_curve_key.as_deref(),
             cli.sensor_id.as_deref(),
             cli.gpsd,
+            cli.hci,
             running,
         ) {
             eprintln!("error: {}", e);

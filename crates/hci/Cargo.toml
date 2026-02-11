@@ -1,0 +1,13 @@
+[package]
+name = "bd-hci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bluer = { version = "0.17", features = ["full"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+futures = "0.3"
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true

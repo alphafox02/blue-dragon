@@ -14,12 +14,14 @@ bd-dsp = { path = "../dsp" }
 bd-output = { path = "../output" }
 bd-sdr = { path = "../sdr" }
 bd-gpu = { path = "../gpu", optional = true }
+bd-hci = { path = "../hci", optional = true }
 crossbeam.workspace = true
 num-complex.workspace = true
 clap.workspace = true
 log.workspace = true
 env_logger.workspace = true
 ctrlc = "3"
+serde_json = { workspace = true, optional = true }
 
 [features]
 default = ["usrp"]
@@ -30,3 +32,4 @@ soapysdr = ["bd-sdr/soapysdr"]
 zmq = ["bd-output/zmq"]
 gps = ["bd-output/gps"]
 gpu = ["dep:bd-gpu"]
+hci = ["dep:bd-hci", "dep:serde_json"]

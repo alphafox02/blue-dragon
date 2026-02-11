@@ -74,6 +74,17 @@ impl ZmqPublisher {
         self.send_raw(&buf, gps);
     }
 
+    /// Publish a GATT result as JSON on the "gatt:" topic.
+    pub fn send_gatt(&self, result: &serde_json::Value) {
+        // Topic frame: "gatt:"
+        let _ = self.socket.send("gatt:", zmq::DONTWAIT | zmq::SNDMORE);
+        if let Some(ref id) = self.sensor_id {
+            let _ = self.socket.send(id.as_bytes(), zmq::DONTWAIT | zmq::SNDMORE);
+        }
+        let json_bytes = result.to_string();
+        let _ = self.socket.send(json_bytes.as_bytes(), zmq::DONTWAIT);
+    }
+
     /// Send raw packet data with optional sensor_id and GPS frames.
     fn send_raw(&self, buf: &[u8], gps: Option<&GpsFix>) {
         if let Some(ref id) = self.sensor_id {

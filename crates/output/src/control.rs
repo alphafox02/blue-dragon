@@ -27,6 +27,10 @@ pub enum ControlCommand {
         channels: Option<u32>,
         req_id: Option<String>,
     },
+    QueryGatt {
+        mac: String,
+        req_id: Option<String>,
+    },
 }
 
 /// Shared state for heartbeat reporting.
@@ -279,6 +283,24 @@ impl ControlClient {
                 };
                 if self.cmd_tx.try_send(command).is_ok() {
                     self.send_response(req_id, "ok", "restarting");
+                } else {
+                    self.send_response(req_id, "error", "command queue full");
+                }
+            }
+            "query_gatt" => {
+                let mac = match root.get("mac").and_then(|m| m.as_str()) {
+                    Some(m) => m.to_string(),
+                    None => {
+                        self.send_response(req_id, "error", "missing mac");
+                        return;
+                    }
+                };
+                let command = ControlCommand::QueryGatt {
+                    mac: mac.clone(),
+                    req_id: req_id.map(|s| s.to_string()),
+                };
+                if self.cmd_tx.try_send(command).is_ok() {
+                    self.send_response(req_id, "ok", &format!("GATT query queued for {}", mac));
                 } else {
                     self.send_response(req_id, "error", "command queue full");
                 }
