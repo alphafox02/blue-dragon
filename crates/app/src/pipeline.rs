@@ -12,7 +12,7 @@ use num_complex::Complex32;
 
 use bd_dsp::burst::BurstCatcher;
 use bd_dsp::fft::BatchFft;
-use bd_dsp::fsk::FskDemod;
+use bd_dsp::fsk::{self, FskDemod};
 use bd_dsp::pfb::PfbChannelizer;
 use bd_dsp::window;
 use bd_output::pcap::PcapWriter;
@@ -87,7 +87,8 @@ pub fn run_file(
     );
 
     // Initialize protocol subsystems
-    let aa_correlator = AaCorrelator::new();
+    let aa_correlator = AaCorrelator::new();       // LE 1M: SPS=2
+    let aa_correlator_2m = AaCorrelator::with_sps(1); // LE 2M: SPS=1
     let syndrome_map = SyndromeMap::new(1);
     let mut conn_table = ConnectionTable::new();
 
@@ -234,7 +235,7 @@ pub fn run_file(
                                 let _ = writer.write_bt(&bt_pkt, None);
                             }
                         } else {
-                            // Try BLE preamble-first detection
+                            // Try BLE LE 1M preamble-first detection
                             let mut pkt = ble::ble_burst(
                                 &fsk_result.bits,
                                 freq,
@@ -243,7 +244,7 @@ pub fn run_file(
                                 |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
                             );
 
-                            // Fall back to AA correlator
+                            // Fall back to LE 1M AA correlator
                             if pkt.is_none() {
                                 pkt = aa_correlator.correlate(
                                     &fsk_result.demod,
@@ -252,6 +253,29 @@ pub fn run_file(
                                     check_crc,
                                 );
                             }
+
+                            // Try LE 2M: reslice at SPS=1
+                            if pkt.is_none() {
+                                let bits_2m = fsk::reslice(&fsk_result.demod, fsk_result.silence, 1);
+                                pkt = ble::ble_burst_2m(
+                                    &bits_2m,
+                                    freq,
+                                    burst_ts.clone(),
+                                    check_crc,
+                                    |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
+                                );
+
+                                // Fall back to LE 2M AA correlator
+                                if pkt.is_none() {
+                                    pkt = aa_correlator_2m.correlate_2m(
+                                        &fsk_result.demod,
+                                        freq,
+                                        burst_ts.clone(),
+                                        check_crc,
+                                    );
+                                }
+                            }
+
 
                             if let Some(mut p) = pkt {
                                 p.rssi_db = rssi;
@@ -365,6 +389,7 @@ fn process_burst(
     burst: &bd_dsp::burst::Burst,
     fsk: &mut FskDemod,
     aa_correlator: &AaCorrelator,
+    aa_correlator_2m: &AaCorrelator,
     syndrome_map: &SyndromeMap,
     conn_table: &mut ConnectionTable,
     pcap_writer: &mut Option<PcapWriter<BufWriter<File>>>,
@@ -409,7 +434,7 @@ fn process_burst(
         return;
     }
 
-    // Try BLE preamble-first detection
+    // Try BLE LE 1M preamble-first detection
     let mut pkt = ble::ble_burst(
         &fsk_result.bits,
         freq,
@@ -418,7 +443,7 @@ fn process_burst(
         |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
     );
 
-    // Fall back to AA correlator
+    // Fall back to LE 1M AA correlator
     if pkt.is_none() {
         pkt = aa_correlator.correlate(
             &fsk_result.demod,
@@ -427,6 +452,29 @@ fn process_burst(
             check_crc,
         );
     }
+
+    // Try LE 2M: reslice the demod at SPS=1 and try preamble-first
+    if pkt.is_none() {
+        let bits_2m = fsk::reslice(&fsk_result.demod, fsk_result.silence, 1);
+        pkt = ble::ble_burst_2m(
+            &bits_2m,
+            freq,
+            burst_ts.clone(),
+            check_crc,
+            |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
+        );
+
+        // Fall back to LE 2M AA correlator
+        if pkt.is_none() {
+            pkt = aa_correlator_2m.correlate_2m(
+                &fsk_result.demod,
+                freq,
+                burst_ts.clone(),
+                check_crc,
+            );
+        }
+    }
+
 
     if let Some(mut p) = pkt {
         p.rssi_db = rssi;
@@ -443,6 +491,12 @@ fn process_burst(
             }
         }
 
+        match p.phy {
+            ble::BlePhy::Phy2M => stats.total_ble_2m += 1,
+            ble::BlePhy::PhyCoded => stats.total_ble_coded += 1,
+            _ => {}
+        }
+
         stats.total_ble += 1;
         if let Some(ref mut writer) = pcap_writer {
             let _ = writer.write_ble(&p, gps_fix);
@@ -456,6 +510,8 @@ fn process_burst(
 
 struct PipelineStats {
     total_ble: u64,
+    total_ble_2m: u64,
+    total_ble_coded: u64,
     total_bt: u64,
     total_crc: u64,
     valid_crc: u64,
@@ -466,6 +522,8 @@ impl PipelineStats {
     fn new() -> Self {
         Self {
             total_ble: 0,
+            total_ble_2m: 0,
+            total_ble_coded: 0,
             total_bt: 0,
             total_crc: 0,
             valid_crc: 0,
@@ -514,6 +572,7 @@ fn spawn_parallel_pipeline(
     mut burst_catchers: Vec<Option<BurstCatcher>>,
     fsk: FskDemod,
     aa_correlator: AaCorrelator,
+    aa_correlator_2m: AaCorrelator,
     syndrome_map: SyndromeMap,
     conn_table: ConnectionTable,
     pcap_writer: Option<PcapWriter<BufWriter<File>>>,
@@ -619,6 +678,7 @@ fn spawn_parallel_pipeline(
         let overflow_proc = overflow_count;
         let mut fsk = fsk;
         let aa_correlator = aa_correlator;
+        let aa_correlator_2m = aa_correlator_2m;
         let syndrome_map = syndrome_map;
         let mut conn_table = conn_table;
         let mut pcap_writer = pcap_writer;
@@ -661,6 +721,7 @@ fn spawn_parallel_pipeline(
                         &burst,
                         &mut fsk,
                         &aa_correlator,
+                        &aa_correlator_2m,
                         &syndrome_map,
                         &mut conn_table,
                         &mut pcap_writer,
@@ -675,10 +736,16 @@ fn spawn_parallel_pipeline(
                         let elapsed = stats_start.elapsed().as_secs_f64();
                         let conns = conn_table.count();
                         let overflows = overflow_proc.load(Ordering::Relaxed);
+                        let phy_str = if stats.total_ble_2m > 0 || stats.total_ble_coded > 0 {
+                            format!(" (2M:{} coded:{})", stats.total_ble_2m, stats.total_ble_coded)
+                        } else {
+                            String::new()
+                        };
                         eprint!(
-                            "[{:.1}s] BLE: {} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {}\n",
+                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {}\n",
                             elapsed,
                             stats.total_ble,
+                            phy_str,
                             stats.total_bt,
                             stats.total_bursts,
                             stats.crc_pct(),
@@ -705,10 +772,16 @@ fn spawn_parallel_pipeline(
                 if print_stats {
                     let elapsed = stats_start.elapsed().as_secs_f64();
                     let overflows = overflow_proc.load(Ordering::Relaxed);
+                    let phy_str = if stats.total_ble_2m > 0 || stats.total_ble_coded > 0 {
+                        format!(" (2M:{} coded:{})", stats.total_ble_2m, stats.total_ble_coded)
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "done ({:.1}s): BLE: {} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {}",
+                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {}",
                         elapsed,
                         stats.total_ble,
+                        phy_str,
                         stats.total_bt,
                         stats.total_bursts,
                         stats.crc_pct(),
@@ -896,6 +969,7 @@ pub fn run_live(
     zmq_curve_keyfile: Option<&str>,
     sensor_id: Option<&str>,
     gpsd_enabled: bool,
+    hci_enabled: bool,
     running: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let sample_rate = num_channels as u32 * 1_000_000;
@@ -917,7 +991,8 @@ pub fn run_live(
     );
 
     // Initialize protocol subsystems
-    let aa_correlator = AaCorrelator::new();
+    let aa_correlator = AaCorrelator::new();       // LE 1M: SPS=2
+    let aa_correlator_2m = AaCorrelator::with_sps(1); // LE 2M: SPS=1
     let syndrome_map = SyndromeMap::new(1);
     let conn_table = ConnectionTable::new();
 
@@ -968,6 +1043,30 @@ pub fn run_live(
         let _ = gpsd_enabled;
         None
     };
+
+    // HCI GATT prober (optional, requires --hci flag)
+    #[cfg(feature = "hci")]
+    let hci_prober: Option<bd_hci::HciProber> = if hci_enabled {
+        match bd_hci::HciProber::new() {
+            Ok(prober) => {
+                if prober.is_available() {
+                    eprintln!("HCI: adapter available, GATT probing enabled");
+                    Some(prober)
+                } else {
+                    eprintln!("HCI: no powered Bluetooth adapter found");
+                    None
+                }
+            }
+            Err(e) => {
+                eprintln!("HCI: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "hci"))]
+    let _ = hci_enabled;
 
     // ZMQ config to pass to processing thread (created there since zmq::Socket is !Send)
     #[cfg(feature = "zmq")]
@@ -1035,10 +1134,33 @@ pub fn run_live(
                     let hb = hb_state.clone();
                     let disp_running = running.clone();
 
+                    // Move HCI prober into dispatch thread if available
+                    #[cfg(feature = "hci")]
+                    let dispatch_hci = hci_prober;
+                    // ZMQ publisher for GATT results (created in dispatch thread)
+                    #[cfg(feature = "hci")]
+                    let dispatch_zmq_ep = zmq_endpoint.map(|s| s.to_string());
+                    #[cfg(feature = "hci")]
+                    let dispatch_zmq_sid = sensor_id.map(|s| s.to_string());
+                    #[cfg(feature = "hci")]
+                    let dispatch_zmq_curve = zmq_curve_keyfile.map(|s| s.to_string());
+
                     let dispatch_handle = std::thread::Builder::new()
                         .name("c2-dispatch".to_string())
                         .spawn(move || {
                             use bd_output::control::ControlCommand;
+
+                            // Create a separate ZMQ publisher for GATT results
+                            #[cfg(feature = "hci")]
+                            let gatt_zmq_pub: Option<bd_output::zmq_pub::ZmqPublisher> =
+                                dispatch_zmq_ep.and_then(|ep| {
+                                    bd_output::zmq_pub::ZmqPublisher::new(
+                                        &ep,
+                                        dispatch_zmq_sid.as_deref(),
+                                        dispatch_zmq_curve.as_deref(),
+                                    ).ok()
+                                });
+
                             while disp_running.load(Ordering::Relaxed) {
                                 match cmd_rx.recv_timeout(std::time::Duration::from_secs(1)) {
                                     Ok(cmd) => match cmd {
@@ -1059,6 +1181,30 @@ pub fn run_live(
                                         }
                                         ControlCommand::Restart { center_freq: _, channels: _, req_id: _ } => {
                                             eprintln!("C2: restart requested (not yet implemented in Rust)");
+                                        }
+                                        #[cfg(feature = "hci")]
+                                        ControlCommand::QueryGatt { mac, req_id: _ } => {
+                                            if let Some(ref prober) = dispatch_hci {
+                                                eprintln!("C2: GATT query for {}", mac);
+                                                let result = prober.query(&mac);
+                                                if let Some(ref e) = result.error {
+                                                    eprintln!("C2: GATT error for {}: {}", mac, e);
+                                                } else {
+                                                    eprintln!("C2: GATT {} services for {}",
+                                                        result.services.len(), mac);
+                                                }
+                                                if let Some(ref pub_socket) = gatt_zmq_pub {
+                                                    if let Ok(val) = serde_json::to_value(&result) {
+                                                        pub_socket.send_gatt(&val);
+                                                    }
+                                                }
+                                            } else {
+                                                eprintln!("C2: GATT query for {} ignored (no HCI adapter)", mac);
+                                            }
+                                        }
+                                        #[cfg(not(feature = "hci"))]
+                                        ControlCommand::QueryGatt { .. } => {
+                                            eprintln!("C2: GATT query ignored (compiled without hci feature)");
                                         }
                                     },
                                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
@@ -1089,7 +1235,7 @@ pub fn run_live(
         return run_live_gpu_loop(
             sdr, &running, num_channels, semi_len, &prototype, fft_scale,
             live_ch, first_live, last_live, burst_catchers,
-            fsk, aa_correlator, syndrome_map, conn_table,
+            fsk, aa_correlator, aa_correlator_2m, syndrome_map, conn_table,
             pcap_writer, check_crc, print_stats,
             gain_pending.clone(), squelch_pending.clone(),
             #[cfg(feature = "zmq")]
@@ -1126,6 +1272,7 @@ pub fn run_live(
         burst_catchers,
         fsk,
         aa_correlator,
+        aa_correlator_2m,
         syndrome_map,
         conn_table,
         pcap_writer,
@@ -1271,6 +1418,7 @@ fn run_live_gpu_loop(
     burst_catchers: Vec<Option<BurstCatcher>>,
     fsk: FskDemod,
     aa_correlator: AaCorrelator,
+    aa_correlator_2m: AaCorrelator,
     syndrome_map: SyndromeMap,
     conn_table: ConnectionTable,
     pcap_writer: Option<PcapWriter<BufWriter<File>>>,
@@ -1313,6 +1461,7 @@ fn run_live_gpu_loop(
         burst_catchers,
         fsk,
         aa_correlator,
+        aa_correlator_2m,
         syndrome_map,
         conn_table,
         pcap_writer,

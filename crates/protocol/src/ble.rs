@@ -64,33 +64,46 @@ pub fn crc24(data: &[u8], init: u32) -> u32 {
 }
 
 /// AA correlator state: pre-computed template for BLE advertising access address
+/// AA correlator state: pre-computed template for BLE advertising access address.
+/// Parameterized by samples-per-symbol to support LE 1M (SPS=2) and LE 2M (SPS=1).
 pub struct AaCorrelator {
-    template: [f32; BLE_AA_TLEN],
+    template: Vec<f32>,
     template_norm: f32,
+    sps: usize,
 }
 
 impl AaCorrelator {
-    pub fn new() -> Self {
-        let mut template = [0.0f32; BLE_AA_TLEN];
+    /// Create a correlator for the given samples-per-symbol rate.
+    /// SPS=2 for LE 1M (default), SPS=1 for LE 2M.
+    pub fn with_sps(sps: usize) -> Self {
+        let tlen = BLE_AA_BITS * sps;
+        let mut template = vec![0.0f32; tlen];
         let mut sum_sq = 0.0f32;
         let aa = BLE_ADV_AA;
 
         for i in 0..BLE_AA_BITS {
             let val: f32 = if (aa >> i) & 1 == 1 { 1.0 } else { -1.0 };
-            for j in 0..BLE_SPS {
-                template[i * BLE_SPS + j] = val;
-                sum_sq += 1.0; // val^2 is always 1
+            for j in 0..sps {
+                template[i * sps + j] = val;
+                sum_sq += 1.0;
             }
         }
 
         Self {
             template,
             template_norm: sum_sq.sqrt(),
+            sps,
         }
+    }
+
+    pub fn new() -> Self {
+        Self::with_sps(BLE_SPS)
     }
 
     /// AA correlator: find BLE advertising packets by correlating the analog demod
     /// signal against the known access address pattern.
+    /// `max_pdu_len`: 37 for legacy advertising, 251 for extended (LE 2M).
+    /// `phy`: PHY type to set on the resulting packet.
     pub fn correlate(
         &self,
         demod: &[f32],
@@ -98,20 +111,43 @@ impl AaCorrelator {
         timestamp: Timespec,
         check_crc: bool,
     ) -> Option<BlePacket> {
-        if demod.len() < BLE_AA_TLEN + 80 {
+        self.correlate_with_params(demod, freq, timestamp, check_crc, 37, BlePhy::Phy1M)
+    }
+
+    /// AA correlator for LE 2M: allows extended PDU length.
+    pub fn correlate_2m(
+        &self,
+        demod: &[f32],
+        freq: u32,
+        timestamp: Timespec,
+        check_crc: bool,
+    ) -> Option<BlePacket> {
+        self.correlate_with_params(demod, freq, timestamp, check_crc, 251, BlePhy::Phy2M)
+    }
+
+    fn correlate_with_params(
+        &self,
+        demod: &[f32],
+        freq: u32,
+        timestamp: Timespec,
+        check_crc: bool,
+        max_pdu_len: u8,
+        phy: BlePhy,
+    ) -> Option<BlePacket> {
+        let tlen = self.template.len();
+        if demod.len() < tlen + 80 {
             return None;
         }
 
         // Slide template across demod, find best normalized correlation
-        // Start from sample 1 to skip potentially wild first sample
-        let search_end = demod.len() - BLE_AA_TLEN;
+        let search_end = demod.len() - tlen;
         let mut best_score: f32 = 0.0;
         let mut best_idx: usize = 0;
 
         for i in 1..=search_end {
             let mut dot: f32 = 0.0;
             let mut win_sq: f32 = 0.0;
-            for j in 0..BLE_AA_TLEN {
+            for j in 0..tlen {
                 let s = demod[i + j];
                 dot += s * self.template[j];
                 win_sq += s * s;
@@ -130,14 +166,14 @@ impl AaCorrelator {
             return None;
         }
 
-        // Try both sample phases for bit extraction, pick lowest hamming distance
+        // Try sample phases for bit extraction, pick lowest hamming distance
         let mut best_phase: usize = 0;
         let mut best_hd: u32 = 33;
 
-        for phase in 0..BLE_SPS {
+        for phase in 0..self.sps {
             let mut aa: u32 = 0;
             for i in 0..32 {
-                let idx = best_idx + phase + i * BLE_SPS;
+                let idx = best_idx + phase + i * self.sps;
                 if idx < demod.len() && demod[idx] > 0.0 {
                     aa |= 1u32 << i;
                 }
@@ -155,16 +191,15 @@ impl AaCorrelator {
 
         // Extract bits starting at AA position with best phase
         let bit_start = best_idx + best_phase;
-        let max_bits = (demod.len() - bit_start) / BLE_SPS;
+        let max_bits = (demod.len() - bit_start) / self.sps;
 
         if max_bits < 32 + 16 {
             return None;
         }
 
-        // Slice bits from analog signal
         let mut bits = vec![0u8; max_bits];
         for i in 0..max_bits {
-            let idx = bit_start + i * BLE_SPS;
+            let idx = bit_start + i * self.sps;
             bits[i] = if demod[idx] > 0.0 { 1 } else { 0 };
         }
 
@@ -179,9 +214,8 @@ impl AaCorrelator {
             }
         }
 
-        // Validate: BLE advertising PDU payload max 37 bytes
         let needed_bits = 32 + 16 + (header_len as usize) * 8 + 24;
-        if header_len > 37 || needed_bits > max_bits {
+        if header_len > max_pdu_len || needed_bits > max_bits {
             return None;
         }
 
@@ -189,13 +223,11 @@ impl AaCorrelator {
         let pkt_len = 4 + 2 + header_len as usize + 3;
         let mut data = vec![0u8; pkt_len.max(64)];
 
-        // AA bytes (LE)
         data[0] = (BLE_ADV_AA >> 0) as u8;
         data[1] = (BLE_ADV_AA >> 8) as u8;
         data[2] = (BLE_ADV_AA >> 16) as u8;
         data[3] = (BLE_ADV_AA >> 24) as u8;
 
-        // Dewhiten and pack remaining bytes
         for i in 0..(pkt_len - 4) {
             let mut byte: u8 = 0;
             for j in 0..8u32 {
@@ -212,7 +244,7 @@ impl AaCorrelator {
         let mut crc_checked = false;
         let mut crc_valid = false;
         if check_crc {
-            let crc_init = 0x555555u32; // correlator only finds advertising AA
+            let crc_init = 0x555555u32;
             let crc_len = pkt_len - 4 - 3;
             let computed_crc = crc24(&data[4..4 + crc_len], crc_init);
             let received_crc = data[pkt_len - 3] as u32
@@ -234,6 +266,8 @@ impl AaCorrelator {
             crc_valid,
             is_data: false,
             conn_valid: false,
+            phy,
+            ext_header: None,
         })
     }
 }
@@ -242,6 +276,180 @@ impl Default for AaCorrelator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// BLE PHY type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlePhy {
+    Phy1M,
+    Phy2M,
+    PhyCoded,
+}
+
+impl Default for BlePhy {
+    fn default() -> Self {
+        BlePhy::Phy1M
+    }
+}
+
+/// AuxPtr: pointer to secondary advertising channel
+#[derive(Debug, Clone, Copy)]
+pub struct AuxPtr {
+    pub channel: u8,      // 0-39
+    pub offset_usec: u32, // offset to next packet in microseconds
+    pub phy: BlePhy,      // PHY of secondary channel
+}
+
+/// Extended Advertising header (Common Extended Header Format)
+/// Parsed from ADV_EXT_IND (PDU type 7) and AUX_ADV_IND payloads
+#[derive(Debug, Clone)]
+pub struct ExtAdvHeader {
+    pub adv_mode: u8,                // 0=non-conn/non-scan, 1=connectable, 2=scannable
+    pub adv_a: Option<[u8; 6]>,      // advertiser address
+    pub target_a: Option<[u8; 6]>,   // target address
+    pub aux_ptr: Option<AuxPtr>,     // pointer to secondary channel
+    pub adi: Option<u16>,            // advertising data info (DID + SID)
+    pub tx_power: Option<i8>,        // TX power in dBm
+}
+
+/// Parse the Common Extended Header from an ADV_EXT_IND PDU.
+/// `pdu` starts at the first byte after AA (i.e., PDU header byte 0).
+/// Returns None if the PDU type is not 7 or if parsing fails.
+pub fn parse_ext_adv(pdu: &[u8]) -> Option<ExtAdvHeader> {
+    // PDU header: byte 0 = type(4 bits) | ChSel | TxAdd | RxAdd | rfu
+    //             byte 1 = length
+    if pdu.len() < 3 {
+        return None;
+    }
+
+    let pdu_type = pdu[0] & 0x0F;
+    if pdu_type != 7 {
+        return None; // not ADV_EXT_IND
+    }
+
+    let pdu_len = pdu[1] as usize;
+    if pdu_len < 1 || pdu.len() < 2 + pdu_len {
+        return None;
+    }
+
+    // Extended header starts at pdu[2]
+    let ext_hdr = &pdu[2..2 + pdu_len];
+
+    // First byte: extended header length (6 bits) + AdvMode (2 bits)
+    let ext_hdr_len = (ext_hdr[0] & 0x3F) as usize;
+    let adv_mode = (ext_hdr[0] >> 6) & 0x03;
+
+    if ext_hdr_len < 1 || ext_hdr.len() < 1 + ext_hdr_len {
+        return None;
+    }
+
+    // Flags byte determines which optional fields are present
+    let flags = ext_hdr[1];
+    let mut pos: usize = 2; // skip ext_hdr_len byte and flags byte
+
+    // Fields appear in fixed order when their flag bit is set:
+    // bit 0: AdvA (6 bytes)
+    // bit 1: TargetA (6 bytes)
+    // bit 2: CTEInfo (1 byte) -- skip
+    // bit 3: ADI (2 bytes)
+    // bit 4: AuxPtr (3 bytes)
+    // bit 5: SyncInfo (18 bytes) -- skip
+    // bit 6: TxPower (1 byte)
+
+    let end = 1 + ext_hdr_len; // bounds within ext_hdr
+
+    let adv_a = if flags & 0x01 != 0 {
+        if pos + 6 > end { return None; }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&ext_hdr[pos..pos + 6]);
+        pos += 6;
+        Some(addr)
+    } else {
+        None
+    };
+
+    let target_a = if flags & 0x02 != 0 {
+        if pos + 6 > end { return None; }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&ext_hdr[pos..pos + 6]);
+        pos += 6;
+        Some(addr)
+    } else {
+        None
+    };
+
+    // CTEInfo (bit 2)
+    if flags & 0x04 != 0 {
+        if pos + 1 > end { return None; }
+        pos += 1;
+    }
+
+    let adi = if flags & 0x08 != 0 {
+        if pos + 2 > end { return None; }
+        let val = ext_hdr[pos] as u16 | ((ext_hdr[pos + 1] as u16) << 8);
+        pos += 2;
+        Some(val)
+    } else {
+        None
+    };
+
+    let aux_ptr = if flags & 0x10 != 0 {
+        if pos + 3 > end { return None; }
+        let b0 = ext_hdr[pos] as u32;
+        let b1 = ext_hdr[pos + 1] as u32;
+        let b2 = ext_hdr[pos + 2] as u32;
+        let raw = b0 | (b1 << 8) | (b2 << 16);
+        pos += 3;
+
+        let channel = (raw & 0x3F) as u8;
+        let ca = ((raw >> 6) & 0x01) as u8;
+        let _ = ca; // clock accuracy, not used
+        let offset_units = (raw >> 7) & 0x01; // 0=30us, 1=300us
+        let aux_offset = (raw >> 8) & 0x1FFF;
+        let aux_phy = (raw >> 21) & 0x07;
+
+        let offset_usec = if offset_units == 0 {
+            aux_offset * 30
+        } else {
+            aux_offset * 300
+        };
+
+        let phy = match aux_phy {
+            0 => BlePhy::Phy1M,
+            1 => BlePhy::Phy2M,
+            2 => BlePhy::PhyCoded,
+            _ => BlePhy::Phy1M, // reserved, default to 1M
+        };
+
+        Some(AuxPtr { channel, offset_usec, phy })
+    } else {
+        None
+    };
+
+    // SyncInfo (bit 5)
+    if flags & 0x20 != 0 {
+        if pos + 18 > end { return None; }
+        pos += 18;
+    }
+
+    let tx_power = if flags & 0x40 != 0 {
+        if pos + 1 > end { return None; }
+        let val = ext_hdr[pos] as i8;
+        pos += 1;
+        let _ = pos;
+        Some(val)
+    } else {
+        None
+    };
+
+    Some(ExtAdvHeader {
+        adv_mode,
+        adv_a,
+        target_a,
+        aux_ptr,
+        adi,
+        tx_power,
+    })
 }
 
 /// BLE packet structure
@@ -257,6 +465,8 @@ pub struct BlePacket {
     pub crc_valid: bool,
     pub is_data: bool,
     pub conn_valid: bool,
+    pub phy: BlePhy,
+    pub ext_header: Option<ExtAdvHeader>,
     pub data: Vec<u8>,
 }
 
@@ -372,6 +582,13 @@ pub fn ble_burst(
 
     data.truncate(pkt_len);
 
+    // Parse extended advertising header for ADV_EXT_IND (PDU type 7)
+    let ext_header = if crc_valid && data.len() > 4 {
+        parse_ext_adv(&data[4..])
+    } else {
+        None
+    };
+
     Some(BlePacket {
         aa: smallest_aa,
         freq,
@@ -384,221 +601,149 @@ pub fn ble_burst(
         crc_valid,
         is_data,
         conn_valid,
+        phy: BlePhy::Phy1M,
+        ext_header,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// LE 2M preamble-first BLE detection.
+/// Same logic as ble_burst() but adapted for LE 2M PHY:
+/// - 16-bit preamble (alternating, vs 8-bit for LE 1M)
+/// - Bits are at SPS=1 (re-sliced from the 2 Msps demod)
+/// - Max PDU length 251 bytes (extended advertising)
+pub fn ble_burst_2m(
+    bits: &[u8],
+    freq: u32,
+    timestamp: Timespec,
+    check_crc: bool,
+    mut crc_init_fn: impl FnMut(u32) -> Option<(u32, bool)>,
+) -> Option<BlePacket> {
+    let bits_len = bits.len();
 
-    #[test]
-    fn test_crc24_known_value() {
-        // CRC-24/BLE check value: 0xC25A56
-        // Input: "123456789" (ASCII bytes)
-        let data = b"123456789";
-        let result = crc24(data, 0x555555);
-        assert_eq!(result, 0xC25A56, "CRC-24/BLE check value mismatch: got 0x{:06X}", result);
+    // Check 16-bit preamble: alternating bits (need at least 12 matching)
+    if bits_len < 64 {
+        return None;
+    }
+    if !(bits[0] == bits[2] && bits[2] == bits[4] && bits[4] == bits[6]
+        && bits[1] == bits[3] && bits[3] == bits[5] && bits[5] == bits[7]
+        && bits[8] == bits[10] && bits[9] == bits[11]
+        && bits[0] != bits[1])
+    {
+        return None;
     }
 
-    #[test]
-    fn test_reflect24() {
-        assert_eq!(reflect24(0x555555), 0xAAAAAA);
-        assert_eq!(reflect24(0xAAAAAA), 0x555555);
-        assert_eq!(reflect24(0x000001), 0x800000);
+    let channel = freq_to_channel(freq);
+
+    let mut smallest_delta: u32 = 0xffffffff;
+    let mut smallest_offset: usize = 0;
+    let mut smallest_aa: u32 = 0;
+    let mut smallest_header_len: u8 = 0;
+
+    // Try candidates for AA start position (after 16-bit preamble)
+    for i in 14..18 {
+        if i + 32 + 16 >= bits_len {
+            continue;
+        }
+        let mut aa: u32 = 0;
+        for j in 0..32 {
+            aa |= (bits[i + j] as u32) << j;
+        }
+        let mut header_len: u8 = 0;
+        for j in 0..8u32 {
+            let whiten_bit = whitening_bit(channel, 8 + j);
+            header_len |= (bits[i + 32 + 8 + j as usize] ^ whiten_bit) << j;
+        }
+        // LE 2M: preamble is 16 bits
+        let bit_len = 16 + 32 + 16 + (header_len as u32) * 8 + 24;
+        let delta = (bits_len as i32) - (bit_len as i32);
+        if delta > 0 && (delta as u32) < smallest_delta {
+            smallest_delta = delta as u32;
+            smallest_offset = i;
+            smallest_aa = aa;
+            smallest_header_len = header_len;
+        }
     }
 
-    #[test]
-    fn test_whitening_bit_range() {
-        // All values should be 0 or 1
-        for ch in 0..40 {
-            for bit in 0..256 {
-                let wb = whitening_bit(ch, bit);
-                assert!(wb <= 1, "whitening_bit({}, {}) = {}", ch, bit, wb);
+    if smallest_delta >= 20 {
+        return None;
+    }
+
+    // Max PDU length 251 for extended advertising
+    if smallest_header_len > 251 {
+        return None;
+    }
+
+    let pkt_len = 4 + 2 + smallest_header_len as usize + 3;
+    let mut data = vec![0u8; pkt_len.max(64)];
+
+    data[0] = (smallest_aa >> 0) as u8;
+    data[1] = (smallest_aa >> 8) as u8;
+    data[2] = (smallest_aa >> 16) as u8;
+    data[3] = (smallest_aa >> 24) as u8;
+
+    for i in 0..(pkt_len - 4) {
+        let mut byte: u8 = 0;
+        for j in 0..8u32 {
+            let wb = whitening_bit(channel, i as u32 * 8 + j);
+            let bit_idx = smallest_offset + 32 + i * 8 + j as usize;
+            if bit_idx < bits_len {
+                byte |= (bits[bit_idx] ^ wb) << j;
+            }
+        }
+        data[i + 4] = byte;
+    }
+
+    let is_data = smallest_aa != BLE_ADV_AA;
+
+    let mut crc_checked = false;
+    let mut crc_valid = false;
+    let mut conn_valid = false;
+
+    if check_crc {
+        if smallest_aa == BLE_ADV_AA {
+            let crc_len = pkt_len - 4 - 3;
+            let computed = crc24(&data[4..4 + crc_len], 0x555555);
+            let received = data[pkt_len - 3] as u32
+                | ((data[pkt_len - 2] as u32) << 8)
+                | ((data[pkt_len - 1] as u32) << 16);
+            crc_checked = true;
+            crc_valid = computed == received;
+        } else {
+            if let Some((init, valid)) = crc_init_fn(smallest_aa) {
+                let crc_len = pkt_len - 4 - 3;
+                let computed = crc24(&data[4..4 + crc_len], init);
+                let received = data[pkt_len - 3] as u32
+                    | ((data[pkt_len - 2] as u32) << 8)
+                    | ((data[pkt_len - 1] as u32) << 16);
+                crc_checked = true;
+                crc_valid = computed == received;
+                conn_valid = valid;
             }
         }
     }
 
-    #[test]
-    fn test_aa_correlator_construction() {
-        let corr = AaCorrelator::new();
-        // Template norm should be sqrt(64) = 8.0
-        assert!((corr.template_norm - 8.0).abs() < 0.001);
-    }
+    data.truncate(pkt_len);
 
-    #[test]
-    fn test_freq_to_channel() {
-        use crate::freq_to_channel;
-        assert_eq!(freq_to_channel(2402), 37);
-        assert_eq!(freq_to_channel(2426), 38);
-        assert_eq!(freq_to_channel(2480), 39);
-        assert_eq!(freq_to_channel(2404), 0);
-        assert_eq!(freq_to_channel(2406), 1);
-        assert_eq!(freq_to_channel(2424), 10);
-        assert_eq!(freq_to_channel(2428), 11);
-        assert_eq!(freq_to_channel(2478), 36);
-    }
+    let ext_header = if crc_valid && data.len() > 4 {
+        parse_ext_adv(&data[4..])
+    } else {
+        None
+    };
 
-    /// End-to-end test: construct a known BLE advertising packet,
-    /// whiten it, convert to bit array, and verify ble_burst decodes it
-    /// with correct CRC.
-    #[test]
-    fn test_ble_burst_known_packet() {
-        use crate::freq_to_channel;
-
-        let freq = 2402u32; // advertising channel 37
-        let channel = freq_to_channel(freq);
-        assert_eq!(channel, 37);
-
-        // Build a simple ADV_NONCONN_IND: type=0x02, length=12
-        // AdvA = 11:22:33:44:55:66, AdvData = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
-        let pdu_header: [u8; 2] = [0x02, 0x0C]; // type=2, len=12
-        let adv_a: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
-        let adv_data: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-
-        // PDU = header + AdvA + AdvData
-        let mut pdu = Vec::new();
-        pdu.extend_from_slice(&pdu_header);
-        pdu.extend_from_slice(&adv_a);
-        pdu.extend_from_slice(&adv_data);
-        assert_eq!(pdu.len(), 14);
-
-        // Compute CRC-24 over PDU
-        let crc = crc24(&pdu, 0x555555);
-        let crc_bytes = [
-            (crc & 0xFF) as u8,
-            ((crc >> 8) & 0xFF) as u8,
-            ((crc >> 16) & 0xFF) as u8,
-        ];
-
-        // Full packet bytes: AA(4) + PDU(14) + CRC(3) = 21 bytes
-        let aa_bytes = [0xD6u8, 0xBE, 0x89, 0x8E]; // LE encoding of 0x8E89BED6
-
-        // Convert to bit array (LSB first within each byte)
-        let mut all_bytes = Vec::new();
-        all_bytes.extend_from_slice(&aa_bytes);
-        all_bytes.extend_from_slice(&pdu);
-        all_bytes.extend_from_slice(&crc_bytes);
-
-        // Convert bytes to bits (LSB first)
-        let mut bits_raw = Vec::new();
-        for &byte in &all_bytes {
-            for j in 0..8 {
-                bits_raw.push((byte >> j) & 1);
-            }
-        }
-
-        // Apply whitening to PDU+CRC bits (not AA)
-        let mut bits_whitened = Vec::new();
-        // Preamble: 8 alternating bits (for AA starting with 0: 01010101)
-        bits_whitened.extend_from_slice(&[0, 1, 0, 1, 0, 1, 0, 1]);
-        // AA bits (not whitened)
-        bits_whitened.extend_from_slice(&bits_raw[..32]);
-        // PDU+CRC bits (whitened)
-        for i in 32..bits_raw.len() {
-            let wb = whitening_bit(channel, (i - 32) as u32);
-            bits_whitened.push(bits_raw[i] ^ wb);
-        }
-
-        // Add a few extra trailing bits (burst catcher always produces overshoot)
-        for _ in 0..16 {
-            bits_whitened.push(0);
-        }
-
-        // ble_burst should find this packet
-        let ts = crate::Timespec { tv_sec: 0, tv_nsec: 0 };
-        let pkt = ble_burst(&bits_whitened, freq, ts, true, |_aa| None);
-        assert!(pkt.is_some(), "ble_burst failed to find known packet");
-        let pkt = pkt.unwrap();
-        assert_eq!(pkt.aa, BLE_ADV_AA);
-        assert!(pkt.crc_checked, "CRC was not checked");
-        assert!(pkt.crc_valid, "CRC INVALID: packet data={:02X?}", &pkt.data);
-
-        // Verify dewhitened data matches original
-        assert_eq!(pkt.data[4], 0x02, "PDU type mismatch");
-        assert_eq!(pkt.data[5], 0x0C, "PDU length mismatch");
-        assert_eq!(&pkt.data[6..12], &adv_a, "AdvA mismatch");
-        assert_eq!(&pkt.data[12..18], &adv_data, "AdvData mismatch");
-    }
-
-    /// Test the AA correlator with a synthetic BLE signal
-    #[test]
-    fn test_correlator_known_packet() {
-        use crate::freq_to_channel;
-
-        let freq = 2402u32; // channel 37
-        let channel = freq_to_channel(freq);
-
-        // Build same packet as above
-        let pdu = [0x02u8, 0x0C, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-                   0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        let crc = crc24(&pdu, 0x555555);
-        let crc_bytes = [
-            (crc & 0xFF) as u8,
-            ((crc >> 8) & 0xFF) as u8,
-            ((crc >> 16) & 0xFF) as u8,
-        ];
-
-        // Build full packet bytes
-        let aa_bytes = [0xD6u8, 0xBE, 0x89, 0x8E];
-        let mut all_bytes = Vec::new();
-        all_bytes.extend_from_slice(&aa_bytes);
-        all_bytes.extend_from_slice(&pdu);
-        all_bytes.extend_from_slice(&crc_bytes);
-
-        // Convert to bits (LSB first)
-        let mut bits_raw = Vec::new();
-        for &byte in &all_bytes {
-            for j in 0..8 {
-                bits_raw.push((byte >> j) & 1);
-            }
-        }
-
-        // Apply whitening to PDU+CRC
-        let mut bits_pdu_whitened = Vec::new();
-        for i in 0..bits_raw.len() {
-            if i < 32 {
-                bits_pdu_whitened.push(bits_raw[i]); // AA not whitened
-            } else {
-                let wb = whitening_bit(channel, (i - 32) as u32);
-                bits_pdu_whitened.push(bits_raw[i] ^ wb);
-            }
-        }
-
-        // Build a synthetic demod signal: +1.0 for bit 1, -1.0 for bit 0
-        // Each bit repeated BLE_SPS=2 times
-        // Prepend some preamble + silence
-        let mut demod = Vec::new();
-        // 20 samples of silence
-        for _ in 0..20 {
-            demod.push(0.0f32);
-        }
-        // Preamble (8 bits * 2 sps = 16 samples)
-        let preamble = [0u8, 1, 0, 1, 0, 1, 0, 1];
-        for &b in &preamble {
-            let val = if b == 1 { 1.0 } else { -1.0 };
-            for _ in 0..BLE_SPS {
-                demod.push(val);
-            }
-        }
-        // Whitened packet bits
-        for &b in &bits_pdu_whitened {
-            let val = if b == 1 { 1.0 } else { -1.0 };
-            for _ in 0..BLE_SPS {
-                demod.push(val);
-            }
-        }
-        // Trail with some zeros
-        for _ in 0..40 {
-            demod.push(0.0f32);
-        }
-
-        let corr = AaCorrelator::new();
-        let ts = crate::Timespec { tv_sec: 0, tv_nsec: 0 };
-        let pkt = corr.correlate(&demod, freq, ts, true);
-        assert!(pkt.is_some(), "correlator failed to find known packet");
-        let pkt = pkt.unwrap();
-        assert_eq!(pkt.aa, BLE_ADV_AA);
-        assert!(pkt.crc_checked, "CRC was not checked");
-        assert!(pkt.crc_valid, "CRC INVALID on correlator: data={:02X?}", &pkt.data);
-    }
+    Some(BlePacket {
+        aa: smallest_aa,
+        freq,
+        len: pkt_len,
+        data,
+        timestamp,
+        rssi_db: 0,
+        noise_db: 0,
+        crc_checked,
+        crc_valid,
+        is_data,
+        conn_valid,
+        phy: BlePhy::Phy2M,
+        ext_header,
+    })
 }
+

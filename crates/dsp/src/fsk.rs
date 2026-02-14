@@ -156,6 +156,19 @@ impl FskDemod {
     }
 }
 
+/// Re-slice an existing demod signal at a different samples-per-symbol rate.
+/// Used to try LE 2M decoding (SPS=1) from the same burst that was already
+/// FM-demodulated and CFO-corrected at 2 Msps.
+pub fn reslice(demod: &[f32], silence_offset: usize, sps: usize) -> Vec<u8> {
+    let mut bits = Vec::with_capacity((demod.len() - silence_offset) / sps);
+    let mut i = silence_offset + 1;
+    while i < demod.len() {
+        bits.push(if demod[i] > 0.0 { 1 } else { 0 });
+        i += sps;
+    }
+    bits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

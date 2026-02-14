@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use byteorder::{LittleEndian, WriteBytesExt};
-use bd_protocol::ble::BlePacket;
+use bd_protocol::ble::{BlePacket, BlePhy};
 use bd_protocol::btbb::ClassicBtPacket;
 
 // Link-layer type constants
@@ -15,9 +15,23 @@ const LE_NOISE_POWER_VALID: u16 = 0x0004;
 const LE_CRC_CHECKED: u16 = 0x0400;
 const LE_CRC_VALID: u16 = 0x0800;
 
+// PHY encoding in flags bits 14-15 (per LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR spec)
+const LE_PHY_1M: u16 = 0x0000;
+const LE_PHY_2M: u16 = 0x4000;
+const LE_PHY_CODED: u16 = 0x8000;
+
 // Classic BT BR/EDR header flags
 const BREDR_SIGNAL_POWER_VALID: u16 = 0x0004;
 const BREDR_NOISE_POWER_VALID: u16 = 0x0008;
+
+/// Map BLE PHY type to PCAP flags bits 14-15
+fn phy_to_flags(phy: BlePhy) -> u16 {
+    match phy {
+        BlePhy::Phy1M => LE_PHY_1M,
+        BlePhy::Phy2M => LE_PHY_2M,
+        BlePhy::PhyCoded => LE_PHY_CODED,
+    }
+}
 
 // ZMQ packet type prefix bytes
 pub const ZMQ_PKT_TYPE_BLE: u8 = 0x00;
@@ -126,6 +140,7 @@ impl<W: Write> PcapWriter<W> {
                 flags |= LE_CRC_VALID;
             }
         }
+        flags |= phy_to_flags(pkt.phy);
 
         let rf_channel = ((pkt.freq - 2402) / 2) as u8;
         let ble_payload_len = pkt.len + 10; // data + LE header (10 bytes)
@@ -243,6 +258,7 @@ pub fn zmq_build_ble(pkt: &BlePacket) -> Vec<u8> {
             flags |= LE_CRC_VALID;
         }
     }
+    flags |= phy_to_flags(pkt.phy);
 
     let ble_payload_len = pkt.len + 10; // data + LE header
     let msg_len = 1 + 16 + 10 + pkt.len;
@@ -360,6 +376,8 @@ mod tests {
             crc_valid: true,
             is_data: false,
             conn_valid: false,
+            phy: BlePhy::Phy1M,
+            ext_header: None,
             data: vec![0xD6, 0xBE, 0x89, 0x8E, 0x40, 0x06, 0x01, 0x02, 0x03],
         };
 
