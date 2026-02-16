@@ -1,5 +1,17 @@
 pub mod file;
 
+#[cfg(feature = "usrp")]
+pub mod usrp;
+
+#[cfg(feature = "hackrf")]
+pub mod hackrf;
+
+#[cfg(feature = "bladerf")]
+pub mod bladerf;
+
+#[cfg(feature = "soapysdr")]
+pub mod soapysdr;
+
 use crossbeam::channel::Sender;
 
 /// Sample buffer: a block of interleaved int16 IQ samples
