@@ -747,3 +747,291 @@ pub fn ble_burst_2m(
     })
 }
 
+/// LE Coded PHY preamble: 80 symbols of repeating `00111100` (10 repetitions).
+/// At SPS=2 the preamble is 160 samples.
+const CODED_PREAMBLE_PATTERN: [u8; 8] = [0, 0, 1, 1, 1, 1, 0, 0];
+const CODED_PREAMBLE_REPS: usize = 10;
+const CODED_PREAMBLE_SYMBOLS: usize = 8 * CODED_PREAMBLE_REPS; // 80
+
+/// Find LE Coded preamble in demod signal.
+/// Returns the sample index where the preamble starts, or None.
+pub fn find_coded_preamble(demod: &[f32], sps: usize) -> Option<usize> {
+    let preamble_samples = CODED_PREAMBLE_SYMBOLS * sps;
+    if demod.len() < preamble_samples + 100 {
+        return None;
+    }
+
+    // Build template
+    let mut template = Vec::with_capacity(preamble_samples);
+    for _ in 0..CODED_PREAMBLE_REPS {
+        for &bit in &CODED_PREAMBLE_PATTERN {
+            let val = if bit == 1 { 1.0f32 } else { -1.0 };
+            for _ in 0..sps {
+                template.push(val);
+            }
+        }
+    }
+
+    let template_norm: f32 = (template.len() as f32).sqrt();
+    let search_end = (demod.len() - preamble_samples).min(preamble_samples * 2);
+
+    let mut best_score: f32 = 0.0;
+    let mut best_idx: usize = 0;
+
+    for i in 0..search_end {
+        let mut dot: f32 = 0.0;
+        let mut win_sq: f32 = 0.0;
+        for j in 0..preamble_samples {
+            let s = demod[i + j];
+            dot += s * template[j];
+            win_sq += s * s;
+        }
+        let win_norm = win_sq.sqrt();
+        if win_norm > 0.001 {
+            let score = dot / (win_norm * template_norm);
+            if score > best_score {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+    }
+
+    if best_score > 0.5 {
+        Some(best_idx)
+    } else {
+        None
+    }
+}
+
+/// LE Coded PHY burst decoder.
+///
+/// Structure:
+/// - Preamble: 80 symbols (`00111100` x10)
+/// - FEC Block 1 (S=8): AA(32 bits) + CI(2 bits) + TERM1(3 bits) = 37 data bits
+///   -> conv encode -> 74 coded bits -> pattern map S=8 -> 592 symbols
+/// - FEC Block 2 (S=CI): PDU + CRC(24 bits) + TERM2(3 bits)
+///   -> conv encode -> pattern map at S=2 or S=8
+///
+/// PCAP format for LE Coded: AA(4) + CI(1) + PDU + CRC(3)
+pub fn ble_coded_burst(
+    demod: &[f32],
+    freq: u32,
+    timestamp: Timespec,
+    sps: usize,
+    check_crc: bool,
+    mut crc_init_fn: impl FnMut(u32) -> Option<(u32, bool)>,
+) -> Option<BlePacket> {
+    use crate::fec;
+
+    // Find preamble
+    let preamble_start = find_coded_preamble(demod, sps)?;
+    let preamble_samples = CODED_PREAMBLE_SYMBOLS * sps;
+
+    // FEC Block 1 starts after preamble
+    let block1_start = preamble_start + preamble_samples;
+
+    // FEC Block 1: 37 data bits -> 74 coded bits -> 592 symbols at S=8
+    let block1_symbols = 74 * 8; // 592
+    let block1_samples = block1_symbols * sps;
+
+    if block1_start + block1_samples > demod.len() {
+        return None;
+    }
+
+    // Extract soft symbols for Block 1
+    let block1_soft: Vec<f32> = (0..block1_symbols)
+        .map(|i| {
+            let idx = block1_start + i * sps;
+            if sps == 2 {
+                (demod[idx] + demod[idx + 1]) / 2.0
+            } else {
+                demod[idx]
+            }
+        })
+        .collect();
+
+    // Soft demap at S=8, then Viterbi decode
+    let soft_coded_block1 = fec::pattern_demap_s8(&block1_soft);
+    let decoded_block1 = fec::viterbi_decode(&soft_coded_block1);
+
+    // decoded_block1 should be 37 bits: AA(32) + CI(2) + TERM1(3)
+    if decoded_block1.len() < 34 {
+        return None;
+    }
+
+    // Extract AA (32 bits, LSB first within each byte)
+    let mut aa: u32 = 0;
+    for i in 0..32 {
+        aa |= (decoded_block1[i] as u32) << i;
+    }
+
+    // Verify AA: must be advertising AA or a known connection AA
+    // For coded PHY, only advertising AA is expected on primary channels
+    let aa_hd = (aa ^ BLE_ADV_AA).count_ones();
+
+    if aa_hd > BLE_MAX_HD {
+        return None;
+    }
+    let aa = BLE_ADV_AA; // snap to advertising AA if close enough
+
+    // Extract CI (2 bits): coding indicator
+    let ci_val = decoded_block1[32] | (decoded_block1[33] << 1);
+    let coding_s = match ci_val {
+        0 => 8usize, // S=8 (125 kbps)
+        1 => 2usize, // S=2 (500 kbps)
+        _ => return None, // CI=2,3 are reserved
+    };
+
+    // FEC Block 2 starts after Block 1
+    let block2_start = block1_start + block1_samples;
+
+    // We don't know the PDU length yet. Extract enough symbols for max PDU (251) + CRC(3) + TERM2(3).
+    // At S=2: (257 + 3) * 8 * 2 / 2 = up to ~2080 symbols
+    // At S=8: much more. Limit to available samples.
+    let remaining_samples = if block2_start < demod.len() {
+        demod.len() - block2_start
+    } else {
+        return None;
+    };
+    let remaining_symbols = remaining_samples / sps;
+
+    if remaining_symbols < coding_s * 20 {
+        return None; // too short for even a minimal PDU
+    }
+
+    // Extract soft symbols for Block 2
+    let block2_soft: Vec<f32> = (0..remaining_symbols)
+        .map(|i| {
+            let idx = block2_start + i * sps;
+            if sps == 2 && idx + 1 < demod.len() {
+                (demod[idx] + demod[idx + 1]) / 2.0
+            } else if idx < demod.len() {
+                demod[idx]
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    // Soft demap at S=coding_s
+    let soft_coded_block2 = if coding_s == 8 {
+        fec::pattern_demap_s8(&block2_soft)
+    } else {
+        fec::pattern_demap_s2(&block2_soft)
+    };
+
+    // Viterbi decode Block 2
+    let decoded_block2 = fec::viterbi_decode(&soft_coded_block2);
+
+    // decoded_block2 = PDU header(2 bytes) + PDU payload(len bytes) + CRC(3 bytes) + TERM2(3 bits)
+    // First, extract PDU header to get length
+    if decoded_block2.len() < 16 {
+        return None;
+    }
+
+    let channel = freq_to_channel(freq);
+
+    // Dewhiten the decoded bits to get PDU header
+    // Note: whitening is applied after FEC decoding in LE Coded
+    let mut header_bytes = [0u8; 2];
+    for byte_idx in 0..2 {
+        let mut byte_val: u8 = 0;
+        for bit_idx in 0..8u32 {
+            let data_bit = decoded_block2[byte_idx * 8 + bit_idx as usize];
+            let wb = whitening_bit(channel, byte_idx as u32 * 8 + bit_idx);
+            byte_val |= (data_bit ^ wb) << bit_idx;
+        }
+        header_bytes[byte_idx] = byte_val;
+    }
+
+    let pdu_length = header_bytes[1] as usize;
+    if pdu_length > 251 {
+        return None;
+    }
+
+    // Total decoded bits needed: header(16) + payload(pdu_length*8) + CRC(24)
+    let total_pdu_crc_bits = 16 + pdu_length * 8 + 24;
+    if decoded_block2.len() < total_pdu_crc_bits {
+        return None;
+    }
+
+    // Dewhiten all PDU + CRC bits
+    let mut pdu_crc_bytes = vec![0u8; 2 + pdu_length + 3];
+    for byte_idx in 0..(2 + pdu_length + 3) {
+        let mut byte_val: u8 = 0;
+        for bit_idx in 0..8u32 {
+            let data_bit = decoded_block2[byte_idx * 8 + bit_idx as usize];
+            let wb = whitening_bit(channel, byte_idx as u32 * 8 + bit_idx);
+            byte_val |= (data_bit ^ wb) << bit_idx;
+        }
+        pdu_crc_bytes[byte_idx] = byte_val;
+    }
+
+    // Build packet data: AA(4) + CI(1) + PDU(header + payload) + CRC(3)
+    let pkt_len = 4 + 1 + 2 + pdu_length + 3;
+    let mut data = vec![0u8; pkt_len];
+
+    // AA bytes (little-endian)
+    data[0] = (aa >> 0) as u8;
+    data[1] = (aa >> 8) as u8;
+    data[2] = (aa >> 16) as u8;
+    data[3] = (aa >> 24) as u8;
+
+    // CI byte
+    data[4] = ci_val;
+
+    // PDU + CRC (already dewhitened)
+    data[5..].copy_from_slice(&pdu_crc_bytes);
+
+    let is_data = aa != BLE_ADV_AA;
+
+    // CRC validation
+    let mut crc_checked = false;
+    let mut crc_valid = false;
+    let mut conn_valid = false;
+
+    if check_crc {
+        // For LE Coded, CRC is computed over PDU (after dewhitening, before CRC bytes)
+        // CRC init depends on AA
+        let crc_data = &pdu_crc_bytes[..2 + pdu_length]; // PDU header + payload
+        let received_crc = pdu_crc_bytes[2 + pdu_length] as u32
+            | ((pdu_crc_bytes[2 + pdu_length + 1] as u32) << 8)
+            | ((pdu_crc_bytes[2 + pdu_length + 2] as u32) << 16);
+
+        if aa == BLE_ADV_AA {
+            let computed = crc24(crc_data, 0x555555);
+            crc_checked = true;
+            crc_valid = computed == received_crc;
+        } else {
+            if let Some((init, valid)) = crc_init_fn(aa) {
+                let computed = crc24(crc_data, init);
+                crc_checked = true;
+                crc_valid = computed == received_crc;
+                conn_valid = valid;
+            }
+        }
+    }
+
+    let ext_header = if crc_valid && pdu_crc_bytes.len() > 0 {
+        parse_ext_adv(&pdu_crc_bytes[..2 + pdu_length])
+    } else {
+        None
+    };
+
+    Some(BlePacket {
+        aa,
+        freq,
+        len: pkt_len,
+        data,
+        timestamp,
+        rssi_db: 0,
+        noise_db: 0,
+        crc_checked,
+        crc_valid,
+        is_data,
+        conn_valid,
+        phy: BlePhy::PhyCoded,
+        ext_header,
+    })
+}
+

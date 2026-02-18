@@ -276,6 +276,17 @@ pub fn run_file(
                                 }
                             }
 
+                            // Try LE Coded PHY (long range)
+                            if pkt.is_none() {
+                                pkt = ble::ble_coded_burst(
+                                    &fsk_result.demod,
+                                    freq,
+                                    burst_ts.clone(),
+                                    2, // SPS=2
+                                    check_crc,
+                                    |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
+                                );
+                            }
 
                             if let Some(mut p) = pkt {
                                 p.rssi_db = rssi;
@@ -475,6 +486,17 @@ fn process_burst(
         }
     }
 
+    // Try LE Coded PHY (long range)
+    if pkt.is_none() {
+        pkt = ble::ble_coded_burst(
+            &fsk_result.demod,
+            freq,
+            burst_ts.clone(),
+            2, // SPS=2
+            check_crc,
+            |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
+        );
+    }
 
     if let Some(mut p) = pkt {
         p.rssi_db = rssi;
