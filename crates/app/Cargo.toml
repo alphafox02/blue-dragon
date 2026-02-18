@@ -1,20 +1,32 @@
 [package]
-name = "bluetooth-sniffer"
+name = "blue-dragon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "bluetooth-sniffer"
+name = "blue-dragon"
 path = "src/main.rs"
 
 [dependencies]
-bt-protocol = { path = "../protocol" }
-bt-dsp = { path = "../dsp" }
-bt-output = { path = "../output" }
-bt-sdr = { path = "../sdr" }
+bd-protocol = { path = "../protocol" }
+bd-dsp = { path = "../dsp" }
+bd-output = { path = "../output" }
+bd-sdr = { path = "../sdr" }
+bd-gpu = { path = "../gpu", optional = true }
 crossbeam.workspace = true
 num-complex.workspace = true
 clap.workspace = true
 log.workspace = true
 env_logger.workspace = true
+ctrlc = "3"
+
+[features]
+default = ["usrp"]
+usrp = ["bd-sdr/usrp"]
+hackrf = ["bd-sdr/hackrf"]
+bladerf = ["bd-sdr/bladerf"]
+soapysdr = ["bd-sdr/soapysdr"]
+zmq = ["bd-output/zmq"]
+gps = ["bd-output/gps"]
+gpu = ["dep:bd-gpu"]
