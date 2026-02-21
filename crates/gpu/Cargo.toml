@@ -1,5 +1,5 @@
 [package]
-name = "bt-gpu"
+name = "bd-gpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 num-complex.workspace = true
 log.workspace = true
+
+[build-dependencies]
+cc = "1"
