@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2025-2026 CEMAXECUTER LLC
 """
-Live web dashboard for ice9-bluetooth-sniffer ZMQ streams.
+Live web dashboard for blue-dragon ZMQ streams.
 
 Binds SUB and C2 ROUTER sockets; sensors connect to us. Presents a
 Kismet-style device list with BLE device fingerprinting, CRC-gated
@@ -65,7 +65,7 @@ except ImportError:
 class DeviceDB:
     """SQLite-backed device persistence for cross-session tracking."""
 
-    DEFAULT_PATH = Path.home() / ".cache" / "ice9-bt-sniffer" / "devices.db"
+    DEFAULT_PATH = Path.home() / ".cache" / "blue-dragon" / "devices.db"
 
     def __init__(self, db_path=None):
         self.path = Path(db_path) if db_path else self.DEFAULT_PATH
@@ -356,6 +356,8 @@ LE_SIGNAL_POWER_VALID = 0x0002
 LE_NOISE_POWER_VALID  = 0x0004
 LE_CRC_CHECKED        = 0x0400
 LE_CRC_VALID          = 0x0800
+LE_PHY_MASK           = 0xC000
+LE_PHY_SHIFT          = 14
 
 BLE_ADV_AA = 0x8E89BED6
 
@@ -768,8 +770,8 @@ NORDIC_DB_BASE = "https://raw.githubusercontent.com/NordicSemiconductor/bluetoot
 NORDIC_COMPANY_IDS_URL = f"{NORDIC_DB_BASE}/company_ids.json"
 NORDIC_SERVICE_UUIDS_URL = f"{NORDIC_DB_BASE}/service_uuids.json"
 
-# Cache directory: ~/.cache/ice9-bt-sniffer/
-BT_DB_CACHE_DIR = Path.home() / ".cache" / "ice9-bt-sniffer"
+# Cache directory: ~/.cache/blue-dragon/
+BT_DB_CACHE_DIR = Path.home() / ".cache" / "blue-dragon"
 
 
 def bt_db_update(quiet=False):
@@ -953,6 +955,8 @@ def parse_ble_packet(data):
 
     crc_checked = bool(flags & LE_CRC_CHECKED)
     crc_valid = bool(flags & LE_CRC_VALID) if crc_checked else None
+    phy_code = (flags & LE_PHY_MASK) >> LE_PHY_SHIFT
+    phy = ("1M", "2M", "Coded", "?")[min(phy_code, 3)]
     is_adv = (aa == BLE_ADV_AA)
     mac = extract_mac(ble_data, aa)
 
@@ -1018,6 +1022,10 @@ def parse_ble_packet(data):
                 "used_channels": n_ch,
             }
 
+    # Connectable: ADV_IND (0) and ADV_DIRECT_IND (1) indicate the device
+    # accepts connections.
+    connectable = pdu_type in (0, 1) if pdu_type is not None else False
+
     return {
         "timestamp": ts_sec + ts_usec / 1e6,
         "rf_channel": rf_channel,
@@ -1035,7 +1043,9 @@ def parse_ble_packet(data):
         "data_len": len(ble_data),
         "fingerprint": fingerprint,
         "protocol": "BLE",
+        "phy": phy,
         "conn_info": conn_info,
+        "connectable": connectable,
     }
 
 
@@ -1262,6 +1272,10 @@ class DashboardState:
                 d["last"] = now
                 d["freq"] = pkt["freq_mhz"]
                 d["type"] = pkt["pdu_type"]
+                d["phy"] = pkt.get("phy", "1M")
+                # Track connectable status (sticky -- once seen connectable, stays)
+                if pkt.get("connectable"):
+                    d["connectable"] = True
                 # RSSI tracking: best, min, sum, count
                 if rssi > d["rssi"]:
                     d["rssi"] = rssi
@@ -1314,6 +1328,7 @@ class DashboardState:
                     "rssi_sum": rssi,
                     "rssi_cnt": 1,
                     "type": pkt["pdu_type"],
+                    "phy": pkt.get("phy", "1M"),
                     "pkts": 1,
                     "crc_ok": 1 if pkt["crc_valid"] else 0,
                     "crc_bad": 1 if pkt["crc_valid"] is False else 0,
@@ -1325,6 +1340,7 @@ class DashboardState:
                     "tx_pwr": fp.get("tx_power"),
                     "services": list(fp.get("services") or []),
                     "identity": identity,
+                    "connectable": bool(pkt.get("connectable")),
                 }
                 if identity:
                     d["rpa_addrs"] = {mac}
@@ -1724,10 +1740,47 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_json({"ok": True})
             except Exception:
                 self.send_error(400)
+        elif path == "/api/gatt/query":
+            self._handle_gatt_query()
         elif path.startswith("/api/c2/"):
             self._handle_c2(path)
         else:
             self.send_error(404)
+
+    def _handle_gatt_query(self):
+        try:
+            body = self._read_post_body()
+            if body is None:
+                self.send_error(413)
+                return
+        except Exception:
+            self.send_error(400)
+            return
+
+        mac = body.get("mac", "").lower()
+        if not mac:
+            self._serve_json({"ok": False, "error": "mac required"})
+            return
+
+        # Only send to sensors that have actually seen this device
+        with state.lock:
+            c2_sensors = set(state.c2_sensor_status.keys())
+            seen_by = set(state.device_sensor_rssi.get(mac, {}).keys())
+            target_sensors = list(c2_sensors & seen_by)
+
+        if not target_sensors:
+            # No sensors with C2 have seen this device
+            if not c2_sensors:
+                self._serve_json({"ok": False, "error": "no sensors with C2 connected"})
+            else:
+                self._serve_json({"ok": False, "error": "no C2-connected sensor has seen this device"})
+            return
+
+        for sid in target_sensors:
+            state.send_c2_command(sid, "query_gatt", {"mac": mac})
+
+        self._serve_json({"status": "ok",
+                          "message": f"GATT query sent to {len(target_sensors)} sensor(s)"})
 
     def _handle_c2(self, path):
         try:
@@ -1967,6 +2020,28 @@ def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
         state.add_packet(pkt, gps_info, sensor_id)
 
 
+def _process_gatt_message(frames):
+    """Process a gatt: topic ZMQ message and store results in device state."""
+    # Expected frames: [b"gatt:", sensor_id_bytes, json_payload]
+    # or: [b"gatt:", json_payload] (no sensor_id)
+    if len(frames) < 2:
+        return
+    try:
+        payload = frames[-1]
+        result = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+
+    mac = result.get("mac", "").lower()
+    if not mac:
+        return
+
+    with state.lock:
+        if mac in state.devices:
+            state.devices[mac]["gatt"] = result
+            state._dirty = True
+
+
 def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
     """Bind SUB socket(s) and receive packets from connecting sensors."""
     ctx = zmq.Context()
@@ -1990,6 +2065,13 @@ def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
             continue
         except zmq.ZMQError:
             break
+
+        # Handle gatt: topic messages (frame 0 = topic, frame 1 = sensor_id,
+        # frame 2 = JSON payload)
+        if frames and frames[0] == b"gatt:":
+            _process_gatt_message(frames)
+            continue
+
         _process_zmq_message(frames, pcap_file, use_gps)
 
     sub.close()
@@ -2088,7 +2170,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ICE9 Bluetooth Sniffer</title>
+<title>Blue Dragon</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font: 12px/1.4 monospace; background: #1a1a1a; color: #ccc; }
@@ -2191,16 +2273,49 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
   color: #ccc; border: 1px solid #555; padding: 1px 3px; }
 .node-ctrl button { font-size: 10px; padding: 1px 6px; }
 .node-ctrl .val-label { font-size: 10px; color: #888; min-width: 30px; text-align: right; }
+/* Device detail slide-out panel */
+.detail-overlay { display:none; position:fixed; top:0; right:0; bottom:0;
+  width:420px; max-width:90vw; background:#1e1e1e; border-left:1px solid #444;
+  z-index:100; overflow-y:auto; padding:12px 16px; box-shadow:-4px 0 16px rgba(0,0,0,0.5); }
+.detail-overlay.open { display:block; }
+.detail-close { position:absolute; top:6px; right:10px; background:none; border:none;
+  color:#888; font-size:18px; cursor:pointer; }
+.detail-close:hover { color:#ccc; }
+.detail-hdr { font-size:13px; color:#fff; margin-bottom:10px; border-bottom:1px solid #333;
+  padding-bottom:8px; }
+.detail-row { display:flex; margin:3px 0; font-size:11px; }
+.detail-row .lbl { color:#666; width:90px; flex-shrink:0; }
+.detail-row .val { color:#ccc; word-break:break-all; }
+.detail-section { margin-top:12px; }
+.detail-section h4 { color:#888; font-size:11px; text-transform:uppercase;
+  margin-bottom:4px; border-bottom:1px solid #333; padding-bottom:3px; font-weight:normal; }
+.gatt-svc { margin:6px 0; padding:4px 0 4px 8px; border-left:2px solid #345; }
+.gatt-svc-uuid { color:#68f; font-size:11px; font-weight:bold; }
+.gatt-svc-label { color:#888; font-size:10px; margin-left:6px; }
+.gatt-char { margin:3px 0 3px 12px; padding:2px 0 2px 8px; border-left:1px solid #333; }
+.gatt-char-uuid { color:#ca6; font-size:10px; }
+.gatt-char-flags { color:#555; font-size:9px; margin-left:4px; }
+.gatt-char-val { color:#7c4; font-size:10px; margin-top:1px; word-break:break-all; }
+.gatt-error { color:#c44; font-size:11px; margin-top:4px; }
+.gatt-btn { font:11px monospace; background:#234; color:#68f; border:1px solid #345;
+  padding:3px 12px; cursor:pointer; margin-top:6px; }
+.gatt-btn:hover { background:#345; }
+.gatt-btn:disabled { opacity:0.4; cursor:default; }
+.gatt-pending { color:#888; font-size:11px; margin-top:4px; }
+.conn-badge { display:inline-block; width:8px; height:8px; border-radius:50%;
+  background:#345; margin-right:3px; vertical-align:middle; }
+.conn-badge.yes { background:#68f; }
 @media (max-width: 900px) {
   .summary-grid { grid-template-columns: 1fr; }
   .summary-card.wide, .summary-card.full { grid-column: span 1; }
+  .detail-overlay { width: 100vw; max-width: 100vw; }
 }
 </style>
 </head>
 <body>
 
 <div class="toolbar">
-  <b>ice9-bluetooth</b>
+  <b>blue-dragon</b>
   <span class="status" id="conn">disconnected</span>
   <div class="tabs" id="tabBar">
     <div class="tab active" data-tab="devices" onclick="switchTab('devices')">devices</div>
@@ -2243,6 +2358,7 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
         <th data-col="name">name</th>
         <th data-col="services">services</th>
         <th data-col="type">type</th>
+        <th data-col="phy">phy</th>
         <th data-col="rssi">rssi</th>
         <th data-col="est_dist">dist</th>
         <th data-col="num_sensors">sensors</th>
@@ -2320,6 +2436,11 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
     </table>
     <div class="empty" id="connEmpty">no active connections</div>
   </div>
+</div>
+
+<div class="detail-overlay" id="detailPanel">
+  <button class="detail-close" onclick="closeDetail()">&times;</button>
+  <div id="detailContent"></div>
 </div>
 
 <script>
@@ -2502,7 +2623,13 @@ function renderDevices() {
     const tr = document.createElement('tr');
     const fresh = (now - d.last) < 3;
     if (fresh) tr.className = 'fresh';
+    tr.style.cursor = 'pointer';
+    tr.addEventListener('click', ((dev) => (e) => {
+      if (e.target.tagName === 'BUTTON') return;
+      openDetail(dev);
+    })(d));
     const proto = d.protocol || 'BLE';
+    const connBadge = d.connectable ? '<span class="conn-badge yes" title="connectable"></span>' : '';
     let mc, macCls;
     if (proto === 'BT') {
       mc = priv ? 'bt:xx:xx:xx' : btMacLabel(d);
@@ -2525,13 +2652,14 @@ function renderDevices() {
     const mt = d.mac_type || '';
     tr.innerHTML =
       `<td class="dim">${ago(d.last)}</td>`+
-      `<td>${protoBadge(proto)}</td>`+
+      `<td>${connBadge}${protoBadge(proto)}</td>`+
       `<td class="${macCls}">${mc}</td>`+
       `<td class="${addrCls(mt)}">${mt}</td>`+
       `<td>${esc(mfrLabel(d))}</td>`+
       `<td class="blu">${esc(d.name)}</td>`+
       `<td class="dim">${esc(svcLabel(d))}</td>`+
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
+      `<td class="${d.phy!=='1M'?'org':'dim'}">${d.phy||'1M'}</td>`+
       `<td>${rssiLabel(d)}</td>`+
       `<td class="dim">${dist}</td>`+
       `<td class="dim">${d.num_sensors||''}</td>`+
@@ -2899,6 +3027,123 @@ function renderConnections() {
   ctb.appendChild(frag);
 }
 
+/* --- Device detail panel --- */
+let detailMac = null;
+let gattPending = {};
+
+function openDetail(d) {
+  detailMac = d.mac;
+  renderDetail(d);
+  document.getElementById('detailPanel').classList.add('open');
+}
+
+function closeDetail() {
+  detailMac = null;
+  document.getElementById('detailPanel').classList.remove('open');
+}
+
+function renderDetail(d) {
+  const el = document.getElementById('detailContent');
+  const mc = priv ? mask(d.mac) : d.mac;
+  const proto = d.protocol || 'BLE';
+  const total = d.crc_ok + d.crc_bad;
+  const crcPct = total > 0 ? Math.round(100*d.crc_ok/total)+'%' : '-';
+  const connLabel = d.connectable ? '<span class="grn">yes</span>' : '<span class="dim">no</span>';
+
+  let html = '<div class="detail-hdr">' + esc(mc) + ' ' + protoBadge(proto) + '</div>';
+  html += '<div class="detail-row"><span class="lbl">Name</span><span class="val blu">' + esc(d.name||'-') + '</span></div>';
+  html += '<div class="detail-row"><span class="lbl">Manufacturer</span><span class="val">' + esc(mfrLabel(d)||'-') + '</span></div>';
+  html += '<div class="detail-row"><span class="lbl">Addr type</span><span class="val ' + addrCls(d.mac_type||'') + '">' + esc(d.mac_type||'-') + '</span></div>';
+  html += '<div class="detail-row"><span class="lbl">Connectable</span><span class="val">' + connLabel + '</span></div>';
+  html += '<div class="detail-row"><span class="lbl">RSSI</span><span class="val">' + rssiLabel(d) + ' dBm</span></div>';
+  if (d.tx_pwr != null) html += '<div class="detail-row"><span class="lbl">TX power</span><span class="val">' + d.tx_pwr + ' dBm</span></div>';
+  if (d.est_dist != null) html += '<div class="detail-row"><span class="lbl">Est. dist</span><span class="val">~' + d.est_dist + ' m</span></div>';
+  html += '<div class="detail-row"><span class="lbl">Packets</span><span class="val">' + d.pkts.toLocaleString() + '</span></div>';
+  html += '<div class="detail-row"><span class="lbl">CRC</span><span class="val">' + crcPct + ' (' + d.crc_ok + ' ok, ' + d.crc_bad + ' bad)</span></div>';
+  html += '<div class="detail-row"><span class="lbl">PDU type</span><span class="val">' + esc(d.type) + '</span></div>';
+  html += '<div class="detail-row"><span class="lbl">PHY</span><span class="val">' + esc(d.phy||'1M') + '</span></div>';
+  html += '<div class="detail-row"><span class="lbl">First seen</span><span class="val">' + fmtT(d.first) + '</span></div>';
+  html += '<div class="detail-row"><span class="lbl">Last seen</span><span class="val">' + ago(d.last) + '</span></div>';
+  if (d.num_sensors > 0) html += '<div class="detail-row"><span class="lbl">Sensors</span><span class="val">' + d.num_sensors + (d.sensor_ids ? ' (' + d.sensor_ids.join(', ') + ')' : '') + '</span></div>';
+
+  // AD services
+  if (d.services && d.services.length) {
+    html += '<div class="detail-section"><h4>Advertised Services</h4>';
+    for (const s of d.services) html += '<div style="font-size:10px;color:#c6f;margin:1px 0">' + esc(s) + '</div>';
+    html += '</div>';
+  }
+
+  // GATT section
+  html += '<div class="detail-section"><h4>GATT Profile</h4>';
+  if (d.gatt) {
+    html += renderGattResult(d.gatt);
+  } else if (gattPending[d.mac]) {
+    html += '<div class="gatt-pending">Querying GATT services...</div>';
+  } else {
+    html += '<div class="dim" style="font-size:10px">No GATT data available.</div>';
+  }
+  if (d.connectable) {
+    const btnDisabled = gattPending[d.mac] ? ' disabled' : '';
+    const btnLabel = gattPending[d.mac] ? 'querying...' : (d.gatt ? 'refresh GATT' : 'query GATT');
+    html += '<button class="gatt-btn"' + btnDisabled + ' onclick="queryGatt(\'' + d.mac.replace(/'/g,"\\'") + '\')">' + btnLabel + '</button>';
+  }
+  html += '</div>';
+
+  el.innerHTML = html;
+}
+
+function renderGattResult(g) {
+  if (g.error) {
+    return '<div class="gatt-error">Error: ' + esc(g.error) + '</div>';
+  }
+  let html = '';
+  if (g.device_name) {
+    html += '<div class="detail-row"><span class="lbl">Device name</span><span class="val blu">' + esc(g.device_name) + '</span></div>';
+  }
+  const svcs = g.services || [];
+  if (!svcs.length) {
+    return html + '<div class="dim" style="font-size:10px">No services found.</div>';
+  }
+  for (const svc of svcs) {
+    html += '<div class="gatt-svc">';
+    html += '<span class="gatt-svc-uuid">' + esc(svc.uuid) + '</span>';
+    if (svc.primary === false) html += '<span class="gatt-svc-label">(secondary)</span>';
+    const chars = svc.characteristics || [];
+    for (const ch of chars) {
+      html += '<div class="gatt-char">';
+      html += '<span class="gatt-char-uuid">' + esc(ch.uuid) + '</span>';
+      if (ch.flags && ch.flags.length) html += '<span class="gatt-char-flags">[' + ch.flags.join(', ') + ']</span>';
+      if (ch.value_str) html += '<div class="gatt-char-val">"' + esc(ch.value_str) + '"</div>';
+      else if (ch.value) html += '<div class="gatt-char-val">' + esc(ch.value) + '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  return html;
+}
+
+function queryGatt(mac) {
+  gattPending[mac] = true;
+  fetch('/api/gatt/query', {
+    method: 'POST',
+    body: JSON.stringify({mac: mac}),
+    headers: {'Content-Type': 'application/json'}
+  }).then(r => r.json()).then(r => {
+    if (r.error || (!r.status && r.ok === false)) {
+      gattPending[mac] = false;
+      if (r.error) alert('GATT query failed: ' + r.error);
+    }
+    // Re-render detail if still showing this device
+    if (detailMac === mac) {
+      const dev = devices.find(d => d.mac === mac);
+      if (dev) renderDetail(dev);
+    }
+  }).catch(() => { gattPending[mac] = false; });
+  // Re-render immediately to show pending state
+  const dev = devices.find(d => d.mac === mac);
+  if (dev) renderDetail(dev);
+}
+
 es.addEventListener('update', e => {
   const d = JSON.parse(e.data);
   devices = d.devices;
@@ -2911,6 +3156,17 @@ es.addEventListener('update', e => {
   if (curTab === 'nodes') { renderNodes(); renderConnections(); }
   if (d.sensors && map) updateSensors(d.sensors);
   if (devices && map) updateDevicePositions(devices);
+  // Update detail panel if open
+  if (detailMac) {
+    const dev = devices.find(dd => dd.mac === detailMac);
+    if (dev) {
+      // Clear pending state if GATT data arrived
+      if (dev.gatt && gattPending[detailMac]) {
+        delete gattPending[detailMac];
+      }
+      renderDetail(dev);
+    }
+  }
   // Browser alerts
   if (d.alerts && d.alerts.length > 0) {
     for (const a of d.alerts) {
@@ -2936,7 +3192,7 @@ def main():
     global running, gps_enabled
 
     parser = argparse.ArgumentParser(
-        description="Live web dashboard for ice9-bluetooth-sniffer")
+        description="Live web dashboard for blue-dragon")
     parser.add_argument("endpoints", nargs="+",
                         help="ZMQ endpoints (e.g. tcp://localhost:5555)")
     parser.add_argument("-p", "--port", type=int, default=8099,
@@ -2957,7 +3213,7 @@ def main():
                         help="Path loss exponent for distance estimation (default: 2.0)")
     # SQLite persistence
     parser.add_argument("--db", metavar="FILE",
-                        help="SQLite database path (default: ~/.cache/ice9-bt-sniffer/devices.db)")
+                        help="SQLite database path (default: ~/.cache/blue-dragon/devices.db)")
     parser.add_argument("--no-db", action="store_true",
                         help="Disable SQLite device persistence")
     # Device alerting
@@ -3068,7 +3324,7 @@ def main():
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), DashboardHandler)
     httpd.timeout = 1
 
-    print(f"\n  ICE9 Bluetooth Sniffer - Web Dashboard", file=sys.stderr)
+    print(f"\n  Blue Dragon - Web Dashboard", file=sys.stderr)
     print(f"  {'='*40}", file=sys.stderr)
     print(f"  Dashboard:  http://localhost:{args.port}", file=sys.stderr)
     if args.write:
