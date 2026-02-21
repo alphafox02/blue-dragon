@@ -1,18 +1,27 @@
 [package]
-name = "bt-output"
+name = "bd-output"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 byteorder.workspace = true
-bt-protocol = { path = "../protocol" }
+bd-protocol = { path = "../protocol" }
+log.workspace = true
 
 [features]
 default = []
-zmq = ["dep:zmq"]
-gps = []
+zmq = ["dep:zmq", "dep:serde_json", "dep:crossbeam"]
+gps = ["dep:serde_json"]
 
 [dependencies.zmq]
 version = "0.10"
+optional = true
+
+[dependencies.serde_json]
+workspace = true
+optional = true
+
+[dependencies.crossbeam]
+workspace = true
 optional = true
