@@ -442,6 +442,14 @@ impl HackrfHandle {
         written / 2
     }
 
+    /// Set LNA and VGA gains at runtime (thread-safe FFI calls).
+    pub fn set_gain(&self, lna: u32, vga: u32) {
+        unsafe {
+            hackrf_set_lna_gain(self.dev, lna);
+            hackrf_set_vga_gain(self.dev, vga);
+        }
+    }
+
     pub fn max_samps(&self) -> usize {
         self.max_samps
     }

@@ -572,6 +572,13 @@ impl SoapyHandle {
         }
     }
 
+    /// Set RX gain at runtime (thread-safe FFI call).
+    pub fn set_gain(&self, gain: f64) {
+        unsafe {
+            SoapySDRDevice_setGain(self.dev, SOAPY_SDR_RX, 0, gain);
+        }
+    }
+
     pub fn max_samps(&self) -> usize {
         self.mtu
     }

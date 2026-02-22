@@ -586,6 +586,14 @@ impl UsrpHandle {
         num_rx
     }
 
+    /// Set RX gain at runtime (thread-safe FFI call).
+    pub fn set_gain(&self, gain: f64) {
+        let empty = CString::new("").unwrap();
+        unsafe {
+            uhd_usrp_set_rx_gain(self.usrp, gain, 0, empty.as_ptr());
+        }
+    }
+
     pub fn max_samps(&self) -> usize {
         self.max_samps
     }

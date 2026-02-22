@@ -1,8 +1,10 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "zmq")]
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam::channel;
@@ -518,8 +520,11 @@ fn spawn_parallel_pipeline(
     check_crc: bool,
     print_stats: bool,
     overflow_count: Arc<std::sync::atomic::AtomicU64>,
+    squelch_pending: Arc<AtomicI32>,
     #[cfg(feature = "zmq")]
     zmq_config: Option<(String, Option<String>, Option<String>)>,
+    #[cfg(feature = "zmq")]
+    hb_state: Option<Arc<Mutex<bd_output::control::HeartbeatState>>>,
     #[cfg(feature = "gps")]
     gps_client: Option<bd_output::gps::GpsClient>,
 ) -> (
@@ -566,11 +571,23 @@ fn spawn_parallel_pipeline(
         let burst_tx = burst_tx.clone();
         let num_ch = num_channels;
         let scale = fft_scale;
+        let sq_pending = squelch_pending.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("burst-{}", worker_id))
             .spawn(move || {
+                let mut current_squelch = i32::MIN;
                 for msg in batch_rx.iter() {
+                    // Check for squelch update
+                    let sq = sq_pending.load(Ordering::Relaxed);
+                    if sq != current_squelch && sq != i32::MIN {
+                        let threshold = sq as f32 / 10.0;
+                        for c in catchers.iter_mut() {
+                            c.set_squelch(threshold);
+                        }
+                        current_squelch = sq;
+                    }
+
                     for (i, assign) in channels.iter().enumerate() {
                         let catcher = &mut catchers[i];
                         for t in 0..msg.batch_steps {
@@ -670,6 +687,17 @@ fn spawn_parallel_pipeline(
                             conns,
                             overflows,
                         );
+
+                        // Update heartbeat state for C2
+                        #[cfg(feature = "zmq")]
+                        if let Some(ref hb) = hb_state {
+                            if let Ok(mut s) = hb.lock() {
+                                s.total_pkts = stats.total_ble + stats.total_bt;
+                                s.pkt_rate = (stats.total_ble + stats.total_bt) as f64 / elapsed;
+                                s.crc_pct = stats.crc_pct();
+                            }
+                        }
+
                         last_stats = Instant::now();
                     }
                 }
@@ -782,6 +810,25 @@ impl SdrHandle {
             SdrHandle::BladeRf(h) => h.overflow_count(),
             #[cfg(feature = "soapysdr")]
             SdrHandle::Soapy(h) => h.overflow_count(),
+        }
+    }
+
+    /// Set SDR gain at runtime. For HackRF, gain is split as LNA=gain, VGA from lna/vga fields.
+    #[allow(unused_variables)]
+    fn set_gain(&self, gain: f64, hackrf_lna: Option<u32>, hackrf_vga: Option<u32>) {
+        match self {
+            #[cfg(feature = "usrp")]
+            SdrHandle::Usrp(h) => h.set_gain(gain),
+            #[cfg(feature = "hackrf")]
+            SdrHandle::HackRf(h) => {
+                let lna = hackrf_lna.unwrap_or(gain as u32);
+                let vga = hackrf_vga.unwrap_or(20);
+                h.set_gain(lna, vga);
+            }
+            #[cfg(feature = "bladerf")]
+            SdrHandle::BladeRf(h) => h.set_gain(gain),
+            #[cfg(feature = "soapysdr")]
+            SdrHandle::Soapy(h) => h.set_gain(gain),
         }
     }
 }
@@ -937,52 +984,102 @@ pub fn run_live(
         let _ = (zmq_endpoint, zmq_curve_keyfile, sensor_id);
     }
 
-    // C2 control thread (optional, requires ZMQ)
+    // Shared atomics for runtime C2 control
+    let gain_pending = Arc::new(AtomicI32::new(i32::MIN));
+    let squelch_pending = Arc::new(AtomicI32::new(i32::MIN));
+
+    // C2 control thread + command dispatch (optional, requires ZMQ)
     #[cfg(feature = "zmq")]
-    let _c2_thread: Option<std::thread::JoinHandle<()>> = if let Some(ref ep) = zmq_endpoint {
-        let ctrl_ep = bd_output::zmq_pub::derive_control_endpoint(ep);
-        let sid = sensor_id.unwrap_or("blue-dragon").to_string();
+    let hb_state_for_decode: Option<Arc<Mutex<bd_output::control::HeartbeatState>>>;
+    #[cfg(feature = "zmq")]
+    let _c2_threads: Option<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)> =
+        if let Some(ref ep) = zmq_endpoint {
+            let ctrl_ep = bd_output::zmq_pub::derive_control_endpoint(ep);
+            let sid = sensor_id.unwrap_or("blue-dragon").to_string();
 
-        let hb_state = std::sync::Arc::new(std::sync::Mutex::new(
-            bd_output::control::HeartbeatState::new(
-                &sid, sdr_type, center_freq_mhz, num_channels as u32,
-            ),
-        ));
-        // Set initial gain/squelch
-        {
-            let mut s = hb_state.lock().unwrap();
-            s.gain = gain;
-            s.squelch = squelch_db;
-        }
-
-        let (cmd_tx, _cmd_rx) = crossbeam::channel::bounded(16);
-        let c2_running = running.clone();
-        let curve_kf = zmq_curve_keyfile.map(|s| s.to_string());
-
-        let ctrl = bd_output::control::ControlClient::new(
-            &ctrl_ep,
-            &sid,
-            curve_kf.as_deref(),
-            hb_state,
-            cmd_tx,
-            c2_running,
-        );
-
-        match ctrl {
-            Ok(client) => {
-                Some(std::thread::Builder::new()
-                    .name("c2-control".to_string())
-                    .spawn(move || client.run())
-                    .map_err(|e| format!("c2 thread: {}", e))?)
+            let hb_state = Arc::new(Mutex::new(
+                bd_output::control::HeartbeatState::new(
+                    &sid, sdr_type, center_freq_mhz, num_channels as u32,
+                ),
+            ));
+            {
+                let mut s = hb_state.lock().unwrap();
+                s.gain = gain;
+                s.squelch = squelch_db;
             }
-            Err(e) => {
-                eprintln!("C2: {}", e);
-                None
+
+            let (cmd_tx, cmd_rx) = crossbeam::channel::bounded(16);
+            let c2_running = running.clone();
+            let curve_kf = zmq_curve_keyfile.map(|s| s.to_string());
+
+            let ctrl = bd_output::control::ControlClient::new(
+                &ctrl_ep,
+                &sid,
+                curve_kf.as_deref(),
+                hb_state.clone(),
+                cmd_tx,
+                c2_running,
+            );
+
+            match ctrl {
+                Ok(client) => {
+                    hb_state_for_decode = Some(hb_state.clone());
+                    let c2_handle = std::thread::Builder::new()
+                        .name("c2-control".to_string())
+                        .spawn(move || client.run())
+                        .map_err(|e| format!("c2 thread: {}", e))?;
+
+                    // Command dispatch thread: reads commands from C2, updates atomics
+                    let gp = gain_pending.clone();
+                    let sp = squelch_pending.clone();
+                    let hb = hb_state.clone();
+                    let disp_running = running.clone();
+
+                    let dispatch_handle = std::thread::Builder::new()
+                        .name("c2-dispatch".to_string())
+                        .spawn(move || {
+                            use bd_output::control::ControlCommand;
+                            while disp_running.load(Ordering::Relaxed) {
+                                match cmd_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                                    Ok(cmd) => match cmd {
+                                        ControlCommand::SetGain { gain, lna: _, vga: _, req_id: _ } => {
+                                            // Store gain * 10 as integer
+                                            gp.store((gain * 10.0) as i32, Ordering::Relaxed);
+                                            if let Ok(mut s) = hb.lock() {
+                                                s.gain = gain;
+                                            }
+                                            eprintln!("C2: gain set to {:.1} dB", gain);
+                                        }
+                                        ControlCommand::SetSquelch { threshold, req_id: _ } => {
+                                            sp.store((threshold * 10.0) as i32, Ordering::Relaxed);
+                                            if let Ok(mut s) = hb.lock() {
+                                                s.squelch = threshold;
+                                            }
+                                            eprintln!("C2: squelch set to {:.1} dB", threshold);
+                                        }
+                                        ControlCommand::Restart { center_freq: _, channels: _, req_id: _ } => {
+                                            eprintln!("C2: restart requested (not yet implemented in Rust)");
+                                        }
+                                    },
+                                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                                    Err(_) => break,
+                                }
+                            }
+                        })
+                        .map_err(|e| format!("c2 dispatch thread: {}", e))?;
+
+                    Some((c2_handle, dispatch_handle))
+                }
+                Err(e) => {
+                    hb_state_for_decode = None;
+                    eprintln!("C2: {}", e);
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            hb_state_for_decode = None;
+            None
+        };
 
     // GPU path
     #[cfg(feature = "gpu")]
@@ -994,8 +1091,11 @@ pub fn run_live(
             live_ch, first_live, last_live, burst_catchers,
             fsk, aa_correlator, syndrome_map, conn_table,
             pcap_writer, check_crc, print_stats,
+            gain_pending.clone(), squelch_pending.clone(),
             #[cfg(feature = "zmq")]
             zmq_config,
+            #[cfg(feature = "zmq")]
+            hb_state_for_decode,
             #[cfg(feature = "gps")]
             gps_client,
         );
@@ -1032,8 +1132,11 @@ pub fn run_live(
         check_crc,
         print_stats,
         overflow_count.clone(),
+        squelch_pending.clone(),
         #[cfg(feature = "zmq")]
         zmq_config,
+        #[cfg(feature = "zmq")]
+        hb_state_for_decode,
         #[cfg(feature = "gps")]
         gps_client,
     );
@@ -1045,11 +1148,19 @@ pub fn run_live(
     let sdr_running = running.clone();
     let sdr_buf_size = max_samps * 2;
 
+    let sdr_gain_pending = gain_pending.clone();
     let sdr_thread = std::thread::Builder::new()
         .name("sdr-recv".to_string())
         .spawn(move || {
             let mut buf = vec![0i8; sdr_buf_size];
             while sdr_running.load(Ordering::Relaxed) {
+                // Check for runtime gain change from C2
+                let pending_gain = sdr_gain_pending.swap(i32::MIN, Ordering::Relaxed);
+                if pending_gain != i32::MIN {
+                    let gain_db = pending_gain as f64 / 10.0;
+                    sdr.set_gain(gain_db, None, None);
+                }
+
                 let num_rx = sdr.recv_into(&mut buf);
                 if num_rx == 0 {
                     continue;
@@ -1165,8 +1276,12 @@ fn run_live_gpu_loop(
     pcap_writer: Option<PcapWriter<BufWriter<File>>>,
     check_crc: bool,
     print_stats: bool,
+    gain_pending: Arc<AtomicI32>,
+    squelch_pending: Arc<AtomicI32>,
     #[cfg(feature = "zmq")]
     zmq_config: Option<(String, Option<String>, Option<String>)>,
+    #[cfg(feature = "zmq")]
+    hb_state_for_decode: Option<Arc<Mutex<bd_output::control::HeartbeatState>>>,
     #[cfg(feature = "gps")]
     gps_client: Option<bd_output::gps::GpsClient>,
 ) -> Result<(), String> {
@@ -1174,7 +1289,7 @@ fn run_live_gpu_loop(
 
     const GPU_BATCH_SIZE: usize = 4096;
 
-    let mut sdr = sdr;
+    let sdr = sdr;
     let max_samps = sdr.max_samps();
 
     let gpu = bd_gpu::GpuChannelizer::new(
@@ -1204,8 +1319,11 @@ fn run_live_gpu_loop(
         check_crc,
         print_stats,
         overflow_count.clone(),
+        squelch_pending,
         #[cfg(feature = "zmq")]
         zmq_config,
+        #[cfg(feature = "zmq")]
+        hb_state_for_decode,
         #[cfg(feature = "gps")]
         gps_client,
     );
@@ -1216,12 +1334,20 @@ fn run_live_gpu_loop(
     let sdr_running = running.clone();
     let sdr_buf_size = max_samps * 2;
 
+    let sdr_gain_pending = gain_pending;
     let sdr_thread = std::thread::Builder::new()
         .name("sdr-recv-gpu".to_string())
         .spawn(move || {
             let mut sdr = sdr;
             let mut buf = vec![0i8; sdr_buf_size];
             while sdr_running.load(Ordering::Relaxed) {
+                // Check for runtime gain change from C2
+                let pending_gain = sdr_gain_pending.swap(i32::MIN, Ordering::Relaxed);
+                if pending_gain != i32::MIN {
+                    let gain_db = pending_gain as f64 / 10.0;
+                    sdr.set_gain(gain_db, None, None);
+                }
+
                 let num_rx = sdr.recv_into(&mut buf);
                 if num_rx == 0 {
                     continue;
