@@ -33,6 +33,10 @@ struct Cli {
     #[arg(short = 'C', long, default_value = "40")]
     channels: usize,
 
+    /// All channels: sets -C 96 -c 2441 for full BLE band coverage
+    #[arg(short = 'a', long = "all-channels")]
+    all_channels: bool,
+
     /// PCAP output file or FIFO
     #[arg(short = 'w', long, alias = "fifo")]
     write: Option<PathBuf>,
@@ -254,10 +258,16 @@ fn main() {
         return;
     }
 
+    let (center_freq, channels) = if cli.all_channels {
+        (2441u32, 96usize)
+    } else {
+        (cli.center_freq, cli.channels)
+    };
+
     if cli.verbose {
         log::info!("blue-dragon starting");
-        log::info!("center frequency: {} MHz", cli.center_freq);
-        log::info!("channels: {}", cli.channels);
+        log::info!("center frequency: {} MHz", center_freq);
+        log::info!("channels: {}", channels);
     }
 
     if let Some(ref file) = cli.file {
@@ -274,8 +284,8 @@ fn main() {
         if let Err(e) = pipeline::run_file(
             file,
             format,
-            cli.center_freq,
-            cli.channels,
+            center_freq,
+            channels,
             cli.write.as_deref(),
             cli.check_crc,
             cli.squelch,
@@ -303,8 +313,8 @@ fn main() {
         let use_gpu = cfg!(feature = "gpu") && !cli.no_gpu;
         if let Err(e) = pipeline::run_live(
             iface,
-            cli.center_freq,
-            cli.channels,
+            center_freq,
+            channels,
             cli.gain,
             cli.squelch,
             cli.hackrf_lna,

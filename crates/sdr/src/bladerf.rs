@@ -177,23 +177,28 @@ impl SdrSource for BladerfSource {
                 BLADERF_FORMAT_SC16_Q11
             };
 
-            bladerf_set_bandwidth(dev, BLADERF_CHANNEL_RX_0, 56_000_000, ptr::null_mut());
+            if !use_sc8 {
+                let bw = self.sample_rate.min(56_000_000);
+                bladerf_set_bandwidth(dev, BLADERF_CHANNEL_RX_0, bw, ptr::null_mut());
+            }
             bladerf_set_frequency(dev, BLADERF_CHANNEL_RX_0, self.center_freq);
             bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_MGC);
             bladerf_set_gain(dev, BLADERF_CHANNEL_RX_0, self.gain);
+
+            let buf_size = (self.sample_rate / 1_000_000 / 2 * 4096).max(8192);
+            let r = bladerf_sync_config(dev, BLADERF_MODULE_RX, format, 16, buf_size, 8, 3500);
+            if r != 0 {
+                bladerf_close(dev);
+                return Err(format!("bladerf_sync_config failed: {}", r));
+            }
+
+            // Set sample rate AFTER sync_config (must occur after format change)
             bladerf_set_sample_rate(
                 dev,
                 BLADERF_CHANNEL_RX_0,
                 self.sample_rate,
                 ptr::null_mut(),
             );
-
-            let buf_size = 8192u32;
-            let r = bladerf_sync_config(dev, BLADERF_MODULE_RX, format, 16, buf_size, 8, 3500);
-            if r != 0 {
-                bladerf_close(dev);
-                return Err(format!("bladerf_sync_config failed: {}", r));
-            }
 
             let r = bladerf_enable_module(dev, BLADERF_MODULE_RX, true);
             if r != 0 {
@@ -252,8 +257,9 @@ impl SdrSource for BladerfSource {
 
                     let num_samples = buf_size as usize;
                     let mut data = Vec::with_capacity(num_samples * 2);
+                    // SC16_Q11: 12-bit data [-2048..2047], shift to i16 range
                     for i in 0..num_samples * 2 {
-                        data.push(sc16_buf[i] >> 4); // SC16_Q11 -> roughly 8-bit range
+                        data.push(sc16_buf[i] << 4);
                     }
 
                     if tx.send(SampleBuf { data, num_samples }).is_err() {
@@ -322,24 +328,41 @@ impl BladerfHandle {
                 BLADERF_FORMAT_SC16_Q11
             };
 
-            bladerf_set_bandwidth(dev, BLADERF_CHANNEL_RX_0, 56_000_000, ptr::null_mut());
+            // Only set bandwidth when NOT in oversample mode
+            if !use_sc8 {
+                let bw = sample_rate.min(56_000_000);
+                bladerf_set_bandwidth(dev, BLADERF_CHANNEL_RX_0, bw, ptr::null_mut());
+            }
             bladerf_set_frequency(dev, BLADERF_CHANNEL_RX_0, center_freq);
             bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_MGC);
             bladerf_set_gain(dev, BLADERF_CHANNEL_RX_0, gain);
-            bladerf_set_sample_rate(dev, BLADERF_CHANNEL_RX_0, sample_rate, ptr::null_mut());
 
-            let buf_size = 8192u32;
+            // Buffer size: match C tool (channels/2 * 4096, minimum 8192)
+            let buf_size = (sample_rate / 1_000_000 / 2 * 4096).max(8192);
             let r = bladerf_sync_config(dev, BLADERF_MODULE_RX, format, 16, buf_size, 8, 3500);
             if r != 0 {
                 bladerf_close(dev);
                 return Err(format!("bladerf_sync_config failed: {}", r));
             }
 
+            // Set sample rate AFTER sync_config (must occur after format change)
+            bladerf_set_sample_rate(dev, BLADERF_CHANNEL_RX_0, sample_rate, ptr::null_mut());
+
             let r = bladerf_enable_module(dev, BLADERF_MODULE_RX, true);
             if r != 0 {
                 bladerf_close(dev);
                 return Err(format!("bladerf_enable_module failed: {}", r));
             }
+
+            log::info!(
+                "bladeRF open (instance={}, {} MHz, {} MS/s, gain={} dB, {}, buf={})",
+                instance,
+                center_freq / 1_000_000,
+                sample_rate / 1_000_000,
+                gain,
+                if use_sc8 { "SC8" } else { "SC16" },
+                buf_size,
+            );
 
             let max_samps = buf_size as usize;
             let sc16_buf = if !use_sc8 {
@@ -386,11 +409,20 @@ impl BladerfHandle {
                 if r != 0 {
                     return 0;
                 }
+                // SC16_Q11: 12-bit data in 16-bit container [-2048..2047]
+                // Shift right by 4 to map to int8 range [-128..127]
                 for i in 0..max_samps * 2 {
-                    buf[i] = (self.sc16_buf[i] >> 8) as i8;
+                    buf[i] = (self.sc16_buf[i] >> 4) as i8;
                 }
                 max_samps
             }
+        }
+    }
+
+    /// Set RX gain at runtime (thread-safe FFI call).
+    pub fn set_gain(&self, gain: f64) {
+        unsafe {
+            bladerf_set_gain(self.dev, BLADERF_CHANNEL_RX_0, gain as c_int);
         }
     }
 

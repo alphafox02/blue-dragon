@@ -1,4 +1,7 @@
 fn main() {
+    // Search /usr/local/lib for libraries installed from source
+    println!("cargo:rustc-link-search=native=/usr/local/lib");
+
     #[cfg(feature = "usrp")]
     {
         println!("cargo:rustc-link-lib=uhd");

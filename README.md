@@ -96,6 +96,7 @@ SDR settings:
     -i, --interface IFACE   SDR device (e.g. usrp-B210-FCO2P05)
     -c, --center-freq FREQ  Center frequency in MHz (default: 2441)
     -C, --channels N        Number of channels (default: 40)
+    -a, --all-channels      Full BLE band: sets -C 96 -c 2441
     -g, --gain DB           SDR gain (default: 60)
     --hackrf-lna DB         HackRF LNA gain (default: 40)
     --hackrf-vga DB         HackRF VGA gain (default: 20)
