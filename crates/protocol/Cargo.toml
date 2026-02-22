@@ -1,5 +1,5 @@
 [package]
-name = "bt-protocol"
+name = "bd-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

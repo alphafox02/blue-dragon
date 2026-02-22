@@ -40,13 +40,17 @@ impl FskDemod {
         self.prev_sample = Complex32::new(0.0, 0.0);
     }
 
-    /// FM frequency discriminator: arg(y[n] * conj(y[n-1]))
-    /// This replaces liquid-dsp's freqdem_demodulate_block
+    /// FM frequency discriminator: arg(y[n] * conj(y[n-1])) / (2*pi*kf)
+    /// This replaces liquid-dsp's freqdem_demodulate_block.
+    /// The kf=0.5 normalization matches liquid-dsp's freqdem_create(0.5f),
+    /// producing output in roughly [-1, 1] range for BLE signals.
     fn freq_discriminate(&mut self, burst: &[Complex32]) -> Vec<f32> {
+        // kf = 0.5 → normalization = 1/(2*pi*0.5) = 1/pi
+        const KF_NORM: f32 = std::f32::consts::FRAC_1_PI;
         let mut demod = Vec::with_capacity(burst.len());
         for &sample in burst {
             let product = sample * self.prev_sample.conj();
-            demod.push(product.arg());
+            demod.push(product.arg() * KF_NORM);
             self.prev_sample = sample;
         }
         demod
@@ -165,9 +169,10 @@ mod tests {
             .map(|i| Complex32::from_polar(1.0, freq * i as f32))
             .collect();
         let result = demod.freq_discriminate(&burst);
-        // After the first sample, all values should be ~freq
+        // After the first sample, all values should be ~freq/PI (normalized by kf=0.5)
+        let expected = freq * std::f32::consts::FRAC_1_PI;
         for &val in &result[1..] {
-            assert!((val - freq).abs() < 0.01, "got {}, expected {}", val, freq);
+            assert!((val - expected).abs() < 0.01, "got {}, expected {}", val, expected);
         }
     }
 

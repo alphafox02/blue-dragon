@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use byteorder::{LittleEndian, WriteBytesExt};
-use bt_protocol::ble::BlePacket;
-use bt_protocol::btbb::ClassicBtPacket;
+use bd_protocol::ble::BlePacket;
+use bd_protocol::btbb::ClassicBtPacket;
 
 // Link-layer type constants
 pub const DLT_PPI: u32 = 192;
@@ -174,7 +174,7 @@ impl<W: Write> PcapWriter<W> {
 
         let rf_channel = (pkt.freq - 2402) as u8;
         let payload_len = if pkt.has_header { 7 } else { 0 };
-        let bt_hdr_len = 20usize; // pcap_bredr_bb_header_t size
+        let bt_hdr_len = 22usize; // pcap_bredr_bb_header_t size
         let total_bt_len = bt_hdr_len + payload_len;
 
         let ppi_len = if gps.map_or(false, |g| g.valid) {
@@ -273,11 +273,11 @@ pub fn zmq_build_ble(pkt: &BlePacket) -> Vec<u8> {
 }
 
 /// Build a ZMQ message buffer for a Classic BT packet.
-/// Format: type_byte(1) + pcaprec_hdr(16) + bredr_header(20) + [raw_header(7)]
+/// Format: type_byte(1) + pcaprec_hdr(16) + bredr_header(22) + [raw_header(7)]
 pub fn zmq_build_bt(pkt: &ClassicBtPacket) -> Vec<u8> {
     let flags: u16 = BREDR_SIGNAL_POWER_VALID | BREDR_NOISE_POWER_VALID;
     let payload_len = if pkt.has_header { 7usize } else { 0 };
-    let total_len = 20 + payload_len;
+    let total_len = 22 + payload_len;
     let msg_len = 1 + 16 + total_len;
     let mut buf = Vec::with_capacity(msg_len);
 
@@ -355,7 +355,7 @@ mod tests {
             noise_db: -90,
             freq: 2426,
             len: 9,
-            timestamp: bt_protocol::Timespec { tv_sec: 1000, tv_nsec: 500_000_000 },
+            timestamp: bd_protocol::Timespec { tv_sec: 1000, tv_nsec: 500_000_000 },
             crc_checked: true,
             crc_valid: true,
             is_data: false,

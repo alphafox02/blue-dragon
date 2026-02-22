@@ -19,7 +19,6 @@ fn bessel_i0(x: f64) -> f64 {
 ///
 /// - `n`: window length
 /// - `beta`: shape parameter (higher = narrower mainlobe, lower sidelobes)
-///   Typical: 6.0-8.0 for channelizer applications
 pub fn kaiser(n: usize, beta: f64) -> Vec<f64> {
     let mut w = Vec::with_capacity(n);
     let n_f = n as f64;
@@ -33,44 +32,44 @@ pub fn kaiser(n: usize, beta: f64) -> Vec<f64> {
     w
 }
 
-/// Generate prototype lowpass filter coefficients for the PFB channelizer.
+/// Generate prototype lowpass filter for the PFB type 2 channelizer.
 ///
-/// The filter is a windowed-sinc FIR with a Kaiser window, designed for M channels
-/// with `taps_per_channel` taps per polyphase branch.
+/// Matches C code's `liquid_firdes_kaiser(2*M*m+1, 0.75/M, 60.0, 0.0, h)`.
 ///
-/// Returns filter coefficients as int16 (Q15 fixed-point) for SIMD dot product.
-pub fn pfb_prototype(num_channels: usize, taps_per_channel: usize, beta: f64) -> Vec<i16> {
-    let total_taps = num_channels * taps_per_channel;
+/// - `num_channels`: M (number of output channels)
+/// - `semi_len`: m (filter semi-length, C code uses m=4)
+///
+/// Returns float coefficients of length 2*M*m+1.
+pub fn pfb_prototype_float(num_channels: usize, semi_len: usize) -> Vec<f32> {
+    let h_len = 2 * num_channels * semi_len + 1;
+    let fc = 0.75 / num_channels as f64; // normalized cutoff (C: lp_cutoff=0.75)
+    let as_db = 60.0_f64; // stopband attenuation
 
-    // Windowed-sinc lowpass at cutoff = 1/(2*M)
-    let fc = 1.0 / (2.0 * num_channels as f64);
-    let window = kaiser(total_taps, beta);
+    // Kaiser beta from stopband attenuation (matching liquid-dsp formula)
+    let beta = if as_db > 50.0 {
+        0.1102 * (as_db - 8.7)
+    } else if as_db > 21.0 {
+        0.5842 * (as_db - 21.0).powf(0.4) + 0.07886 * (as_db - 21.0)
+    } else {
+        0.0
+    };
 
-    let mut h = Vec::with_capacity(total_taps);
-    let half = (total_taps as f64 - 1.0) / 2.0;
+    let win = kaiser(h_len, beta);
+    let half = (h_len as f64 - 1.0) / 2.0;
+    let mut h = Vec::with_capacity(h_len);
 
-    for i in 0..total_taps {
-        let n = i as f64 - half;
-        let sinc = if n.abs() < 1e-12 {
-            2.0 * fc
+    for n in 0..h_len {
+        let t = n as f64 - half;
+        let sinc_val = if t.abs() < 1e-12 {
+            1.0
         } else {
-            (2.0 * PI * fc * n).sin() / (PI * n)
+            let x = 2.0 * fc * t;
+            (PI * x).sin() / (PI * x)
         };
-        h.push(sinc * window[i]);
+        h.push((sinc_val * win[n]) as f32);
     }
 
-    // Normalize so that sum of taps = 1
-    let sum: f64 = h.iter().sum();
-    for val in h.iter_mut() {
-        *val /= sum;
-    }
-
-    // Convert to Q15 fixed-point (int16)
-    // Scale by 32767 * num_channels to maintain energy after polyphase decomposition
-    let scale = 32767.0 * num_channels as f64;
-    h.iter()
-        .map(|&val| (val * scale).round().clamp(-32768.0, 32767.0) as i16)
-        .collect()
+    h
 }
 
 #[cfg(test)]
@@ -98,10 +97,29 @@ mod tests {
     }
 
     #[test]
-    fn test_pfb_prototype() {
-        let coeffs = pfb_prototype(96, 12, 7.0);
-        assert_eq!(coeffs.len(), 96 * 12);
-        // Should be non-trivial
-        assert!(coeffs.iter().any(|&c| c != 0));
+    fn test_pfb_prototype_float() {
+        let m = 40;
+        let semi_len = 4;
+        let h = pfb_prototype_float(m, semi_len);
+        assert_eq!(h.len(), 2 * m * semi_len + 1);
+        // Peak should be at center
+        let center = h.len() / 2;
+        let peak = h.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            (h[center].abs() - peak).abs() < 0.01,
+            "peak not at center: center={}, peak={}",
+            h[center],
+            peak
+        );
+        // Should be symmetric
+        for i in 0..h.len() / 2 {
+            assert!(
+                (h[i] - h[h.len() - 1 - i]).abs() < 1e-5,
+                "asymmetry at {}: {} != {}",
+                i,
+                h[i],
+                h[h.len() - 1 - i]
+            );
+        }
     }
 }

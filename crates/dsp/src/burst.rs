@@ -1,6 +1,6 @@
 use num_complex::Complex32;
 use crate::agc::{Agc, SquelchState};
-use bt_protocol::Timespec;
+use bd_protocol::Timespec;
 
 const BURST_START_SIZE: usize = 2048;
 const MAX_BURST_SIZE: usize = 32768;

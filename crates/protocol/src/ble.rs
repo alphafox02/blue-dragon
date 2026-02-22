@@ -437,4 +437,168 @@ mod tests {
         assert_eq!(freq_to_channel(2428), 11);
         assert_eq!(freq_to_channel(2478), 36);
     }
+
+    /// End-to-end test: construct a known BLE advertising packet,
+    /// whiten it, convert to bit array, and verify ble_burst decodes it
+    /// with correct CRC.
+    #[test]
+    fn test_ble_burst_known_packet() {
+        use crate::freq_to_channel;
+
+        let freq = 2402u32; // advertising channel 37
+        let channel = freq_to_channel(freq);
+        assert_eq!(channel, 37);
+
+        // Build a simple ADV_NONCONN_IND: type=0x02, length=12
+        // AdvA = 11:22:33:44:55:66, AdvData = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
+        let pdu_header: [u8; 2] = [0x02, 0x0C]; // type=2, len=12
+        let adv_a: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let adv_data: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        // PDU = header + AdvA + AdvData
+        let mut pdu = Vec::new();
+        pdu.extend_from_slice(&pdu_header);
+        pdu.extend_from_slice(&adv_a);
+        pdu.extend_from_slice(&adv_data);
+        assert_eq!(pdu.len(), 14);
+
+        // Compute CRC-24 over PDU
+        let crc = crc24(&pdu, 0x555555);
+        let crc_bytes = [
+            (crc & 0xFF) as u8,
+            ((crc >> 8) & 0xFF) as u8,
+            ((crc >> 16) & 0xFF) as u8,
+        ];
+
+        // Full packet bytes: AA(4) + PDU(14) + CRC(3) = 21 bytes
+        let aa_bytes = [0xD6u8, 0xBE, 0x89, 0x8E]; // LE encoding of 0x8E89BED6
+
+        // Convert to bit array (LSB first within each byte)
+        let mut all_bytes = Vec::new();
+        all_bytes.extend_from_slice(&aa_bytes);
+        all_bytes.extend_from_slice(&pdu);
+        all_bytes.extend_from_slice(&crc_bytes);
+
+        // Convert bytes to bits (LSB first)
+        let mut bits_raw = Vec::new();
+        for &byte in &all_bytes {
+            for j in 0..8 {
+                bits_raw.push((byte >> j) & 1);
+            }
+        }
+
+        // Apply whitening to PDU+CRC bits (not AA)
+        let mut bits_whitened = Vec::new();
+        // Preamble: 8 alternating bits (for AA starting with 0: 01010101)
+        bits_whitened.extend_from_slice(&[0, 1, 0, 1, 0, 1, 0, 1]);
+        // AA bits (not whitened)
+        bits_whitened.extend_from_slice(&bits_raw[..32]);
+        // PDU+CRC bits (whitened)
+        for i in 32..bits_raw.len() {
+            let wb = whitening_bit(channel, (i - 32) as u32);
+            bits_whitened.push(bits_raw[i] ^ wb);
+        }
+
+        // Add a few extra trailing bits (burst catcher always produces overshoot)
+        for _ in 0..16 {
+            bits_whitened.push(0);
+        }
+
+        // ble_burst should find this packet
+        let ts = crate::Timespec { tv_sec: 0, tv_nsec: 0 };
+        let pkt = ble_burst(&bits_whitened, freq, ts, true, |_aa| None);
+        assert!(pkt.is_some(), "ble_burst failed to find known packet");
+        let pkt = pkt.unwrap();
+        assert_eq!(pkt.aa, BLE_ADV_AA);
+        assert!(pkt.crc_checked, "CRC was not checked");
+        assert!(pkt.crc_valid, "CRC INVALID: packet data={:02X?}", &pkt.data);
+
+        // Verify dewhitened data matches original
+        assert_eq!(pkt.data[4], 0x02, "PDU type mismatch");
+        assert_eq!(pkt.data[5], 0x0C, "PDU length mismatch");
+        assert_eq!(&pkt.data[6..12], &adv_a, "AdvA mismatch");
+        assert_eq!(&pkt.data[12..18], &adv_data, "AdvData mismatch");
+    }
+
+    /// Test the AA correlator with a synthetic BLE signal
+    #[test]
+    fn test_correlator_known_packet() {
+        use crate::freq_to_channel;
+
+        let freq = 2402u32; // channel 37
+        let channel = freq_to_channel(freq);
+
+        // Build same packet as above
+        let pdu = [0x02u8, 0x0C, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                   0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let crc = crc24(&pdu, 0x555555);
+        let crc_bytes = [
+            (crc & 0xFF) as u8,
+            ((crc >> 8) & 0xFF) as u8,
+            ((crc >> 16) & 0xFF) as u8,
+        ];
+
+        // Build full packet bytes
+        let aa_bytes = [0xD6u8, 0xBE, 0x89, 0x8E];
+        let mut all_bytes = Vec::new();
+        all_bytes.extend_from_slice(&aa_bytes);
+        all_bytes.extend_from_slice(&pdu);
+        all_bytes.extend_from_slice(&crc_bytes);
+
+        // Convert to bits (LSB first)
+        let mut bits_raw = Vec::new();
+        for &byte in &all_bytes {
+            for j in 0..8 {
+                bits_raw.push((byte >> j) & 1);
+            }
+        }
+
+        // Apply whitening to PDU+CRC
+        let mut bits_pdu_whitened = Vec::new();
+        for i in 0..bits_raw.len() {
+            if i < 32 {
+                bits_pdu_whitened.push(bits_raw[i]); // AA not whitened
+            } else {
+                let wb = whitening_bit(channel, (i - 32) as u32);
+                bits_pdu_whitened.push(bits_raw[i] ^ wb);
+            }
+        }
+
+        // Build a synthetic demod signal: +1.0 for bit 1, -1.0 for bit 0
+        // Each bit repeated BLE_SPS=2 times
+        // Prepend some preamble + silence
+        let mut demod = Vec::new();
+        // 20 samples of silence
+        for _ in 0..20 {
+            demod.push(0.0f32);
+        }
+        // Preamble (8 bits * 2 sps = 16 samples)
+        let preamble = [0u8, 1, 0, 1, 0, 1, 0, 1];
+        for &b in &preamble {
+            let val = if b == 1 { 1.0 } else { -1.0 };
+            for _ in 0..BLE_SPS {
+                demod.push(val);
+            }
+        }
+        // Whitened packet bits
+        for &b in &bits_pdu_whitened {
+            let val = if b == 1 { 1.0 } else { -1.0 };
+            for _ in 0..BLE_SPS {
+                demod.push(val);
+            }
+        }
+        // Trail with some zeros
+        for _ in 0..40 {
+            demod.push(0.0f32);
+        }
+
+        let corr = AaCorrelator::new();
+        let ts = crate::Timespec { tv_sec: 0, tv_nsec: 0 };
+        let pkt = corr.correlate(&demod, freq, ts, true);
+        assert!(pkt.is_some(), "correlator failed to find known packet");
+        let pkt = pkt.unwrap();
+        assert_eq!(pkt.aa, BLE_ADV_AA);
+        assert!(pkt.crc_checked, "CRC was not checked");
+        assert!(pkt.crc_valid, "CRC INVALID on correlator: data={:02X?}", &pkt.data);
+    }
 }

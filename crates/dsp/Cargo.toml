@@ -1,5 +1,5 @@
 [package]
-name = "bt-dsp"
+name = "bd-dsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,4 +8,4 @@ license.workspace = true
 num-complex.workspace = true
 rustfft.workspace = true
 crossbeam.workspace = true
-bt-protocol = { path = "../protocol" }
+bd-protocol = { path = "../protocol" }
