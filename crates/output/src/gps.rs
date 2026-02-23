@@ -1,7 +1,7 @@
 // Copyright 2025-2026 CEMAXECUTER LLC
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -20,13 +20,13 @@ impl GpsClient {
     /// `port`: gpsd port (default 2947)
     pub fn new(host: &str, port: u16) -> Result<Self, String> {
         let addr = format!("{}:{}", host, port);
-        let stream = TcpStream::connect_timeout(
-            &addr
-                .parse()
-                .map_err(|e| format!("invalid gpsd address {}: {}", addr, e))?,
-            Duration::from_secs(5),
-        )
-        .map_err(|e| format!("failed to connect to gpsd at {}: {}", addr, e))?;
+        let sock_addr = addr
+            .to_socket_addrs()
+            .map_err(|e| format!("cannot resolve gpsd address {}: {}", addr, e))?
+            .next()
+            .ok_or_else(|| format!("no addresses for gpsd at {}", addr))?;
+        let stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+            .map_err(|e| format!("failed to connect to gpsd at {}: {}", addr, e))?;
 
         // Enable JSON watch mode
         let mut writer = stream
