@@ -266,20 +266,38 @@ Read from a previously recorded IQ file:
 
 ### Channel Count Guidelines
 
-The `-C` flag controls how many 1 MHz channels the polyphase channelizer
-creates. Each BLE/BT channel is 2 MHz wide. More channels = more spectrum
-coverage = more packets, but requires more CPU.
+The `-C` flag sets both the SDR sample rate and the number of 1 MHz FFT
+bins in the polyphase channelizer: **`-C 40` = 40 MHz bandwidth at
+40 Msps, split into 40 channels**.
 
-| Channels | Bandwidth | BLE Coverage | Notes |
-|----------|-----------|--------------|-------|
-| 4 | 4 MHz | ~5% | Minimal, for testing |
-| 20 | 20 MHz | ~25% | HackRF maximum |
-| 40 | 40 MHz | ~50% | Good starting point |
-| 48 | 48 MHz | ~60% | Better coverage |
-| 56 | 56 MHz | ~70% | Near full coverage |
-| 60 | 60 MHz | ~75% | Best CRC rates |
-| 80 | 80 MHz | 100% | Full BLE band |
-| 96 | 96 MHz | 100% | Full band with margin |
+BLE channels are spaced every **2 MHz** (ch 0 = 2402 MHz, ch 1 = 2404 MHz,
+..., ch 39 = 2480 MHz), so only half the FFT bins land on BLE channel
+centers. The other half sit between BLE channels (these still catch
+Classic Bluetooth, which uses 1 MHz spacing). This means you need
+roughly **2x the FFT bins to cover N BLE channels**:
+
+| `-C` | Bandwidth | BLE Channels | Notes |
+|------|-----------|-------------|-------|
+| 4 | 4 MHz | ~2 of 40 | Minimal, for testing |
+| 20 | 20 MHz | ~10 of 40 | HackRF maximum |
+| 40 | 40 MHz | ~20 of 40 | Good starting point |
+| 48 | 48 MHz | ~24 of 40 | Better coverage |
+| 56 | 56 MHz | ~28 of 40 | Near full coverage |
+| 60 | 60 MHz | ~30 of 40 | Best CRC rates |
+| 80 | 80 MHz | 40 of 40 | Full BLE band (2402-2480 MHz) |
+| 96 | 96 MHz | 40 of 40 | Full band + 8 MHz guard on each side |
+
+**Why `-C 80` for full coverage?** The BLE band spans 2402-2480 MHz
+(78 MHz). At 80 MHz centered on 2441 MHz, all 40 BLE channels fit
+within the captured bandwidth.
+
+**Why `-C 96` for bladeRF?** The extra 16 MHz (8 MHz per side) acts as
+a guard band, preventing filter roll-off from degrading channels at the
+band edges. The bladeRF 2.0 supports the wider sample rate natively.
+
+**Tradeoff:** More channels = more CPU. At `-C 40` you capture half the
+BLE band at half the compute cost. On constrained hardware (Raspberry Pi,
+HackRF's 20 MHz limit), smaller values are necessary.
 
 Best CRC validation rates are at channel counts that are multiples of 4
 near 40, 48, and 60. This is a characteristic of the PFBCH2 filterbank,
