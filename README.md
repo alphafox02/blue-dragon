@@ -1,10 +1,39 @@
 # Blue Dragon
 
-Wideband BLE and Classic Bluetooth (BR) passive sniffer written in Rust.
-Captures packets across multiple channels simultaneously using a polyphase
-channelizer. Decodes BLE 5 LE 1M, LE 2M, and LE Coded PHYs with Extended
-Advertising support. Wireshark-compatible PCAP output with optional ZMQ
-streaming, GPS tagging, and remote sensor management.
+Wideband BLE and Classic Bluetooth passive sniffer written in Rust.
+
+Most BLE sniffers capture one channel at a time. Blue Dragon uses a
+polyphase filterbank channelizer to capture **up to 40 BLE channels
+simultaneously** from a single SDR, decoding BLE 5 LE 1M, LE 2M, and
+LE Coded PHYs plus Classic Bluetooth BR in the same passband. This
+means no channel hopping and no missed packets -- every advertisement
+and connection event across the captured bandwidth is seen.
+
+Output is Wireshark-compatible PCAP with optional ZMQ streaming for
+multi-sensor deployments, GPS tagging for drive surveys, and a web
+dashboard for real-time monitoring.
+
+## Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| USRP B210 capture | Tested | USB 3, up to -C 40 validated |
+| BLE LE 1M decoding | Tested | 95-96% CRC pass rate |
+| BLE LE 2M decoding | Tested | |
+| BLE LE Coded decoding | Tested | Low volume confirmed in drive tests |
+| Classic BT BR detection | Tested | LAP extraction, UAP recovery |
+| PCAP output (PPI) | Tested | Mixed BLE+BT per-packet DLT |
+| GPS tagging (gpsd) | Tested | 100% packet tagging in drive tests |
+| ZMQ streaming | Tested | PUB/SUB + C2 heartbeat |
+| CurveZMQ encryption | Tested | Requires system libzmq with libsodium |
+| Wireshark extcap | Tested | Live capture with GPS/CRC options |
+| CPU SIMD (AVX2) | Tested | i7-12700H |
+| GPU OpenCL | Tested | NVIDIA RTX 3060, Intel UHD iGPU |
+| HackRF backend | Untested | Compiles, needs hardware validation |
+| bladeRF backend | Tested | |
+| SoapySDR backend | Tested | |
+| HCI GATT probing | Untested | Compiles, needs end-to-end test with --hci |
+| Channel counts -C 60+ | Untested | -C 40 validated, higher counts need testing |
 
 ## Supported Hardware
 
