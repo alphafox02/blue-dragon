@@ -133,7 +133,7 @@ any compute savings. The CPU NEON path is faster on Pi hardware.
 USRP is possible but UHD on Pi is heavy. SoapySDR with an RTL-SDR,
 Airspy, or HackRF is the better fit for Pi deployments.
 
-### macOS (Homebrew)
+### macOS (Homebrew) -- Untested
 
     brew install uhd hackrf libbladerf soapysdr zeromq pkg-config
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
