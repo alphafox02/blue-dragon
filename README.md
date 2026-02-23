@@ -325,9 +325,22 @@ Restart-required: center frequency, channel count (sensor restarts automatically
 
 ### CURVE Encryption
 
+CURVE encryption requires `libzmq3-dev` (system libzmq with libsodium).
+The `.cargo/config.toml` overrides the Rust crate's vendored libzmq build
+to link against the system library, which has full CURVE support.
+
+    # Generate a keypair:
     python3 tools/zmq_keygen.py server.key
+
+    # Start sensor with CURVE:
     blue-dragon -l ... --zmq tcp://collector:5555 --zmq-curve-key server.key
+
+    # Start dashboard with CURVE:
     python3 tools/zmq_web_dashboard.py tcp://*:5555 --server-key server.key
+
+The `server.key` contains both public and secret keys (keep it on the sensor
+and dashboard hosts). The `server.key.pub` contains only the public key and
+is safe to distribute.
 
 ## GPS Tagging
 

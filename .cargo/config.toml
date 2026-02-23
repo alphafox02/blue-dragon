@@ -1,0 +1,22 @@
+# Override zmq-sys vendored build to use system libzmq (required for CurveZMQ).
+#
+# The vendored zeromq-src compiles libzmq without libsodium, so CURVE
+# encryption is unavailable.  System libzmq (libzmq3-dev / libzmq-devel)
+# links against libsodium and has full CURVE support.
+#
+# Prerequisites:
+#   Debian/Ubuntu/DragonOS:  sudo apt install libzmq3-dev
+#   Fedora/RHEL:             sudo dnf install zeromq-devel
+#   Arch:                    sudo pacman -S zeromq
+#   macOS:                   brew install zeromq
+#
+# If your target triple is not listed below, add a section for it:
+#   [target.YOUR-TRIPLE.zmq]
+#   rustc-link-lib = ["zmq"]
+# Run `rustc --print cfg | grep target` to find your triple.
+
+[target.x86_64-unknown-linux-gnu.zmq]
+rustc-link-lib = ["zmq"]
+
+[target.aarch64-unknown-linux-gnu.zmq]
+rustc-link-lib = ["zmq"]
