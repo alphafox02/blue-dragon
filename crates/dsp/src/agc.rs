@@ -2,8 +2,12 @@ use num_complex::Complex32;
 
 /// AGC (Automatic Gain Control) replacing liquid-dsp's agc_crcf.
 ///
-/// Uses a simple envelope follower with attack/decay time constants.
+/// Uses a simple envelope follower with multiplicative gain update.
 /// The gain is adapted to normalize the signal to unit amplitude.
+/// Gain update uses the log-domain formula from liquid-dsp:
+///   g *= exp(-0.5 * alpha * ln(y_hat))
+/// Always positive, never oscillates (unlike the linear approximation
+/// which goes negative for signal_level > 1/alpha + 1).
 pub struct Agc {
     gain: f32,
     bandwidth: f32,
@@ -58,11 +62,11 @@ impl Agc {
         let alpha = self.bandwidth;
         self.signal_level = alpha * level + (1.0 - alpha) * self.signal_level;
 
-        // Adapt gain toward unity output
-        if self.signal_level > 1e-9 {
-            let error = 1.0 - self.signal_level;
-            self.gain *= 1.0 + alpha * error;
-            // Clamp gain to reasonable range
+        // Adapt gain toward unity output using liquid-dsp's stable formula:
+        // g *= exp(-0.5 * alpha * ln(y_hat))
+        // Smoothly decreases gain when output > 1, increases when < 1.
+        if self.signal_level > 1e-6 {
+            self.gain *= (-0.5 * alpha * self.signal_level.ln()).exp();
             self.gain = self.gain.clamp(1e-6, 1e6);
         }
 
@@ -141,6 +145,30 @@ mod tests {
         assert!(
             (output.norm() - 1.0).abs() < 0.3,
             "AGC output norm = {}, expected ~1.0",
+            output.norm()
+        );
+    }
+
+    #[test]
+    fn test_agc_stability_strong_signal() {
+        let mut agc = Agc::new(0.25, -45.0, 100);
+
+        // Start with weak noise
+        for _ in 0..100 {
+            agc.execute(Complex32::new(0.001, 0.0));
+        }
+
+        // Sudden strong signal (50x noise)
+        for _ in 0..50 {
+            let (output, _) = agc.execute(Complex32::new(0.05, 0.0));
+            assert!(output.norm() > 0.0, "output should never be zero");
+        }
+
+        // After convergence, should be near unity
+        let (output, _) = agc.execute(Complex32::new(0.05, 0.0));
+        assert!(
+            (output.norm() - 1.0).abs() < 0.5,
+            "AGC output = {}, expected ~1.0",
             output.norm()
         );
     }

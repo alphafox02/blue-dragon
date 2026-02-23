@@ -5,7 +5,7 @@ pub const BLE_SPS: usize = 2; // samples per symbol
 pub const BLE_AA_BITS: usize = 32;
 pub const BLE_AA_TLEN: usize = BLE_AA_BITS * BLE_SPS; // 64 samples
 pub const BLE_CORR_THRESH: f32 = 0.6;
-pub const BLE_MAX_HD: u32 = 4; // max hamming distance for AA match
+pub const BLE_MAX_HD: u32 = 4;
 
 // Pre-computed 127-bit whitening sequence (7-bit maximal-length LFSR, period 127)
 // All 40 BLE channels use the same sequence at different offsets
@@ -139,8 +139,10 @@ impl AaCorrelator {
             return None;
         }
 
-        // Slide template across demod, find best normalized correlation
-        let search_end = demod.len() - tlen;
+        // Slide template across demod, find best normalized correlation.
+        // Limit search to first 5000 samples: max LE 1M/2M packet is ~4300 samples
+        // at SPS=2. Searching further risks false positives in long coded bursts.
+        let search_end = (demod.len() - tlen).min(5000);
         let mut best_score: f32 = 0.0;
         let mut best_idx: usize = 0;
 
@@ -753,54 +755,130 @@ const CODED_PREAMBLE_PATTERN: [u8; 8] = [0, 0, 1, 1, 1, 1, 0, 0];
 const CODED_PREAMBLE_REPS: usize = 10;
 const CODED_PREAMBLE_SYMBOLS: usize = 8 * CODED_PREAMBLE_REPS; // 80
 
-/// Find LE Coded preamble in demod signal.
+/// Build GFSK-filtered correlation template for LE Coded advertising detection.
+/// Includes preamble (80 symbols) + FEC-encoded advertising AA at S=8 (512 symbols)
+/// Find LE Coded advertising packet in demod signal.
+/// max_search_samples: how far into the burst to search (0 = auto).
 /// Returns the sample index where the preamble starts, or None.
-pub fn find_coded_preamble(demod: &[f32], sps: usize) -> Option<usize> {
-    let preamble_samples = CODED_PREAMBLE_SYMBOLS * sps;
-    if demod.len() < preamble_samples + 100 {
+pub fn find_coded_preamble(demod: &[f32], sps: usize, max_search_samples: usize) -> Option<usize> {
+    find_coded_preamble_freq(demod, sps, max_search_samples, 0)
+}
+
+/// Inner coded preamble finder with frequency for diagnostics.
+///
+/// Uses bit-level pattern matching: hard-slices FM demod output and looks
+/// for the coded preamble pattern 00111100 repeated at least 5 times.
+/// This approach is robust to waveform shape differences between the
+/// transmitter's GFSK filter and the PFB channelizer's response.
+pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: usize, _freq: u32) -> Option<usize> {
+    // Need at least preamble + Block 1 worth of samples
+    let min_samples = CODED_PREAMBLE_SYMBOLS * sps + 600 * sps;
+    if demod.len() < min_samples {
         return None;
     }
 
-    // Build template
-    let mut template = Vec::with_capacity(preamble_samples);
-    for _ in 0..CODED_PREAMBLE_REPS {
-        for &bit in &CODED_PREAMBLE_PATTERN {
-            let val = if bit == 1 { 1.0f32 } else { -1.0 };
-            for _ in 0..sps {
-                template.push(val);
-            }
-        }
-    }
-
-    let template_norm: f32 = (template.len() as f32).sqrt();
-    let search_end = (demod.len() - preamble_samples).min(preamble_samples * 2);
-
-    let mut best_score: f32 = 0.0;
-    let mut best_idx: usize = 0;
-
-    for i in 0..search_end {
-        let mut dot: f32 = 0.0;
-        let mut win_sq: f32 = 0.0;
-        for j in 0..preamble_samples {
-            let s = demod[i + j];
-            dot += s * template[j];
-            win_sq += s * s;
-        }
-        let win_norm = win_sq.sqrt();
-        if win_norm > 0.001 {
-            let score = dot / (win_norm * template_norm);
-            if score > best_score {
-                best_score = score;
-                best_idx = i;
-            }
-        }
-    }
-
-    if best_score > 0.5 {
-        Some(best_idx)
+    let max_search = if max_search_samples > 0 {
+        max_search_samples
     } else {
-        None
+        demod.len()
+    };
+    let search_end = max_search.min(demod.len());
+
+    // Compute local DC offset (median-based CFO correction)
+    // Take median of first 200 samples to estimate DC offset from carrier offset
+    let dc_offset = {
+        let n = 200.min(demod.len());
+        let mut sorted: Vec<f32> = demod[..n].to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted[n / 2]
+    };
+
+    // Pattern: 00111100 at SPS=2 -> --++++-- (each symbol = 2 samples)
+    // We check symbols by averaging SPS samples centered on each symbol position.
+    // Require >= 5 consecutive pattern matches (out of 10 repetitions).
+    let pattern_len = 8; // 00111100
+    let pattern_samples = pattern_len * sps;
+    let min_reps = 5;
+
+    let mut best_pos: Option<usize> = None;
+    let mut best_reps: usize = 0;
+    let mut _best_confidence: f32 = 0.0;
+
+    // Try both sample phase offsets (0 and 1 within SPS=2)
+    for phase in 0..sps {
+        let mut i = phase;
+        while i + pattern_samples * (min_reps + 1) <= search_end {
+            // Extract symbols for this window
+            let mut reps = 0usize;
+            let mut total_conf: f32 = 0.0;
+
+            for rep in 0..10 {
+                let base = i + rep * pattern_samples;
+                if base + pattern_samples > search_end {
+                    break;
+                }
+
+                let mut match_count = 0usize;
+                let mut rep_conf: f32 = 0.0;
+                for sym_idx in 0..pattern_len {
+                    let sample_start = base + sym_idx * sps;
+                    // Average SPS samples for this symbol
+                    let mut val: f32 = 0.0;
+                    for s in 0..sps {
+                        val += demod[sample_start + s];
+                    }
+                    val = val / sps as f32 - dc_offset;
+
+                    let expected = if CODED_PREAMBLE_PATTERN[sym_idx] == 1 { 1 } else { 0 };
+                    let actual = if val > 0.0 { 1 } else { 0 };
+                    if actual == expected {
+                        match_count += 1;
+                        rep_conf += val.abs();
+                    }
+                }
+
+                if match_count >= 7 { // 7 of 8 symbols match
+                    reps += 1;
+                    total_conf += rep_conf;
+                } else {
+                    // Also check inverted pattern (11000011)
+                    let mut inv_match = 0usize;
+                    let mut inv_conf: f32 = 0.0;
+                    for sym_idx in 0..pattern_len {
+                        let sample_start = base + sym_idx * sps;
+                        let mut val: f32 = 0.0;
+                        for s in 0..sps {
+                            val += demod[sample_start + s];
+                        }
+                        val = val / sps as f32 - dc_offset;
+
+                        let expected = if CODED_PREAMBLE_PATTERN[sym_idx] == 1 { 0 } else { 1 };
+                        let actual = if val > 0.0 { 1 } else { 0 };
+                        if actual == expected {
+                            inv_match += 1;
+                            inv_conf += val.abs();
+                        }
+                    }
+                    if inv_match >= 7 {
+                        reps += 1;
+                        total_conf += inv_conf;
+                    } else {
+                        break; // pattern broken
+                    }
+                }
+            }
+
+            if reps >= min_reps && reps > best_reps {
+                best_reps = reps;
+                best_pos = Some(i);
+                _best_confidence = total_conf / (reps as f32 * pattern_len as f32);
+            }
+
+            i += sps; // advance one symbol at a time
+        }
     }
+
+    best_pos
 }
 
 /// LE Coded PHY burst decoder.
@@ -821,153 +899,267 @@ pub fn ble_coded_burst(
     check_crc: bool,
     mut crc_init_fn: impl FnMut(u32) -> Option<(u32, bool)>,
 ) -> Option<BlePacket> {
+    ble_coded_burst_search(demod, freq, timestamp, sps, check_crc, &mut crc_init_fn, 0)
+}
+
+/// LE Coded burst decoder with configurable search depth.
+/// max_search: how far into burst to search for preamble (0 = default 5000).
+pub fn ble_coded_burst_search(
+    demod: &[f32],
+    freq: u32,
+    timestamp: Timespec,
+    sps: usize,
+    check_crc: bool,
+    crc_init_fn: &mut dyn FnMut(u32) -> Option<(u32, bool)>,
+    max_search: usize,
+) -> Option<BlePacket> {
     use crate::fec;
 
-    // Find preamble
-    let preamble_start = find_coded_preamble(demod, sps)?;
+    // Find coded preamble (80 symbols of 00111100 pattern)
+    let preamble_start = match find_coded_preamble_freq(demod, sps, max_search, freq) {
+        Some(idx) => idx,
+        None => return None,
+    };
     let preamble_samples = CODED_PREAMBLE_SYMBOLS * sps;
-
-    // FEC Block 1 starts after preamble
-    let block1_start = preamble_start + preamble_samples;
 
     // FEC Block 1: 37 data bits -> 74 coded bits -> 592 symbols at S=8
     let block1_symbols = 74 * 8; // 592
-    let block1_samples = block1_symbols * sps;
+    let nominal_block1 = preamble_start + preamble_samples;
 
-    if block1_start + block1_samples > demod.len() {
-        return None;
-    }
+    // Block 1 search: try SPS=1 with normal and inverted polarity over a
+    // range of sample offsets.  The PFBCH2 outputs at 2 Msps but the coded
+    // signal resolves at 1 sample per symbol (minimum S=8 run length = 4
+    // samples), so SPS=1 is the correct extraction rate.
+    let mut best_hd: u32 = 33;
+    let mut best_ci: u8 = 0;
+    let mut best_block1_start: usize = 0;
+    let mut best_best_state: u8 = 0;
+    let mut best_invert: bool = false;
 
-    // Extract soft symbols for Block 1
-    let block1_soft: Vec<f32> = (0..block1_symbols)
-        .map(|i| {
-            let idx = block1_start + i * sps;
-            if sps == 2 {
-                (demod[idx] + demod[idx + 1]) / 2.0
-            } else {
-                demod[idx]
+    'search: for off in -8isize..=8 {
+        let block1_start_raw = nominal_block1 as isize + off;
+        if block1_start_raw < 0 {
+            continue;
+        }
+        let block1_start = block1_start_raw as usize;
+        if block1_start + block1_symbols > demod.len() {
+            continue;
+        }
+
+        let block1_soft: Vec<f32> = (0..block1_symbols)
+            .map(|i| demod[block1_start + i])
+            .collect();
+
+        for &invert in &[false, true] {
+            let mut soft_coded = fec::pattern_demap_s8(&block1_soft);
+            if invert {
+                for v in soft_coded.iter_mut() {
+                    *v = -*v;
+                }
             }
-        })
-        .collect();
 
-    // Soft demap at S=8, then Viterbi decode
-    let soft_coded_block1 = fec::pattern_demap_s8(&block1_soft);
-    let decoded_block1 = fec::viterbi_decode(&soft_coded_block1);
+            let decoded = fec::viterbi_decode(&soft_coded);
+            let (_, vit_best_state, _) = fec::viterbi_decode_terminated(&soft_coded);
 
-    // decoded_block1 should be 37 bits: AA(32) + CI(2) + TERM1(3)
-    if decoded_block1.len() < 34 {
-        return None;
+            if decoded.len() < 37 {
+                continue;
+            }
+
+            let mut aa: u32 = 0;
+            for i in 0..32 {
+                aa |= (decoded[i] as u32) << i;
+            }
+
+            let hd = (aa ^ BLE_ADV_AA).count_ones();
+
+            if hd < best_hd {
+                best_hd = hd;
+                best_ci = decoded[32] | (decoded[33] << 1);
+                best_block1_start = block1_start;
+                best_best_state = vit_best_state;
+                best_invert = invert;
+                if hd == 0 {
+                    break 'search;
+                }
+            }
+        }
     }
 
-    // Extract AA (32 bits, LSB first within each byte)
-    let mut aa: u32 = 0;
-    for i in 0..32 {
-        aa |= (decoded_block1[i] as u32) << i;
-    }
-
-    // Verify AA: must be advertising AA or a known connection AA
-    // For coded PHY, only advertising AA is expected on primary channels
-    let aa_hd = (aa ^ BLE_ADV_AA).count_ones();
+    let aa_hd = best_hd;
+    let terminated = best_best_state == 0;
 
     if aa_hd > BLE_MAX_HD {
         return None;
     }
+
     let aa = BLE_ADV_AA; // snap to advertising AA if close enough
 
-    // Extract CI (2 bits): coding indicator
-    let ci_val = decoded_block1[32] | (decoded_block1[33] << 1);
-    let coding_s = match ci_val {
-        0 => 8usize, // S=8 (125 kbps)
-        1 => 2usize, // S=2 (500 kbps)
-        _ => return None, // CI=2,3 are reserved
-    };
+    // Re-decode Block 1 with terminated Viterbi for reliable CI extraction
+    if terminated {
+        let block1_soft_best: Vec<f32> = (0..block1_symbols)
+            .map(|i| {
+                let idx = best_block1_start + i;
+                let val = if idx < demod.len() { demod[idx] } else { 0.0 };
+                if best_invert { -val } else { val }
+            })
+            .collect();
+        let soft_coded_b1 = fec::pattern_demap_s8(&block1_soft_best);
+        let (decoded_b1, _, _) = fec::viterbi_decode_terminated(&soft_coded_b1);
+        if decoded_b1.len() >= 37 {
+            best_ci = decoded_b1[32] | (decoded_b1[33] << 1);
+        }
+    }
 
-    // FEC Block 2 starts after Block 1
-    let block2_start = block1_start + block1_samples;
+    // FEC Block 2 starts after Block 1 (SPS=1: one sample per symbol)
+    let block2_start = best_block1_start + block1_symbols;
 
-    // We don't know the PDU length yet. Extract enough symbols for max PDU (251) + CRC(3) + TERM2(3).
-    // At S=2: (257 + 3) * 8 * 2 / 2 = up to ~2080 symbols
-    // At S=8: much more. Limit to available samples.
     let remaining_samples = if block2_start < demod.len() {
         demod.len() - block2_start
     } else {
         return None;
     };
-    let remaining_symbols = remaining_samples / sps;
 
-    if remaining_symbols < coding_s * 20 {
-        return None; // too short for even a minimal PDU
-    }
-
-    // Extract soft symbols for Block 2
-    let block2_soft: Vec<f32> = (0..remaining_symbols)
+    // Extract soft symbols for Block 2 using same polarity as Block 1
+    let block2_soft: Vec<f32> = (0..remaining_samples)
         .map(|i| {
-            let idx = block2_start + i * sps;
-            if sps == 2 && idx + 1 < demod.len() {
-                (demod[idx] + demod[idx + 1]) / 2.0
-            } else if idx < demod.len() {
-                demod[idx]
-            } else {
-                0.0
-            }
+            let idx = block2_start + i;
+            let val = if idx < demod.len() { demod[idx] } else { 0.0 };
+            if best_invert { -val } else { val }
         })
         .collect();
 
-    // Soft demap at S=coding_s
-    let soft_coded_block2 = if coding_s == 8 {
-        fec::pattern_demap_s8(&block2_soft)
+    let channel = freq_to_channel(freq);
+    let is_data = aa != BLE_ADV_AA;
+    let crc_init_val = if aa == BLE_ADV_AA {
+        Some((0x555555u32, false))
     } else {
-        fec::pattern_demap_s2(&block2_soft)
+        crc_init_fn(aa)
     };
 
-    // Viterbi decode Block 2
-    let decoded_block2 = fec::viterbi_decode(&soft_coded_block2);
+    // Try BOTH S=8 and S=2 for Block 2.
+    // The CI decode from Block 1 may have errors, and trying both is cheap.
+    // Order: CI-indicated value first, then the alternative.
+    let ci_s = match best_ci { 0 => 8usize, 1 => 2usize, _ => 8 };
+    let try_order: [usize; 2] = if ci_s == 8 { [8, 2] } else { [2, 8] };
 
-    // decoded_block2 = PDU header(2 bytes) + PDU payload(len bytes) + CRC(3 bytes) + TERM2(3 bits)
-    // First, extract PDU header to get length
-    if decoded_block2.len() < 16 {
-        return None;
-    }
+    let mut best_result: Option<(Vec<u8>, usize, bool, bool, bool, usize)> = None; // (dewhitened, pdu_len, crc_checked, crc_valid, conn_valid, coding_s)
 
-    let channel = freq_to_channel(freq);
+    let remaining_symbols = remaining_samples; // SPS=1: symbols == samples
 
-    // Dewhiten the decoded bits to get PDU header
-    // Note: whitening is applied after FEC decoding in LE Coded
-    let mut header_bytes = [0u8; 2];
-    for byte_idx in 0..2 {
-        let mut byte_val: u8 = 0;
-        for bit_idx in 0..8u32 {
-            let data_bit = decoded_block2[byte_idx * 8 + bit_idx as usize];
-            let wb = whitening_bit(channel, byte_idx as u32 * 8 + bit_idx);
-            byte_val |= (data_bit ^ wb) << bit_idx;
+    for &coding_s in &try_order {
+        if remaining_symbols < coding_s * 20 {
+            continue;
         }
-        header_bytes[byte_idx] = byte_val;
-    }
 
-    let pdu_length = header_bytes[1] as usize;
-    if pdu_length > 251 {
-        return None;
-    }
+        let soft_coded_block2 = if coding_s == 8 {
+            fec::pattern_demap_s8(&block2_soft)
+        } else {
+            fec::pattern_demap_s2(&block2_soft)
+        };
 
-    // Total decoded bits needed: header(16) + payload(pdu_length*8) + CRC(24)
-    let total_pdu_crc_bits = 16 + pdu_length * 8 + 24;
-    if decoded_block2.len() < total_pdu_crc_bits {
-        return None;
-    }
-
-    // Dewhiten all PDU + CRC bits
-    let mut pdu_crc_bytes = vec![0u8; 2 + pdu_length + 3];
-    for byte_idx in 0..(2 + pdu_length + 3) {
-        let mut byte_val: u8 = 0;
-        for bit_idx in 0..8u32 {
-            let data_bit = decoded_block2[byte_idx * 8 + bit_idx as usize];
-            let wb = whitening_bit(channel, byte_idx as u32 * 8 + bit_idx);
-            byte_val |= (data_bit ^ wb) << bit_idx;
+        if soft_coded_block2.is_empty() {
+            continue;
         }
-        pdu_crc_bytes[byte_idx] = byte_val;
+
+        let decoded_block2 = fec::viterbi_decode(&soft_coded_block2);
+
+        if decoded_block2.len() < 16 {
+            continue;
+        }
+
+        let max_bytes = decoded_block2.len() / 8;
+        if max_bytes < 5 {
+            continue;
+        }
+
+        // Dewhiten all decoded bytes
+        let dewhitened_bytes: Vec<u8> = (0..max_bytes)
+            .map(|byte_idx| {
+                let mut byte_val: u8 = 0;
+                for bit_idx in 0..8u32 {
+                    let data_bit = decoded_block2[byte_idx * 8 + bit_idx as usize];
+                    let wb = whitening_bit(channel, byte_idx as u32 * 8 + bit_idx);
+                    byte_val |= (data_bit ^ wb) << bit_idx;
+                }
+                byte_val
+            })
+            .collect();
+
+        // CRC check
+        let mut pdu_length = dewhitened_bytes[1] as usize;
+        let hdr_pdu_length = pdu_length;
+        let mut crc_checked = false;
+        let mut crc_valid = false;
+        let mut conn_valid = false;
+
+        if check_crc {
+            if let Some((init, conn_v)) = crc_init_val {
+                let max_pdu_len = (max_bytes.saturating_sub(5)).min(251);
+                let candidates = std::iter::once(hdr_pdu_length.min(max_pdu_len))
+                    .chain((0..=max_pdu_len).filter(|&l| l != hdr_pdu_length.min(max_pdu_len)));
+                for candidate_len in candidates {
+                    let crc_offset = 2 + candidate_len;
+                    if crc_offset + 3 > max_bytes {
+                        continue;
+                    }
+                    let crc_data = &dewhitened_bytes[..crc_offset];
+                    let received_crc = dewhitened_bytes[crc_offset] as u32
+                        | ((dewhitened_bytes[crc_offset + 1] as u32) << 8)
+                        | ((dewhitened_bytes[crc_offset + 2] as u32) << 16);
+                    let computed = crc24(crc_data, init);
+                    if computed == received_crc {
+                        pdu_length = candidate_len;
+                        crc_checked = true;
+                        crc_valid = true;
+                        conn_valid = conn_v;
+                        break;
+                    }
+                }
+                if !crc_valid {
+                    crc_checked = true;
+                    if hdr_pdu_length <= 251 && 2 + hdr_pdu_length + 3 <= max_bytes {
+                        pdu_length = hdr_pdu_length;
+                    } else {
+                        pdu_length = max_bytes.saturating_sub(5).min(251);
+                    }
+                }
+            }
+        } else {
+            if hdr_pdu_length > 251 || 2 + hdr_pdu_length + 3 > max_bytes {
+                pdu_length = max_bytes.saturating_sub(5).min(251);
+            }
+        }
+
+        if 2 + pdu_length + 3 > max_bytes {
+            continue;
+        }
+
+        // If CRC matched, use this result immediately
+        if crc_valid {
+            best_result = Some((dewhitened_bytes, pdu_length, crc_checked, crc_valid, conn_valid, coding_s));
+            break;
+        }
+
+        // Otherwise, save the first (CI-indicated) attempt as fallback
+        if best_result.is_none() {
+            best_result = Some((dewhitened_bytes, pdu_length, crc_checked, crc_valid, conn_valid, coding_s));
+        }
+    }
+
+    let (dewhitened_bytes, pdu_length, crc_checked, crc_valid, conn_valid, coding_s) = match best_result {
+        Some(r) => r,
+        None => return None,
+    };
+    let best_ci_for_pkt = match coding_s { 8 => 0u8, 2 => 1u8, _ => best_ci };
+
+    // Post-CRC false positive filter:
+    // CRC match always emitted; CRC fail + terminated = likely genuine; others rejected
+    if !crc_valid && !terminated {
+        return None;
     }
 
     // Build packet data: AA(4) + CI(1) + PDU(header + payload) + CRC(3)
+    let pdu_crc_bytes = &dewhitened_bytes[..2 + pdu_length + 3];
     let pkt_len = 4 + 1 + 2 + pdu_length + 3;
     let mut data = vec![0u8; pkt_len];
 
@@ -978,39 +1170,10 @@ pub fn ble_coded_burst(
     data[3] = (aa >> 24) as u8;
 
     // CI byte
-    data[4] = ci_val;
+    data[4] = best_ci_for_pkt;
 
     // PDU + CRC (already dewhitened)
-    data[5..].copy_from_slice(&pdu_crc_bytes);
-
-    let is_data = aa != BLE_ADV_AA;
-
-    // CRC validation
-    let mut crc_checked = false;
-    let mut crc_valid = false;
-    let mut conn_valid = false;
-
-    if check_crc {
-        // For LE Coded, CRC is computed over PDU (after dewhitening, before CRC bytes)
-        // CRC init depends on AA
-        let crc_data = &pdu_crc_bytes[..2 + pdu_length]; // PDU header + payload
-        let received_crc = pdu_crc_bytes[2 + pdu_length] as u32
-            | ((pdu_crc_bytes[2 + pdu_length + 1] as u32) << 8)
-            | ((pdu_crc_bytes[2 + pdu_length + 2] as u32) << 16);
-
-        if aa == BLE_ADV_AA {
-            let computed = crc24(crc_data, 0x555555);
-            crc_checked = true;
-            crc_valid = computed == received_crc;
-        } else {
-            if let Some((init, valid)) = crc_init_fn(aa) {
-                let computed = crc24(crc_data, init);
-                crc_checked = true;
-                crc_valid = computed == received_crc;
-                conn_valid = valid;
-            }
-        }
-    }
+    data[5..].copy_from_slice(pdu_crc_bytes);
 
     let ext_header = if crc_valid && pdu_crc_bytes.len() > 0 {
         parse_ext_adv(&pdu_crc_bytes[..2 + pdu_length])
@@ -1432,7 +1595,10 @@ mod tests {
         assert!(parse_ext_adv(&pdu).is_none());
     }
 
-    /// Test LE Coded PHY end-to-end with synthetic signal
+    /// Test LE Coded PHY end-to-end with synthetic signal.
+    /// Uses SPS=1 to match the decoder's stride-1 block extraction.
+    /// The real pipeline passes sps=2 for preamble finding (channelizer is 2 Msps)
+    /// but the FEC block extraction reads every sample at stride 1.
     #[test]
     fn test_ble_coded_burst_synthetic() {
         use crate::fec;
@@ -1440,7 +1606,7 @@ mod tests {
 
         let freq = 2402u32;
         let channel = freq_to_channel(freq);
-        let sps = 2usize;
+        let sps = 1usize;
 
         // Build a minimal ADV packet
         let pdu_header: [u8; 2] = [0x02, 0x06]; // type=2, len=6
@@ -1494,27 +1660,30 @@ mod tests {
         let block2_coded = fec::conv_encode(&pdu_crc_bits);
         let block2_symbols = fec::pattern_map_s8(&block2_coded);
 
-        // Build full demod signal at SPS=2
+        // Build full demod signal at SPS=1 (one sample per symbol)
         let mut demod = Vec::new();
 
-        // Preamble: 80 symbols of 00111100, each repeated SPS=2 times
+        // Leading silence (anchors DC offset estimate near 0.0, matching real bursts)
+        for _ in 0..100 { demod.push(0.0f32); }
+
+        // Preamble: 80 symbols of 00111100
         for _ in 0..CODED_PREAMBLE_REPS {
             for &bit in &CODED_PREAMBLE_PATTERN {
                 let val = if bit == 1 { 1.0f32 } else { -1.0 };
-                for _ in 0..sps { demod.push(val); }
+                demod.push(val);
             }
         }
 
-        // FEC Block 1 symbols at SPS=2
+        // FEC Block 1 symbols
         for &sym in &block1_symbols {
             let val = if sym == 1 { 1.0f32 } else { -1.0 };
-            for _ in 0..sps { demod.push(val); }
+            demod.push(val);
         }
 
-        // FEC Block 2 symbols at SPS=2
+        // FEC Block 2 symbols
         for &sym in &block2_symbols {
             let val = if sym == 1 { 1.0f32 } else { -1.0 };
-            for _ in 0..sps { demod.push(val); }
+            demod.push(val);
         }
 
         // Trail

@@ -575,14 +575,51 @@ def channel_to_freq(ch):
     return 2402 + ch * 2
 
 
-def extract_mac(ble_data, aa):
-    """Extract advertiser MAC from BLE advertising PDU."""
+def extract_mac(ble_data, aa, phy="1M"):
+    """Extract advertiser MAC from BLE advertising PDU.
+
+    For ADV_EXT_IND (PDU type 7), the payload is a Common Extended Header
+    which may or may not contain AdvA. Only extract MAC if the AdvA flag
+    (bit 0 of extended header flags) is set.
+    """
     if aa != BLE_ADV_AA:
         return None
-    # AA(4) + Header(2) + AdvA(6)
-    if len(ble_data) < 12:
+    # LE Coded packets have CI byte between AA and PDU:
+    #   AA(4) + CI(1) + Header(2) + AdvA(6) = 13 bytes minimum
+    # LE 1M/2M:
+    #   AA(4) + Header(2) + AdvA(6) = 12 bytes minimum
+    ci_offset = 1 if phy == "Coded" else 0
+    hdr_pos = 4 + ci_offset  # position of PDU header byte
+    if len(ble_data) < hdr_pos + 2:
         return None
-    mac_bytes = ble_data[6:12]
+    pdu_type = ble_data[hdr_pos] & 0x0F
+
+    # PDU type 7 (ADV_EXT_IND / AUX_ADV_IND / AUX_CHAIN_IND):
+    # Payload is Common Extended Header, not AdvA at fixed offset.
+    # Parse ext header flags to find AdvA if present.
+    if pdu_type == 7:
+        # ext_hdr starts after PDU header (2 bytes)
+        ext_start = hdr_pos + 2
+        if len(ble_data) < ext_start + 2:
+            return None
+        ext_hdr_len = ble_data[ext_start] & 0x3F
+        if ext_hdr_len < 1:
+            return None
+        flags = ble_data[ext_start + 1]
+        if not (flags & 0x01):
+            return None  # no AdvA present
+        # AdvA is first field after flags byte (6 bytes)
+        adva_pos = ext_start + 2
+        if len(ble_data) < adva_pos + 6:
+            return None
+        mac_bytes = ble_data[adva_pos:adva_pos + 6]
+        return ":".join(f"{b:02x}" for b in reversed(mac_bytes))
+
+    min_len = 12 + ci_offset
+    if len(ble_data) < min_len:
+        return None
+    mac_start = 6 + ci_offset
+    mac_bytes = ble_data[mac_start:mac_start + 6]
     return ":".join(f"{b:02x}" for b in reversed(mac_bytes))
 
 
@@ -847,18 +884,37 @@ def bt_db_load():
             print(f"  WARNING: Failed to load {svc_path}: {e}", file=sys.stderr)
 
 
-def classify_mac_type(ble_data):
+def classify_mac_type(ble_data, ci_offset=0):
     """Classify MAC address type from PDU header TxAdd bit."""
-    if len(ble_data) < 6:
+    hdr_pos = 4 + ci_offset
+    if len(ble_data) < hdr_pos + 2:
         return "unknown"
-    # TxAdd is bit 6 of the first header byte (ble_data[4])
-    tx_add = (ble_data[4] >> 6) & 1
+    pdu_type = ble_data[hdr_pos] & 0x0F
+    # TxAdd is bit 6 of the first header byte
+    tx_add = (ble_data[hdr_pos] >> 6) & 1
     if tx_add == 0:
         return "public"
-    # Random address: check the two MSBs of the address (ble_data[11])
-    if len(ble_data) < 12:
-        return "random"
-    msb = ble_data[11]
+
+    # For PDU type 7 (extended advertising), AdvA is in the ext header,
+    # not at the fixed offset. Find it via the flags byte.
+    if pdu_type == 7:
+        ext_start = hdr_pos + 2
+        if len(ble_data) < ext_start + 2:
+            return "random"
+        flags = ble_data[ext_start + 1]
+        if not (flags & 0x01):
+            return "unknown"  # no AdvA present
+        adva_end = ext_start + 2 + 6
+        if len(ble_data) < adva_end:
+            return "random"
+        msb = ble_data[adva_end - 1]
+    else:
+        # Standard: AdvA at Header(2) + AdvA(6) from hdr_pos
+        mac_end = hdr_pos + 2 + 6
+        if len(ble_data) < mac_end:
+            return "random"
+        msb = ble_data[mac_end - 1]
+
     top2 = (msb >> 6) & 0x03
     if top2 == 0x03:
         return "static"       # static random -- persists per boot
@@ -958,56 +1014,72 @@ def parse_ble_packet(data):
     phy_code = (flags & LE_PHY_MASK) >> LE_PHY_SHIFT
     phy = ("1M", "2M", "Coded", "?")[min(phy_code, 3)]
     is_adv = (aa == BLE_ADV_AA)
-    mac = extract_mac(ble_data, aa)
+    # LE Coded packets have CI byte between AA and PDU
+    ci_offset = 1 if phy == "Coded" else 0
+    mac = extract_mac(ble_data, aa, phy)
 
     # Extract PDU type for advertising packets
     pdu_type = None
     pdu_type_name = None
     mac_type = None
     fingerprint = {}
-    if is_adv and len(ble_data) >= 6:
-        pdu_type = ble_data[4] & 0x0F
+    if is_adv and len(ble_data) >= 6 + ci_offset:
+        pdu_type = ble_data[4 + ci_offset] & 0x0F
         pdu_names = {
             0: "ADV_IND", 1: "ADV_DIRECT", 2: "ADV_NONCONN",
             3: "SCAN_REQ", 4: "SCAN_RSP", 5: "CONNECT_IND",
             6: "ADV_SCAN_IND", 7: "ADV_EXT",
         }
         pdu_type_name = pdu_names.get(pdu_type, f"ADV_{pdu_type}")
-        mac_type = classify_mac_type(ble_data)
+        # Distinguish ADV_EXT_IND (no AdvA) from AUX_ADV_IND (has AdvA)
+        if pdu_type == 7 and mac:
+            pdu_type_name = "AUX_ADV"
+        mac_type = classify_mac_type(ble_data, ci_offset)
 
-        # Only PDU types 0 (ADV_IND), 2 (ADV_NONCONN), 4 (SCAN_RSP),
-        # 6 (ADV_SCAN_IND) carry AD structures.
-        # Types 1 (ADV_DIRECT), 3 (SCAN_REQ), 5 (CONNECT_IND) do NOT --
-        # their payload is MAC addresses / connection params, not AD data.
-        # Only parse CRC-valid packets to avoid false fingerprints from
-        # bit errors (corrupted bytes decode as garbage AD structures).
-        ad_pdu_types = {0, 2, 4, 6}
+        # AD structure parsing:
+        # Types 0 (ADV_IND), 2 (ADV_NONCONN), 4 (SCAN_RSP), 6 (ADV_SCAN_IND)
+        # carry AD structures at fixed offset (Header + AdvA).
+        # Type 7 (ADV_EXT / AUX_ADV_IND) carries AD data after the variable-
+        # length Common Extended Header.
+        # Types 1 (ADV_DIRECT), 3 (SCAN_REQ), 5 (CONNECT_IND) do NOT have AD.
         crc_ok = (crc_valid is True) or (not crc_checked)
-        if crc_ok and pdu_type in ad_pdu_types and len(ble_data) > 12:
-            pdu_len = ble_data[5]
-            adv_data_start = 12  # AA(4) + Header(2) + AdvA(6)
-            adv_data_end = min(6 + pdu_len, len(ble_data))
+        hdr_pos = 4 + ci_offset
+        if crc_ok and pdu_type in {0, 2, 4, 6} and len(ble_data) > 12 + ci_offset:
+            pdu_len = ble_data[5 + ci_offset]
+            adv_data_start = 12 + ci_offset  # AA(4) [+CI(1)] + Header(2) + AdvA(6)
+            adv_data_end = min(6 + ci_offset + pdu_len, len(ble_data))
             if adv_data_end > adv_data_start:
                 fingerprint = parse_ad_structures(
                     ble_data[adv_data_start:adv_data_end])
+        elif crc_ok and pdu_type == 7:
+            # Extended advertising: AD data follows the Common Extended Header
+            ext_start = hdr_pos + 2
+            if len(ble_data) >= ext_start + 2:
+                ext_hdr_len = ble_data[ext_start] & 0x3F
+                pdu_len = ble_data[hdr_pos + 1]
+                ad_start = ext_start + 1 + ext_hdr_len  # after ext_hdr_len byte + header
+                ad_end = min(hdr_pos + 2 + pdu_len, len(ble_data))
+                if ad_end > ad_start:
+                    fingerprint = parse_ad_structures(ble_data[ad_start:ad_end])
 
     # Parse CONNECT_IND payload for connection tracking
     conn_info = None
-    if is_adv and pdu_type == 5 and len(ble_data) >= 40:
-        pdu_len = ble_data[5]
+    if is_adv and pdu_type == 5 and len(ble_data) >= 40 + ci_offset:
+        pdu_len = ble_data[5 + ci_offset]
         if pdu_len == 34:
-            init_addr = ":".join(f"{b:02x}" for b in reversed(ble_data[6:12]))
-            adv_addr  = ":".join(f"{b:02x}" for b in reversed(ble_data[12:18]))
-            conn_aa   = struct.unpack_from("<I", ble_data, 18)[0]
-            crc_init  = ble_data[22] | (ble_data[23] << 8) | (ble_data[24] << 16)
-            interval  = struct.unpack_from("<H", ble_data, 28)[0]
-            latency   = struct.unpack_from("<H", ble_data, 30)[0]
-            sup_timeout = struct.unpack_from("<H", ble_data, 32)[0]
-            ch_map    = ble_data[34:39]
-            hop       = ble_data[39] & 0x1F
-            n_ch      = sum(bin(b).count('1') for b in ch_map[:4]) + bin(ch_map[4] & 0x1F).count('1')
-            init_type = (ble_data[4] >> 6) & 1
-            adv_type  = (ble_data[4] >> 7) & 1
+            b = ci_offset
+            init_addr = ":".join(f"{b2:02x}" for b2 in reversed(ble_data[6+b:12+b]))
+            adv_addr  = ":".join(f"{b2:02x}" for b2 in reversed(ble_data[12+b:18+b]))
+            conn_aa   = struct.unpack_from("<I", ble_data, 18+b)[0]
+            crc_init  = ble_data[22+b] | (ble_data[23+b] << 8) | (ble_data[24+b] << 16)
+            interval  = struct.unpack_from("<H", ble_data, 28+b)[0]
+            latency   = struct.unpack_from("<H", ble_data, 30+b)[0]
+            sup_timeout = struct.unpack_from("<H", ble_data, 32+b)[0]
+            ch_map    = ble_data[34+b:39+b]
+            hop       = ble_data[39+b] & 0x1F
+            n_ch      = sum(bin(x).count('1') for x in ch_map[:4]) + bin(ch_map[4] & 0x1F).count('1')
+            init_type = (ble_data[4+b] >> 6) & 1
+            adv_type  = (ble_data[4+b] >> 7) & 1
             conn_info = {
                 "init_addr": init_addr,
                 "adv_addr": adv_addr,

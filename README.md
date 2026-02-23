@@ -201,6 +201,9 @@ GPS:
 IQ file options:
     --format FORMAT         Sample format: ci8, ci16, cf32 (default: ci16)
 
+BLE 5 Long Range:
+    --coded-scan            Continuous LE Coded scan on advertising channels
+
 GPU:
     --no-gpu                Disable GPU acceleration (CPU-only)
 
@@ -237,6 +240,15 @@ Stream with CURVE encryption:
 Capture with GPS tagging:
 
     blue-dragon -l -c 2441 -C 40 --gpsd --zmq tcp://collector:5555
+
+Capture BLE 5 Long Range (LE Coded PHY) on advertising channels:
+
+    blue-dragon -l -i usrp-B210-SERIAL -c 2402 -C 4 --check-crc --coded-scan --stats
+
+Without `--coded-scan`, coded decoding still runs on any squelch-triggered
+burst that fails LE 1M and BT decode. The flag adds continuous sampling on
+channels 37/38/39 to catch weak coded signals below the normal squelch
+threshold.
 
 Read from a previously recorded IQ file:
 

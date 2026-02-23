@@ -156,7 +156,7 @@ Protocol Decode (tried in order, first success wins)
         80-symbol coded preamble (00111100 x10)
         FEC Block 1 at S=8: AA(32 bits) + CI(2 bits), Viterbi decode
         FEC Block 2 at S=CI: PDU + CRC, soft pattern demap, Viterbi decode
-        Convolutional code: rate 1/2, K=3, g0=7, g1=5 (4 trellis states)
+        Convolutional code: rate 1/2, K=4, g0=17o, g1=15o (8 trellis states)
   │
   ├── BLE Extended Advertising: parse Common Extended Header (AuxPtr, ADI, TxPower)
   ├── BLE connection following: CONNECT_IND tracking table
@@ -241,8 +241,8 @@ The FEC pipeline:
 3. **CI decode**: CI=0 means S=8 (125 kbps), CI=1 means S=2 (500 kbps)
 4. **Block 2** (at S per CI): soft pattern demap, Viterbi decode to get PDU + CRC
 
-The convolutional code (rate 1/2, K=3, generators 7 and 5) has only
-4 trellis states, so the Viterbi decoder runs in microseconds. Soft
+The convolutional code (rate 1/2, K=4, generators g0=17o and g1=15o)
+has 8 trellis states, so the Viterbi decoder runs in microseconds. Soft
 pattern demapping uses the analog demod values (not hard bits) for
 maximum coding gain.
 

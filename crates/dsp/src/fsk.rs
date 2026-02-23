@@ -109,6 +109,14 @@ impl FskDemod {
         0
     }
 
+    /// Raw FM discriminator only (no CFO check, no normalization).
+    /// Used by LE Coded decoder as a fallback when full demod fails,
+    /// since coded preamble correlation works on unnormalized FM output.
+    pub fn fm_discriminate_raw(&mut self, burst: &[Complex32]) -> Vec<f32> {
+        self.reset();
+        self.freq_discriminate(burst)
+    }
+
     /// Full FSK demodulation pipeline:
     /// 1. FM demodulate
     /// 2. CFO correction (median-based)

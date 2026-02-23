@@ -89,6 +89,13 @@ struct Cli {
     #[arg(long)]
     stats: bool,
 
+    /// Enable continuous LE Coded PHY (Long Range) scan on advertising channels.
+    /// Captures samples on channels 37/38/39 regardless of squelch, catching
+    /// weak coded signals that don't trigger normal burst detection.
+    /// Without this flag, coded decoding still runs on squelch-triggered bursts.
+    #[arg(long)]
+    coded_scan: bool,
+
     /// Disable GPU acceleration (use CPU-only PFB+FFT)
     #[arg(long)]
     no_gpu: bool,
@@ -332,6 +339,7 @@ fn main() {
             cli.sensor_id.as_deref(),
             cli.gpsd,
             cli.hci,
+            cli.coded_scan,
             running,
         ) {
             eprintln!("error: {}", e);

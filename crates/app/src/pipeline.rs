@@ -235,14 +235,31 @@ pub fn run_file(
                                 let _ = writer.write_bt(&bt_pkt, None);
                             }
                         } else {
+                            let burst_len = fsk_result.demod.len();
+                            let mut pkt = None;
+
+                            // Try coded first on long bursts
+                            if burst_len > 2000 {
+                                pkt = ble::ble_coded_burst(
+                                    &fsk_result.demod,
+                                    freq,
+                                    burst_ts.clone(),
+                                    2, // SPS=2
+                                    check_crc,
+                                    |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
+                                );
+                            }
+
                             // Try BLE LE 1M preamble-first detection
-                            let mut pkt = ble::ble_burst(
-                                &fsk_result.bits,
-                                freq,
-                                burst_ts.clone(),
-                                check_crc,
-                                |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
-                            );
+                            if pkt.is_none() {
+                                pkt = ble::ble_burst(
+                                    &fsk_result.bits,
+                                    freq,
+                                    burst_ts.clone(),
+                                    check_crc,
+                                    |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
+                                );
+                            }
 
                             // Fall back to LE 1M AA correlator
                             if pkt.is_none() {
@@ -276,8 +293,8 @@ pub fn run_file(
                                 }
                             }
 
-                            // Try LE Coded PHY (long range)
-                            if pkt.is_none() {
+                            // Try coded on shorter bursts too (S=2 min ~2000 samples)
+                            if pkt.is_none() && burst_len <= 2000 {
                                 pkt = ble::ble_coded_burst(
                                     &fsk_result.demod,
                                     freq,
@@ -313,6 +330,7 @@ pub fn run_file(
                         }
                     }
                 }
+
             }
 
             // M/2 complex samples consumed per PFB call
@@ -409,15 +427,102 @@ fn process_burst(
     check_crc: bool,
     stats: &mut PipelineStats,
 ) {
-    stats.total_bursts += 1;
+    // Scan bursts: coded PHY search only (no BT/BLE 1M/2M)
+    if burst.scan {
+        let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
+        stats.coded_attempts += 1;
+        if let Some(mut p) = ble::ble_coded_burst_search(
+            &raw_demod,
+            burst.freq,
+            burst.timestamp.clone(),
+            2,
+            check_crc,
+            &mut |aa| conn_table.crc_init_for_aa(aa, burst.timestamp.tv_sec),
+            raw_demod.len(), // search full scan window
+        ) {
+            p.rssi_db = burst.rssi_db as i32;
+            p.noise_db = burst.noise_db as i32;
+            // Require valid CRC for coded packets from scan to avoid
+            // false positives (garbled AA/MAC = phantom devices)
+            if p.crc_checked && !p.crc_valid {
+                return;
+            }
+            if p.crc_checked {
+                stats.total_crc += 1;
+                if p.crc_valid { stats.valid_crc += 1; }
+            }
+            stats.total_ble += 1;
+            stats.total_ble_coded += 1;
+            if let Some(ref mut writer) = pcap_writer {
+                let _ = writer.write_ble(&p, gps_fix);
+            }
+            #[cfg(feature = "zmq")]
+            if let Some(ref pub_socket) = zmq_pub {
+                pub_socket.send_ble(&p, gps_fix);
+            }
+        }
+        return;
+    }
 
-    if burst.samples.len() < 132 {
+    stats.total_bursts += 1;
+    let blen = burst.samples.len();
+    if blen > stats.max_burst_len {
+        stats.max_burst_len = blen;
+    }
+    match blen {
+        0..=199 => stats.burst_lt200 += 1,
+        200..=999 => stats.burst_200_1k += 1,
+        1000..=4999 => stats.burst_1k_5k += 1,
+        5000..=49999 => stats.burst_5k_50k += 1,
+        _ => stats.burst_50k_plus += 1,
+    }
+    if blen < 132 {
         return;
     }
 
     let fsk_result = match fsk.demodulate(&burst.samples) {
         Some(r) => r,
-        None => return,
+        None => {
+            // FSK demod failed. Try raw FM + coded for any burst >= 1500 samples
+            // (coded S=2 min ~2000 samples, S=8 min ~4000 samples).
+            if blen >= 1500 {
+                stats.fsk_reject_long += 1;
+                let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
+                stats.coded_attempts += 1;
+                let search_depth = 0; // 0 = search full burst (coarse stride handles perf)
+                if let Some(mut p) = ble::ble_coded_burst_search(
+                    &raw_demod,
+                    burst.freq,
+                    burst.timestamp.clone(),
+                    2,
+                    check_crc,
+                    &mut |aa| conn_table.crc_init_for_aa(aa, burst.timestamp.tv_sec),
+                    search_depth,
+                ) {
+                    p.rssi_db = burst.rssi_db as i32;
+                    p.noise_db = burst.noise_db as i32;
+                    // Require valid CRC for coded packets from noise bursts
+                    // to avoid false positives (garbled AA/MAC = phantom devices)
+                    if p.crc_checked && !p.crc_valid {
+                        return;
+                    }
+                    if p.crc_checked {
+                        stats.total_crc += 1;
+                        if p.crc_valid { stats.valid_crc += 1; }
+                    }
+                    stats.total_ble += 1;
+                    stats.total_ble_coded += 1;
+                    if let Some(ref mut writer) = pcap_writer {
+                        let _ = writer.write_ble(&p, gps_fix);
+                    }
+                    #[cfg(feature = "zmq")]
+                    if let Some(ref pub_socket) = zmq_pub {
+                        pub_socket.send_ble(&p, gps_fix);
+                    }
+                }
+            }
+            return;
+        }
     };
 
     let freq = burst.freq;
@@ -445,14 +550,36 @@ fn process_burst(
         return;
     }
 
+    // For long bursts (> 2000 samples), try coded FIRST since coded packets
+    // are always long (min ~2700 at S=2, ~6800+ at S=8). The coded preamble
+    // check is cheap and highly distinctive (80 symbols of 00111100).
+    let mut pkt = None;
+    let burst_len = fsk_result.demod.len();
+
+
+    if burst_len > 2000 {
+        stats.coded_attempts += 1;
+        stats.coded_fsk_ok += 1;
+        pkt = ble::ble_coded_burst(
+            &fsk_result.demod,
+            freq,
+            burst_ts.clone(),
+            2, // SPS=2
+            check_crc,
+            |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
+        );
+    }
+
     // Try BLE LE 1M preamble-first detection
-    let mut pkt = ble::ble_burst(
-        &fsk_result.bits,
-        freq,
-        burst_ts.clone(),
-        check_crc,
-        |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
-    );
+    if pkt.is_none() {
+        pkt = ble::ble_burst(
+            &fsk_result.bits,
+            freq,
+            burst_ts.clone(),
+            check_crc,
+            |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
+        );
+    }
 
     // Fall back to LE 1M AA correlator
     if pkt.is_none() {
@@ -486,8 +613,9 @@ fn process_burst(
         }
     }
 
-    // Try LE Coded PHY (long range)
-    if pkt.is_none() {
+    // Also try coded on shorter bursts (S=2 min is ~2000 samples)
+    if pkt.is_none() && burst_len <= 2000 {
+        stats.coded_attempts += 1;
         pkt = ble::ble_coded_burst(
             &fsk_result.demod,
             freq,
@@ -504,6 +632,20 @@ fn process_burst(
 
         if p.aa == ble::BLE_ADV_AA && p.crc_valid {
             conn_table.parse_connect_ind(&p, burst_ts.tv_sec);
+        }
+
+        // Debug: show ADV_EXT_IND packets with AuxPtr to find coded secondary channel
+        if let Some(ref eh) = p.ext_header {
+            if let Some(ref aux) = eh.aux_ptr {
+                let phy_str = match aux.phy {
+                    ble::BlePhy::Phy1M => "1M",
+                    ble::BlePhy::Phy2M => "2M",
+                    ble::BlePhy::PhyCoded => "Coded",
+                };
+                let ch_freq = 2402 + (aux.channel as u32) * 2;
+                eprintln!("ADV_EXT_IND: freq={} rssi={} -> AuxPtr ch={} ({}MHz) phy={} offset={}us",
+                    freq, rssi, aux.channel, ch_freq, phy_str, aux.offset_usec);
+            }
         }
 
         if p.crc_checked {
@@ -538,6 +680,20 @@ struct PipelineStats {
     total_crc: u64,
     valid_crc: u64,
     total_bursts: u64,
+    /// Debug: bursts that reached the coded decoder (all prior decoders returned None)
+    coded_attempts: u64,
+    /// Debug: FSK demod failures >= 1500 samples
+    fsk_reject_long: u64,
+    /// Debug: coded attempts from FSK-success path
+    coded_fsk_ok: u64,
+    /// Debug: longest burst seen (samples)
+    max_burst_len: usize,
+    /// Debug: burst length histogram
+    burst_lt200: u64,
+    burst_200_1k: u64,
+    burst_1k_5k: u64,
+    burst_5k_50k: u64,
+    burst_50k_plus: u64,
 }
 
 impl PipelineStats {
@@ -550,6 +706,15 @@ impl PipelineStats {
             total_crc: 0,
             valid_crc: 0,
             total_bursts: 0,
+            coded_attempts: 0,
+            fsk_reject_long: 0,
+            coded_fsk_ok: 0,
+            max_burst_len: 0,
+            burst_lt200: 0,
+            burst_200_1k: 0,
+            burst_1k_5k: 0,
+            burst_5k_50k: 0,
+            burst_50k_plus: 0,
         }
     }
 
@@ -682,6 +847,10 @@ fn spawn_parallel_pipeline(
                                 let _ = burst_tx.send(burst);
                             }
                         }
+                        // Emit scan bursts for advertising channels
+                        if let Some(scan_burst) = catcher.take_scan_burst() {
+                            let _ = burst_tx.send(scan_burst);
+                        }
                     }
                 }
             })
@@ -764,7 +933,7 @@ fn spawn_parallel_pipeline(
                             String::new()
                         };
                         eprint!(
-                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {}\n",
+                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{}\n",
                             elapsed,
                             stats.total_ble,
                             phy_str,
@@ -775,6 +944,15 @@ fn spawn_parallel_pipeline(
                             stats.total_crc,
                             conns,
                             overflows,
+                            stats.coded_attempts,
+                            stats.coded_fsk_ok,
+                            stats.fsk_reject_long,
+                            stats.max_burst_len,
+                            stats.burst_lt200,
+                            stats.burst_200_1k,
+                            stats.burst_1k_5k,
+                            stats.burst_5k_50k,
+                            stats.burst_50k_plus,
                         );
 
                         // Update heartbeat state for C2
@@ -992,6 +1170,7 @@ pub fn run_live(
     sensor_id: Option<&str>,
     gpsd_enabled: bool,
     hci_enabled: bool,
+    coded_scan: bool,
     running: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let sample_rate = num_channels as u32 * 1_000_000;
@@ -1023,10 +1202,18 @@ pub fn run_live(
     let sps = 2usize;
 
     // Per-channel burst catchers
+    // With --coded-scan, advertising channels get scan mode for continuous
+    // coded PHY capture regardless of squelch.
     let burst_catchers: Vec<Option<BurstCatcher>> = (0..40)
         .map(|ch| {
             if ch >= first_live && ch <= last_live && live_ch[ch] >= 0 {
-                Some(BurstCatcher::new(2402 + ch as u32 * 2, squelch_db))
+                let freq = 2402 + ch as u32 * 2;
+                let is_adv = ch == 0 || ch == 12 || ch == 39;
+                if coded_scan && is_adv {
+                    Some(BurstCatcher::new_scan(freq, squelch_db))
+                } else {
+                    Some(BurstCatcher::new(freq, squelch_db))
+                }
             } else {
                 None
             }
