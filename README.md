@@ -142,8 +142,12 @@ Airspy, or HackRF is the better fit for Pi deployments.
     cd blue-dragon
     cargo build --release --features "usrp,hackrf,bladerf,soapysdr,zmq"
 
-GPU acceleration on macOS requires Metal (future work -- OpenCL is
-deprecated on macOS and Metal backend is not yet implemented).
+GPU acceleration on macOS uses Metal instead of OpenCL (which Apple has
+deprecated). The Metal backend is on the `feature/metal-backend` branch
+and requires testing on macOS hardware:
+
+    git checkout feature/metal-backend
+    cargo build --release --features "usrp,zmq,gpu"
 
 ### Feature Flags
 
