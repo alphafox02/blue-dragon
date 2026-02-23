@@ -309,9 +309,11 @@ Install as a Wireshark extcap plugin:
 
     blue-dragon --install
 
-This creates a symlink in `~/.config/wireshark/extcap/`. After
-installation, plug in your SDR and launch Wireshark -- Blue Dragon
-will appear in the interface list.
+This detects Wireshark's personal extcap path (via `tshark -G folders`)
+and creates a symlink there. On Wireshark 4.2+ this is typically
+`~/.local/lib/wireshark/extcap/`. After installation, plug in your SDR
+and launch Wireshark -- Blue Dragon will appear in the interface list
+with one entry per connected SDR.
 
 ## ZMQ Streaming and Dashboard
 

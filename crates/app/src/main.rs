@@ -135,8 +135,41 @@ fn print_extcap_interfaces() {
             for dev in &devices {
                 let supported = if dev.device_type == "b200" { "" } else { " (unsupported)" };
                 println!(
-                    "interface {{value=usrp-{}-{}}}{{display=Blue Dragon{}}}",
-                    dev.product, dev.serial, supported
+                    "interface {{value=usrp-{}-{}}}{{display=Blue Dragon USRP {}{}}}",
+                    dev.product, dev.serial, dev.serial, supported
+                );
+            }
+        }
+    }
+    #[cfg(feature = "hackrf")]
+    {
+        if let Ok(devices) = bd_sdr::hackrf::list_devices() {
+            for dev in &devices {
+                println!(
+                    "interface {{value=hackrf-{}}}{{display=Blue Dragon HackRF {}}}",
+                    dev.serial, dev.serial
+                );
+            }
+        }
+    }
+    #[cfg(feature = "bladerf")]
+    {
+        if let Ok(devices) = bd_sdr::bladerf::list_devices() {
+            for dev in &devices {
+                println!(
+                    "interface {{value=bladerf{}}}{{display=Blue Dragon bladeRF {}}}",
+                    dev.instance, dev.serial
+                );
+            }
+        }
+    }
+    #[cfg(feature = "soapysdr")]
+    {
+        if let Ok(devices) = bd_sdr::soapysdr::list_devices() {
+            for dev in &devices {
+                println!(
+                    "interface {{value=soapy-{}}}{{display=Blue Dragon SoapySDR {} ({})}}",
+                    dev.index, dev.index, dev.driver
                 );
             }
         }
@@ -154,6 +187,8 @@ fn print_extcap_config() {
     }
     println!("value {{arg=0}}{{value=96}}{{display=96}}{{default=true}}");
     println!("arg {{number=1}}{{call=--center-freq}}{{display=Center Frequency}}{{tooltip=Center frequency to capture on}}{{type=integer}}{{range=2400,2480}}{{default=2441}}");
+    println!("arg {{number=2}}{{call=--gpsd}}{{display=GPS Tagging}}{{tooltip=Tag packets with GPS coordinates from gpsd}}{{type=boolflag}}{{default=false}}");
+    println!("arg {{number=3}}{{call=--check-crc}}{{display=CRC Validation}}{{tooltip=Enable BLE CRC-24 validation}}{{type=boolflag}}{{default=true}}");
 }
 
 fn install_extcap() {
@@ -162,7 +197,23 @@ fn install_extcap() {
         std::process::exit(1);
     });
 
-    let extcap_dir = format!("{}/.config/wireshark/extcap", home);
+    // Wireshark 4.2+ uses ~/.local/lib/wireshark/extcap/
+    // Older versions use ~/.config/wireshark/extcap/
+    // Detect via tshark, fall back to the modern path.
+    let extcap_dir = std::process::Command::new("tshark")
+        .args(["-G", "folders"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8(out.stdout).ok().and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Personal Extcap path:"))
+                    .map(|l| l.split('\t').last().unwrap_or("").trim().to_string())
+            })
+        })
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| format!("{}/.local/lib/wireshark/extcap", home));
+
     std::fs::create_dir_all(&extcap_dir).unwrap_or_else(|e| {
         eprintln!("error creating {}: {}", extcap_dir, e);
         std::process::exit(1);
