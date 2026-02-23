@@ -322,6 +322,19 @@ fn main() {
         .expect("failed to set Ctrl-C handler");
 
         let use_gpu = cfg!(feature = "gpu") && !cli.no_gpu;
+
+        // Auto-generate sensor_id from hostname when using ZMQ but no explicit ID
+        let sensor_id = cli.sensor_id.clone().or_else(|| {
+            if cli.zmq.is_some() {
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        });
+
         if let Err(e) = pipeline::run_live(
             iface,
             center_freq,
@@ -336,7 +349,7 @@ fn main() {
             use_gpu,
             cli.zmq.as_deref(),
             cli.zmq_curve_key.as_deref(),
-            cli.sensor_id.as_deref(),
+            sensor_id.as_deref(),
             cli.gpsd,
             cli.hci,
             cli.coded_scan,

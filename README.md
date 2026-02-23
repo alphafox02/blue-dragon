@@ -399,22 +399,42 @@ Output
 
 ## Performance
 
-Tested on an Intel i7-12700H / NVIDIA RTX 3060 Laptop GPU with a
-bladeRF 2.0 micro xA4 at 96 channels (full BLE band):
+Tested on Intel i7-12700H, USRP B210, -C 40 (20 BLE channels, 40 MHz),
+WHAD ButteRFly advertiser through 30 dB attenuator:
 
 | Metric | Result |
 |--------|--------|
-| BLE CRC validation rate | 95-97% |
-| Packet rate (quiet environment) | 50-70 pkt/s |
+| BLE CRC validation rate | 92-95% |
+| Packet rate (active environment) | 30-60 pkt/s |
 | Classic BT UAP recovery | Converges in ~12 packets |
-| GPU PFB+FFT (OpenCL) | ~2x throughput vs CPU-only |
-| CPU usage (GPU enabled) | ~30% of one core (recv + decode) |
 | Memory usage | ~40 MB RSS |
 
-The polyphase channelizer processes all 96 channels in real time on
-both CPU (AVX2/SSE2/NEON) and GPU (OpenCL) paths. On hardware without
-a GPU, the CPU path handles 96 channels comfortably on any modern
-x86_64 or aarch64 processor.
+### GPU vs CPU Performance
+
+The polyphase channelizer + FFT is the compute bottleneck. The CPU
+path uses SIMD (AVX2/SSE2/NEON) and handles high channel counts well
+on modern hardware. GPU acceleration (OpenCL) offloads this work and
+may help on slower CPUs or at very high channel counts.
+
+Comparison at -C 40 (20 BLE channels), USRP B210, i7-12700H:
+
+| Compute backend | BLE/30s | CRC% | Overflow |
+|-----------------|---------|------|----------|
+| NVIDIA RTX 3060 (OpenCL) | 1,486 | 95.2% | 1 |
+| Intel UHD iGPU (OpenCL) | 870 | 92.3% | 0 |
+| CPU-only (AVX2) | 1,820 | 94.0% | 0 |
+
+All three backends handle -C 40 without sample loss on this hardware.
+The CPU AVX2 path is competitive with discrete GPU at moderate channel
+counts. GPU offload becomes more beneficial at -C 60+ or on slower CPUs
+without AVX2.
+
+Build with GPU support:
+
+    cargo build --release --features "usrp,zmq,gps,gpu"
+
+Use `--no-gpu` to force CPU-only mode. On Raspberry Pi, the CPU NEON
+path is faster than the VideoCore GPU -- do not use `gpu` on Pi.
 
 LE 2M and LE Coded decoding adds negligible overhead -- the additional
 PHY decoders only run when LE 1M decode fails on a burst, and the
