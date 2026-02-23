@@ -159,20 +159,20 @@ impl ConnectionTable {
         let init_type = (p.data[4] >> 6) & 1; // TxAdd
         let adv_type = (p.data[4] >> 7) & 1; // RxAdd
 
-        let init_addr: [u8; 6] = p.data[6..12].try_into().unwrap();
-        let adv_addr: [u8; 6] = p.data[12..18].try_into().unwrap();
+        let init_addr: [u8; 6] = p.data[6..12].try_into().ok()?;
+        let adv_addr: [u8; 6] = p.data[12..18].try_into().ok()?;
 
         // LLData starts at byte 18
-        let conn_aa = u32::from_le_bytes(p.data[18..22].try_into().unwrap());
+        let conn_aa = u32::from_le_bytes(p.data[18..22].try_into().ok()?);
         let crc_init = p.data[22] as u32
             | ((p.data[23] as u32) << 8)
             | ((p.data[24] as u32) << 16);
         // byte 25: WinSize (skip)
         // bytes 26-27: WinOffset (skip)
-        let interval = u16::from_le_bytes(p.data[28..30].try_into().unwrap());
-        let latency = u16::from_le_bytes(p.data[30..32].try_into().unwrap());
-        let timeout = u16::from_le_bytes(p.data[32..34].try_into().unwrap());
-        let ch_map: [u8; 5] = p.data[34..39].try_into().unwrap();
+        let interval = u16::from_le_bytes(p.data[28..30].try_into().ok()?);
+        let latency = u16::from_le_bytes(p.data[30..32].try_into().ok()?);
+        let timeout = u16::from_le_bytes(p.data[32..34].try_into().ok()?);
+        let ch_map: [u8; 5] = p.data[34..39].try_into().ok()?;
         let hop = p.data[39] & 0x1F;
 
         self.add(

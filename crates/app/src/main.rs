@@ -144,8 +144,7 @@ fn print_extcap_interfaces() {
 }
 
 fn print_extcap_dlts() {
-    println!("dlt {{number=255}}{{name=LINKTYPE_BLUETOOTH_BREDR_BB}}{{display=Bluetooth BR/EDR and LE}}");
-    println!("dlt {{number=256}}{{name=DLT_BLUETOOTH_LE_LL_WITH_PHDR}}{{display=Bluetooth LE}}");
+    println!("dlt {{number=192}}{{name=DLT_PPI}}{{display=PPI (BLE + Classic BT + GPS)}}");
 }
 
 fn print_extcap_config() {

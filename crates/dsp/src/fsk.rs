@@ -84,13 +84,17 @@ impl FskDemod {
             return None;
         }
 
-        self.pos_points.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        self.neg_points.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        self.pos_points.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.neg_points.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let midpoint = (self.pos_points[self.pos_points.len() * 3 / 4]
             + self.neg_points[self.neg_points.len() / 4])
             / 2.0;
         let deviation = self.pos_points[self.pos_points.len() * 3 / 4] - midpoint;
+
+        if deviation.abs() < 1e-6 {
+            return None; // flat signal, not valid FSK
+        }
 
         Some((midpoint, deviation))
     }

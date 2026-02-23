@@ -45,6 +45,16 @@ Build with all SDR backends:
 
     cargo build --release --features "usrp,hackrf,bladerf,soapysdr,zmq,gps"
 
+Optional GPU acceleration (OpenCL):
+
+    sudo apt install ocl-icd-opencl-dev
+    cargo build --release --features "usrp,zmq,gps,gpu"
+
+DragonOS systems with an NVIDIA GPU typically have the OpenCL ICD loader
+already installed. If `clinfo` shows your GPU, you only need the
+`ocl-icd-opencl-dev` headers for the build. For Intel iGPU support,
+install `intel-opencl-icd` as well.
+
 The binary is at `target/release/blue-dragon`.
 
 **Note:** If a library is installed from source but the linker can't find

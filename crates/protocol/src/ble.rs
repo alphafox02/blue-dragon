@@ -25,9 +25,13 @@ static WHITENING_INDEX: [u8; 40] = [
     112, 47, 102,
 ];
 
-/// Whitening bit lookup: index into pre-computed sequence at channel-specific offset
+/// Whitening bit lookup: index into pre-computed sequence at channel-specific offset.
+/// Returns 0 for invalid channels (>= 40) to avoid panicking on malformed packets.
 #[inline]
 pub fn whitening_bit(channel: u32, bit_position: u32) -> u8 {
+    if channel >= 40 {
+        return 0;
+    }
     WHITENING[((WHITENING_INDEX[channel as usize] as u32 + bit_position) % 127) as usize]
 }
 
@@ -404,6 +408,9 @@ pub fn parse_ext_adv(pdu: &[u8]) -> Option<ExtAdvHeader> {
         pos += 3;
 
         let channel = (raw & 0x3F) as u8;
+        if channel > 39 {
+            return None; // BLE only defines channels 0-39
+        }
         let ca = ((raw >> 6) & 0x01) as u8;
         let _ = ca; // clock accuracy, not used
         let offset_units = (raw >> 7) & 0x01; // 0=30us, 1=300us
@@ -802,7 +809,6 @@ pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: u
 
     let mut best_pos: Option<usize> = None;
     let mut best_reps: usize = 0;
-    let mut _best_confidence: f32 = 0.0;
 
     // Try both sample phase offsets (0 and 1 within SPS=2)
     for phase in 0..sps {
@@ -810,7 +816,6 @@ pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: u
         while i + pattern_samples * (min_reps + 1) <= search_end {
             // Extract symbols for this window
             let mut reps = 0usize;
-            let mut total_conf: f32 = 0.0;
 
             for rep in 0..10 {
                 let base = i + rep * pattern_samples;
@@ -819,7 +824,6 @@ pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: u
                 }
 
                 let mut match_count = 0usize;
-                let mut rep_conf: f32 = 0.0;
                 for sym_idx in 0..pattern_len {
                     let sample_start = base + sym_idx * sps;
                     // Average SPS samples for this symbol
@@ -833,17 +837,14 @@ pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: u
                     let actual = if val > 0.0 { 1 } else { 0 };
                     if actual == expected {
                         match_count += 1;
-                        rep_conf += val.abs();
                     }
                 }
 
                 if match_count >= 7 { // 7 of 8 symbols match
                     reps += 1;
-                    total_conf += rep_conf;
                 } else {
                     // Also check inverted pattern (11000011)
                     let mut inv_match = 0usize;
-                    let mut inv_conf: f32 = 0.0;
                     for sym_idx in 0..pattern_len {
                         let sample_start = base + sym_idx * sps;
                         let mut val: f32 = 0.0;
@@ -856,12 +857,10 @@ pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: u
                         let actual = if val > 0.0 { 1 } else { 0 };
                         if actual == expected {
                             inv_match += 1;
-                            inv_conf += val.abs();
                         }
                     }
                     if inv_match >= 7 {
                         reps += 1;
-                        total_conf += inv_conf;
                     } else {
                         break; // pattern broken
                     }
@@ -871,7 +870,6 @@ pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: u
             if reps >= min_reps && reps > best_reps {
                 best_reps = reps;
                 best_pos = Some(i);
-                _best_confidence = total_conf / (reps as f32 * pattern_len as f32);
             }
 
             i += sps; // advance one symbol at a time
