@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2025-2026 CEMAXECUTER LLC
+# Copyright 2025-2026 CEMAXECUTER LLC
 """
 Generate CurveZMQ keypair for blue-dragon encrypted streaming.
 

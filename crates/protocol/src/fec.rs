@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 /// Forward error correction for BLE LE Coded PHY.
 ///
 /// Convolutional code per Bluetooth Core Spec v5.4, Vol 6, Part B, Section 3.3:

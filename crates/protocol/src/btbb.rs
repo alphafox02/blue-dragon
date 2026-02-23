@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use std::collections::HashMap;
 
 const MAX_BARKER_ERRORS: u8 = 1;

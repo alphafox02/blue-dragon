@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use std::path::Path;
 use std::process::Command;
 

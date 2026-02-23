@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use crate::{freq_to_channel, Timespec};
 
 pub const BLE_ADV_AA: u32 = 0x8E89BED6;

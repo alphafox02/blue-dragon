@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use num_complex::Complex32;
 
 const MEDIAN_SYMBOLS: usize = 64;

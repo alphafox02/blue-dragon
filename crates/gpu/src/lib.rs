@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 //! GPU-accelerated PFB channelizer + FFT using OpenCL + VkFFT.
 //!
 //! Offloads the polyphase filterbank and inverse FFT to the GPU,

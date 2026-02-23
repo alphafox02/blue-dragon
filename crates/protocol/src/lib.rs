@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 pub mod ble;
 pub mod ble_connection;
 pub mod btbb;

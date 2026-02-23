@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 fn main() {
     let csrc = std::path::PathBuf::from("csrc");
 

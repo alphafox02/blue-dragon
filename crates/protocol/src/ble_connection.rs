@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use crate::ble::{BlePacket, BLE_ADV_AA};
 
 pub const BLE_MAX_CONNECTIONS: usize = 128;

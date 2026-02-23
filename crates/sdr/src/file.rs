@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;

@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use std::f64::consts::PI;
 
 /// Modified Bessel function of the first kind, order 0 (for Kaiser window)

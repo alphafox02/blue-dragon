@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 // Auto-generated from btbb/sw_check_tables.h
 // Sync word check tables for Classic Bluetooth
 

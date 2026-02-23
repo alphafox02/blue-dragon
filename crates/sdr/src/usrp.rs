@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use crossbeam::channel::Sender;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_double, c_int, c_void};

@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use num_complex::Complex32;
 
 // ── Delay line: flat buffer with power-of-2 wrap ─────────────────────────────

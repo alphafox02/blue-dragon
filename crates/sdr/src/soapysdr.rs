@@ -1,4 +1,4 @@
-// Copyright 2025 CEMAXECUTER LLC
+// Copyright 2025-2026 CEMAXECUTER LLC
 
 use crossbeam::channel::Sender;
 use std::ffi::CString;

@@ -1,3 +1,5 @@
+// Copyright 2025-2026 CEMAXECUTER LLC
+
 use std::io::{self, Write};
 use byteorder::{LittleEndian, WriteBytesExt};
 use bd_protocol::ble::{BlePacket, BlePhy};
