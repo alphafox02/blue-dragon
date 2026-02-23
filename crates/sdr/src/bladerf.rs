@@ -293,6 +293,7 @@ impl SdrSource for BladerfSource {
 /// Direct bladeRF handle for zero-copy recv_into path.
 pub struct BladerfHandle {
     dev: *mut BladerfDevice,
+    rx_channel: c_int,
     use_sc8: bool,
     max_samps: usize,
     sc16_buf: Vec<i16>,
@@ -303,14 +304,22 @@ pub struct BladerfHandle {
 unsafe impl Send for BladerfHandle {}
 
 impl BladerfHandle {
+    /// Open bladeRF and start streaming.
+    /// `antenna`: optional RX port ("RX1" or "RX2"). Defaults to RX1 (channel 0).
     pub fn open(
         iface: &str,
         sample_rate: u32,
         center_freq: u64,
         gain: i32,
+        antenna: Option<&str>,
     ) -> Result<Self, String> {
         let instance = parse_instance(iface)
             .ok_or_else(|| format!("invalid bladeRF interface: '{}'", iface))?;
+
+        let rx_channel = match antenna {
+            Some("RX2") | Some("rx2") => 1, // BLADERF_CHANNEL_RX(1)
+            _ => BLADERF_CHANNEL_RX_0,
+        };
 
         let identifier = CString::new(format!("*:instance={}", instance))
             .map_err(|e| format!("CString error: {}", e))?;
@@ -332,12 +341,12 @@ impl BladerfHandle {
                 BLADERF_FORMAT_SC8_Q7
             } else {
                 let bw = sample_rate.min(56_000_000);
-                bladerf_set_bandwidth(dev, BLADERF_CHANNEL_RX_0, bw, ptr::null_mut());
+                bladerf_set_bandwidth(dev, rx_channel, bw, ptr::null_mut());
                 BLADERF_FORMAT_SC16_Q11
             };
-            bladerf_set_frequency(dev, BLADERF_CHANNEL_RX_0, center_freq);
-            bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_MGC);
-            bladerf_set_gain(dev, BLADERF_CHANNEL_RX_0, gain);
+            bladerf_set_frequency(dev, rx_channel, center_freq);
+            bladerf_set_gain_mode(dev, rx_channel, BLADERF_GAIN_MGC);
+            bladerf_set_gain(dev, rx_channel, gain);
 
             // Buffer size: match C tool (channels/2 * 4096, minimum 8192)
             let buf_size = (sample_rate / 1_000_000 / 2 * 4096).max(8192);
@@ -348,7 +357,7 @@ impl BladerfHandle {
             }
 
             // Set sample rate AFTER sync_config (must occur after format change)
-            bladerf_set_sample_rate(dev, BLADERF_CHANNEL_RX_0, sample_rate, ptr::null_mut());
+            bladerf_set_sample_rate(dev, rx_channel, sample_rate, ptr::null_mut());
 
             let r = bladerf_enable_module(dev, BLADERF_MODULE_RX, true);
             if r != 0 {
@@ -373,8 +382,13 @@ impl BladerfHandle {
                 Vec::new()
             };
 
+            if antenna.is_some() {
+                log::info!("bladeRF using RX channel {}", if rx_channel == 0 { "RX1" } else { "RX2" });
+            }
+
             Ok(Self {
                 dev,
+                rx_channel,
                 use_sc8,
                 max_samps,
                 sc16_buf,
@@ -424,7 +438,7 @@ impl BladerfHandle {
     /// Set RX gain at runtime (thread-safe FFI call).
     pub fn set_gain(&self, gain: f64) {
         unsafe {
-            bladerf_set_gain(self.dev, BLADERF_CHANNEL_RX_0, gain as c_int);
+            bladerf_set_gain(self.dev, self.rx_channel, gain as c_int);
         }
     }
 

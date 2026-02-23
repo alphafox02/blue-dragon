@@ -97,6 +97,11 @@ extern "C" {
         chan: usize,
         tune_result: *mut UhdTuneResult,
     ) -> UhdError;
+    fn uhd_usrp_set_rx_antenna(
+        h: UhdUsrpHandle,
+        ant: *const c_char,
+        chan: usize,
+    ) -> UhdError;
     fn uhd_usrp_get_rx_stream(
         h: UhdUsrpHandle,
         stream_args: *mut UhdStreamArgs,
@@ -470,7 +475,8 @@ pub struct UsrpHandle {
 
 impl UsrpHandle {
     /// Open USRP and start streaming. Returns a handle for recv_into() calls.
-    pub fn open(iface: &str, sample_rate: u32, center_freq: u64, gain: f64) -> Result<Self, String> {
+    /// `antenna`: optional RX port name (e.g. "RX2", "TX/RX"). Defaults to UHD default (RX2).
+    pub fn open(iface: &str, sample_rate: u32, center_freq: u64, gain: f64, antenna: Option<&str>) -> Result<Self, String> {
         let serial = parse_serial(iface)
             .ok_or_else(|| format!("invalid USRP interface: '{}'", iface))?;
 
@@ -487,6 +493,17 @@ impl UsrpHandle {
 
             uhd_usrp_set_rx_rate(usrp, sample_rate as f64, 0);
             uhd_usrp_set_rx_gain(usrp, gain, 0, empty.as_ptr());
+
+            if let Some(ant) = antenna {
+                let ant_c = CString::new(ant)
+                    .map_err(|e| format!("invalid antenna name: {}", e))?;
+                let err = uhd_usrp_set_rx_antenna(usrp, ant_c.as_ptr(), 0);
+                if err != UHD_ERROR_NONE {
+                    uhd_usrp_free(&mut usrp);
+                    return Err(format!("uhd_usrp_set_rx_antenna('{}') failed: error {}", ant, err));
+                }
+                log::info!("USRP antenna set to '{}'", ant);
+            }
 
             let mut tune_req = UhdTuneRequest {
                 target_freq: center_freq as f64,

@@ -63,6 +63,10 @@ struct Cli {
     #[arg(long, default_value = "20")]
     hackrf_vga: u32,
 
+    /// SDR antenna/RX port (e.g. RX2, TX/RX for USRP; RX1, RX2 for bladeRF)
+    #[arg(long)]
+    antenna: Option<String>,
+
     /// ZMQ endpoint (sensor connects PUB, e.g. tcp://collector:5555)
     #[arg(short = 'Z', long)]
     zmq: Option<String>,
@@ -395,6 +399,7 @@ fn main() {
             cli.squelch,
             cli.hackrf_lna,
             cli.hackrf_vga,
+            cli.antenna.as_deref(),
             cli.write.as_deref(),
             cli.check_crc,
             cli.stats,

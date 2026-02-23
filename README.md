@@ -222,6 +222,7 @@ SDR settings:
     -g, --gain DB           SDR gain (default: 60)
     --hackrf-lna DB         HackRF LNA gain (default: 40)
     --hackrf-vga DB         HackRF VGA gain (default: 20)
+    --antenna PORT          RX port (USRP: RX2/TX/RX, bladeRF: RX1/RX2)
 
 Output:
     -w, --write FILE        Output PCAP to file or FIFO

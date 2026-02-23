@@ -1117,12 +1117,13 @@ fn open_sdr_handle(
     gain: f64,
     hackrf_lna: u32,
     hackrf_vga: u32,
+    antenna: Option<&str>,
 ) -> Result<SdrHandle, String> {
     let sdr_type = detect_sdr_type(iface);
     match sdr_type {
         #[cfg(feature = "usrp")]
         "usrp" => {
-            let h = bd_sdr::usrp::UsrpHandle::open(iface, sample_rate, center_freq_hz, gain)?;
+            let h = bd_sdr::usrp::UsrpHandle::open(iface, sample_rate, center_freq_hz, gain, antenna)?;
             Ok(SdrHandle::Usrp(h))
         }
         #[cfg(feature = "hackrf")]
@@ -1135,7 +1136,7 @@ fn open_sdr_handle(
         #[cfg(feature = "bladerf")]
         "bladerf" => {
             let h = bd_sdr::bladerf::BladerfHandle::open(
-                iface, sample_rate, center_freq_hz, gain as i32,
+                iface, sample_rate, center_freq_hz, gain as i32, antenna,
             )?;
             Ok(SdrHandle::BladeRf(h))
         }
@@ -1163,6 +1164,7 @@ pub fn run_live(
     squelch_db: f32,
     hackrf_lna: u32,
     hackrf_vga: u32,
+    antenna: Option<&str>,
     pcap_path: Option<&Path>,
     check_crc: bool,
     print_stats: bool,
@@ -1441,7 +1443,7 @@ pub fn run_live(
     // GPU path
     #[cfg(feature = "gpu")]
     if use_gpu {
-        let sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga)?;
+        let sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna)?;
 
         return run_live_gpu_loop(
             sdr, &running, num_channels, semi_len, &prototype, fft_scale,
@@ -1466,7 +1468,7 @@ pub fn run_live(
     //   -> [broadcast] -> parallel burst workers -> decode thread
     use std::sync::atomic::AtomicU64;
 
-    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga)?;
+    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna)?;
     let max_samps = sdr.max_samps();
 
     let overflow_count = Arc::new(AtomicU64::new(0));
