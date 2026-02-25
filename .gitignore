@@ -18,5 +18,10 @@ Cargo.lock
 *.db
 *.sqlite
 
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+
 # Environment / credentials
 .env
