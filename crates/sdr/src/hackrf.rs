@@ -442,6 +442,48 @@ impl HackrfHandle {
         written / 2
     }
 
+    /// Receive samples into an i16 buffer (sign-extended from native 8-bit).
+    /// HackRF is natively 8-bit, so this just sign-extends via << 8.
+    /// Returns: number of complex samples received, or 0 on timeout/error.
+    pub fn recv_into_i16(&mut self, buf: &mut [i16]) -> usize {
+        // Receive into a temporary i8 view, then promote
+        let max_bytes = buf.len(); // i16 buf has 2*max_samps elements, same count as i8 bytes
+        let mut written = 0;
+
+        // Drain pending data
+        while written < max_bytes && self.pending_offset < self.pending.len() {
+            buf[written] = (self.pending[self.pending_offset] as i16) << 8;
+            written += 1;
+            self.pending_offset += 1;
+        }
+
+        if written >= max_bytes {
+            return written / 2;
+        }
+
+        // Try to receive a new chunk
+        match self.rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(chunk) => {
+                let avail = chunk.len().min(max_bytes - written);
+                for i in 0..avail {
+                    buf[written + i] = (chunk[i] as i16) << 8;
+                }
+                written += avail;
+
+                if avail < chunk.len() {
+                    self.pending = chunk;
+                    self.pending_offset = avail;
+                } else {
+                    self.pending.clear();
+                    self.pending_offset = 0;
+                }
+            }
+            Err(_) => {}
+        }
+
+        written / 2
+    }
+
     /// Set LNA and VGA gains at runtime (thread-safe FFI calls).
     pub fn set_gain(&self, lna: u32, vga: u32) {
         unsafe {

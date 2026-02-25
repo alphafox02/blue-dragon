@@ -248,8 +248,11 @@ impl SdrSource for UsrpSource {
         self.running.store(true, Ordering::SeqCst);
 
         // Open USRP device
-        let dev_args = CString::new(format!("serial={},num_recv_frames=1024", self.serial))
-            .map_err(|e| format!("CString error: {}", e))?;
+        let dev_args = CString::new(format!(
+            "serial={},num_recv_frames=1024",
+            self.serial
+        ))
+        .map_err(|e| format!("CString error: {}", e))?;
 
         let mut usrp: UhdUsrpHandle = ptr::null_mut();
         let empty = CString::new("").unwrap();
@@ -321,9 +324,9 @@ impl SdrSource for UsrpSource {
                 return Err(format!("uhd_rx_metadata_make failed: error {}", err));
             }
 
-            // Configure stream (SC8 format, matching C code)
-            let cpu_fmt = CString::new("sc8").unwrap();
-            let otw_fmt = CString::new("sc8").unwrap();
+            // Configure stream (SC16 format for full 12-bit ADC precision)
+            let cpu_fmt = CString::new("sc16").unwrap();
+            let otw_fmt = CString::new("sc16").unwrap();
             let stream_args_str = CString::new("").unwrap();
             let mut channel: usize = 0;
 
@@ -370,13 +373,13 @@ impl SdrSource for UsrpSource {
                 self.gain,
             );
 
-            // Pre-allocate receive buffer (reused each iteration)
-            let mut sc8_buf = vec![0i8; max_samps * 2];
+            // Pre-allocate receive buffer (SC16: 2 bytes per component, 4 bytes per complex sample)
+            let mut sc16_buf = vec![0i16; max_samps * 2];
             let mut overflow_count: u64 = 0;
 
             // Main receive loop
             while self.running.load(Ordering::SeqCst) {
-                let mut buf_ptr = sc8_buf.as_mut_ptr() as *mut c_void;
+                let mut buf_ptr = sc16_buf.as_mut_ptr() as *mut c_void;
                 let mut num_rx: usize = 0;
 
                 let err = uhd_rx_streamer_recv(
@@ -413,12 +416,8 @@ impl SdrSource for UsrpSource {
                     continue;
                 }
 
-                // Convert SC8 to int16 (shift left 8 to fill 16-bit range)
-                let mut data = Vec::with_capacity(num_rx * 2);
-                for i in 0..num_rx {
-                    data.push((sc8_buf[i * 2] as i16) << 8);
-                    data.push((sc8_buf[i * 2 + 1] as i16) << 8);
-                }
+                // SC16 samples are already i16 -- copy directly
+                let data = sc16_buf[..num_rx * 2].to_vec();
 
                 if tx.send(SampleBuf { data, num_samples: num_rx }).is_err() {
                     break; // receiver dropped
@@ -462,8 +461,8 @@ impl SdrSource for UsrpSource {
     }
 }
 
-/// Opened USRP device handle for direct recv_into() calls (GPU path).
-/// Bypasses crossbeam channel and i16 conversion for zero-copy SC8→GPU.
+/// Opened USRP device handle for direct recv_into() calls.
+/// Uses SC16 wire format for full 12-bit ADC precision.
 pub struct UsrpHandle {
     usrp: UhdUsrpHandle,
     rx_handle: UhdRxStreamerHandle,
@@ -480,8 +479,11 @@ impl UsrpHandle {
         let serial = parse_serial(iface)
             .ok_or_else(|| format!("invalid USRP interface: '{}'", iface))?;
 
-        let dev_args = CString::new(format!("serial={},num_recv_frames=1024", serial))
-            .map_err(|e| format!("CString error: {}", e))?;
+        let dev_args = CString::new(format!(
+            "serial={},num_recv_frames=1024",
+            serial
+        ))
+        .map_err(|e| format!("CString error: {}", e))?;
         let empty = CString::new("").unwrap();
 
         unsafe {
@@ -528,8 +530,8 @@ impl UsrpHandle {
             let mut md: UhdRxMetadataHandle = ptr::null_mut();
             uhd_rx_metadata_make(&mut md);
 
-            let cpu_fmt = CString::new("sc8").unwrap();
-            let otw_fmt = CString::new("sc8").unwrap();
+            let cpu_fmt = CString::new("sc16").unwrap();
+            let otw_fmt = CString::new("sc16").unwrap();
             let stream_args_str = CString::new("").unwrap();
             let mut channel: usize = 0;
 
@@ -568,10 +570,10 @@ impl UsrpHandle {
         }
     }
 
-    /// Receive SC8 samples directly into a raw i8 buffer.
-    /// `buf`: destination buffer (i8 IQ pairs, at least max_samps * 2 bytes).
+    /// Receive SC16 samples directly into an i16 buffer.
+    /// `buf`: destination buffer (i16 IQ pairs, at least max_samps * 2 elements).
     /// Returns: number of complex samples received, or 0 on timeout/error.
-    pub fn recv_into(&mut self, buf: &mut [i8]) -> usize {
+    pub fn recv_into_i16(&mut self, buf: &mut [i16]) -> usize {
         let max_samps = (buf.len() / 2).min(self.max_samps);
         let mut num_rx: usize = 0;
 

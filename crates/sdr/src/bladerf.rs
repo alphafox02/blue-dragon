@@ -435,6 +435,52 @@ impl BladerfHandle {
         }
     }
 
+    /// Receive samples into an i16 buffer with full native precision.
+    /// SC16_Q11 (normal mode): 12-bit data shifted left 4 to fill i16 range.
+    /// SC8_Q7 (oversample): 8-bit data sign-extended via << 8.
+    /// Returns: number of complex samples received, or 0 on error.
+    pub fn recv_into_i16(&mut self, buf: &mut [i16]) -> usize {
+        let max_samps = (buf.len() / 2).min(self.max_samps);
+
+        unsafe {
+            if self.use_sc8 {
+                // Oversample mode: receive SC8, sign-extend to i16
+                let mut sc8_buf = vec![0i8; max_samps * 2];
+                let r = bladerf_sync_rx(
+                    self.dev,
+                    sc8_buf.as_mut_ptr() as *mut c_void,
+                    max_samps as c_uint,
+                    ptr::null_mut(),
+                    3500,
+                );
+                if r != 0 {
+                    return 0;
+                }
+                for i in 0..max_samps * 2 {
+                    buf[i] = (sc8_buf[i] as i16) << 8;
+                }
+                max_samps
+            } else {
+                // Normal mode: receive SC16_Q11, shift left 4 to fill i16
+                let r = bladerf_sync_rx(
+                    self.dev,
+                    self.sc16_buf.as_mut_ptr() as *mut c_void,
+                    max_samps as c_uint,
+                    ptr::null_mut(),
+                    3500,
+                );
+                if r != 0 {
+                    return 0;
+                }
+                // SC16_Q11: 12-bit data in [-2048..2047], shift left 4 -> [-32768..32752]
+                for i in 0..max_samps * 2 {
+                    buf[i] = self.sc16_buf[i] << 4;
+                }
+                max_samps
+            }
+        }
+    }
+
     /// Set RX gain at runtime (thread-safe FFI call).
     pub fn set_gain(&self, gain: f64) {
         unsafe {

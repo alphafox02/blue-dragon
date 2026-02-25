@@ -439,12 +439,10 @@ impl SdrSource for AaroniaSource {
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, self.center_freq as f64);
 
-            // Reference level -- [-20, 10] dBm with preamp "Auto"
-            let reflevel = if (-20.0..=10.0).contains(&self.gain) {
-                self.gain
-            } else {
-                -20.0
-            };
+            // Reference level -- [-20, 10] dBm with preamp "Auto".
+            // Map -g N to reflevel = -N dBm (higher gain = lower reflevel = more sensitive).
+            // Default -g 60 clamps to -20 dBm (most sensitive, same as before).
+            let reflevel = (-self.gain).clamp(-20.0, 10.0);
             let key = to_wchar("main/reflevel");
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, reflevel);
@@ -612,9 +610,8 @@ unsafe impl Send for AaroniaHandle {}
 
 impl AaroniaHandle {
     /// Open a Spectran V6 in raw mode and start streaming.
-    /// `gain` is interpreted as reflevel in dBm (range [-20, 10]).
-    /// If out of range (e.g. the default 60 from USRP), defaults to -20 dBm
-    /// (maximum sensitivity for BLE).
+    /// `gain` maps to reflevel as -gain dBm, clamped to [-20, 10].
+    /// -g 20 = reflevel -20 dBm (most sensitive, default), -g 0 = 0 dBm.
     pub fn open(
         iface: &str,
         sample_rate: u32,
@@ -724,12 +721,8 @@ impl AaroniaHandle {
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, center_freq as f64);
 
-            // With preamp "Auto", reflevel range is [-20, 10] dBm
-            let reflevel = if (-20.0..=10.0).contains(&gain) {
-                gain
-            } else {
-                -20.0
-            };
+            // Map -g N to reflevel = -N dBm (higher gain = lower reflevel = more sensitive).
+            let reflevel = (-gain).clamp(-20.0, 10.0);
             let key = to_wchar("main/reflevel");
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, reflevel);
@@ -995,7 +988,8 @@ impl AaroniaHandle {
             AARTSAAPI_ConfigRoot(d_ptr, &mut root);
             let key = to_wchar("main/reflevel");
             AARTSAAPI_ConfigFind(d_ptr, &mut root, &mut config, key.as_ptr());
-            AARTSAAPI_ConfigSetFloat(d_ptr, &mut config, gain);
+            let reflevel = (-gain).clamp(-20.0, 10.0);
+            AARTSAAPI_ConfigSetFloat(d_ptr, &mut config, reflevel);
         }
     }
 
