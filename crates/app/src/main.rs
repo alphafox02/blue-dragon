@@ -87,6 +87,11 @@ struct Cli {
     #[arg(long)]
     hci: bool,
 
+    /// Enable HCI LE active scanning to enrich device data (name, manufacturer,
+    /// services) via the system Bluetooth adapter. Complementary to --hci GATT.
+    #[arg(long)]
+    active_scan: bool,
+
     /// Verbose output
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -409,6 +414,7 @@ fn main() {
             sensor_id.as_deref(),
             cli.gpsd,
             cli.hci,
+            cli.active_scan,
             cli.coded_scan,
             running,
         ) {

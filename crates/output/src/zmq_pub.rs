@@ -85,6 +85,16 @@ impl ZmqPublisher {
         let _ = self.socket.send(json_bytes.as_bytes(), zmq::DONTWAIT);
     }
 
+    /// Publish an active-scan result as JSON on the "scan:" topic.
+    pub fn send_scan(&self, result: &serde_json::Value) {
+        let _ = self.socket.send("scan:", zmq::DONTWAIT | zmq::SNDMORE);
+        if let Some(ref id) = self.sensor_id {
+            let _ = self.socket.send(id.as_bytes(), zmq::DONTWAIT | zmq::SNDMORE);
+        }
+        let json_bytes = result.to_string();
+        let _ = self.socket.send(json_bytes.as_bytes(), zmq::DONTWAIT);
+    }
+
     /// Send raw packet data with optional sensor_id and GPS frames.
     fn send_raw(&self, buf: &[u8], gps: Option<&GpsFix>) {
         if let Some(ref id) = self.sensor_id {

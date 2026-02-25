@@ -1,6 +1,9 @@
 // Copyright 2025-2026 CEMAXECUTER LLC
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bluer::{Address, Session};
@@ -110,6 +113,181 @@ impl HciProber {
             }
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Active scanner (--active-scan)
+// ---------------------------------------------------------------------------
+
+/// Result of a single BLE active-scan observation from the HCI adapter.
+/// Contains advertisement + scan-response data merged by BlueZ.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanResult {
+    pub mac: String,
+    pub name: Option<String>,
+    /// Company ID -> raw bytes from manufacturer-specific data AD type.
+    pub manufacturer_data: Option<HashMap<u16, Vec<u8>>>,
+    pub service_uuids: Vec<String>,
+    /// Service UUID string -> raw bytes from service data AD types.
+    pub service_data: Option<HashMap<String, Vec<u8>>>,
+    pub appearance: Option<u16>,
+    pub tx_power: Option<i16>,
+    pub rssi: Option<i16>,
+    pub timestamp: f64,
+}
+
+/// Minimum interval between reports for the same MAC address (seconds).
+const SCAN_RATE_LIMIT_SECS: u64 = 10;
+
+/// HCI active scanner. Uses BlueZ discovery to perform LE active scanning,
+/// collecting advertisement + scan-response data for nearby devices.
+/// Runs independently of the GATT prober (HciProber).
+pub struct HciScanner {
+    rt: Runtime,
+}
+
+impl HciScanner {
+    /// Create a new HciScanner with its own single-threaded tokio runtime.
+    pub fn new() -> Result<Self, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
+        Ok(Self { rt })
+    }
+
+    /// Run the active scanner, sending results to `tx` until `running` becomes false.
+    /// This is a blocking call -- run it on a dedicated thread.
+    pub fn run(
+        &self,
+        tx: crossbeam::channel::Sender<ScanResult>,
+        running: Arc<AtomicBool>,
+    ) {
+        self.rt.block_on(async {
+            if let Err(e) = scan_loop(&tx, &running).await {
+                eprintln!("HCI scan: {}", e);
+            }
+        });
+    }
+}
+
+/// Core async scanning loop.
+async fn scan_loop(
+    tx: &crossbeam::channel::Sender<ScanResult>,
+    running: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let session = Session::new()
+        .await
+        .map_err(|e| format!("BlueZ session error: {}", e))?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .map_err(|e| format!("no HCI adapter: {}", e))?;
+
+    if !adapter.is_powered().await.unwrap_or(false) {
+        return Err("HCI adapter not powered".into());
+    }
+
+    // Start discovery (active scanning is the BlueZ default)
+    let disco = adapter
+        .discover_devices()
+        .await
+        .map_err(|e| format!("discovery error: {}", e))?;
+
+    eprintln!("HCI scan: active scanning started");
+
+    use futures::StreamExt;
+    let mut stream = Box::pin(disco);
+
+    // Rate-limit: track last report time per MAC
+    let mut last_report: HashMap<Address, std::time::Instant> = HashMap::new();
+    let rate_limit = Duration::from_secs(SCAN_RATE_LIMIT_SECS);
+
+    while running.load(Ordering::Relaxed) {
+        // Poll with 1-second timeout so we can check the stop flag
+        match timeout(Duration::from_secs(1), stream.next()).await {
+            Ok(Some(event)) => {
+                let addr = match &event {
+                    bluer::AdapterEvent::DeviceAdded(a) => *a,
+                    bluer::AdapterEvent::PropertyChanged(_) => continue,
+                    _ => continue,
+                };
+
+                // Rate-limit per MAC
+                let now_inst = std::time::Instant::now();
+                if let Some(last) = last_report.get(&addr) {
+                    if now_inst.duration_since(*last) < rate_limit {
+                        continue;
+                    }
+                }
+
+                // Read device properties
+                let device = match adapter.device(addr) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+
+                let name = device.name().await.ok().flatten();
+                let rssi = device.rssi().await.ok().flatten();
+
+                // Skip devices with no RSSI (stale cache entries)
+                if rssi.is_none() {
+                    continue;
+                }
+
+                let manufacturer_data = device.manufacturer_data().await.ok().flatten().map(|m| {
+                    m.into_iter()
+                        .map(|(k, v)| (k, v))
+                        .collect::<HashMap<u16, Vec<u8>>>()
+                });
+
+                let service_uuids: Vec<String> = device
+                    .uuids()
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|set| set.into_iter().map(|u| u.to_string()).collect())
+                    .unwrap_or_default();
+
+                let service_data = device.service_data().await.ok().flatten().map(|m| {
+                    m.into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect::<HashMap<String, Vec<u8>>>()
+                });
+
+                let appearance = device.appearance().await.ok().flatten();
+                let tx_power = device.tx_power().await.ok().flatten();
+
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+
+                let result = ScanResult {
+                    mac: format!("{}", addr),
+                    name,
+                    manufacturer_data,
+                    service_uuids,
+                    service_data,
+                    appearance,
+                    tx_power,
+                    rssi,
+                    timestamp: now_ts,
+                };
+
+                last_report.insert(addr, now_inst);
+
+                if tx.send(result).is_err() {
+                    break; // receiver dropped
+                }
+            }
+            Ok(None) => break, // stream ended
+            Err(_) => continue, // timeout, check stop flag
+        }
+    }
+
+    eprintln!("HCI scan: stopped");
+    Ok(())
 }
 
 /// Convert CharacteristicFlags to a list of human-readable strings.

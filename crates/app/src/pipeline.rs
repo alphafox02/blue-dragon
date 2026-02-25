@@ -1174,6 +1174,7 @@ pub fn run_live(
     sensor_id: Option<&str>,
     gpsd_enabled: bool,
     hci_enabled: bool,
+    active_scan: bool,
     coded_scan: bool,
     running: Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -1280,6 +1281,33 @@ pub fn run_live(
     };
     #[cfg(not(feature = "hci"))]
     let _ = hci_enabled;
+
+    // HCI active scanner (optional, requires --active-scan flag)
+    #[cfg(feature = "hci")]
+    let scan_rx: Option<crossbeam::channel::Receiver<bd_hci::ScanResult>> = if active_scan {
+        match bd_hci::HciScanner::new() {
+            Ok(scanner) => {
+                let (tx, rx) = crossbeam::channel::bounded(256);
+                let scan_running = running.clone();
+                std::thread::Builder::new()
+                    .name("hci-scan".to_string())
+                    .spawn(move || scanner.run(tx, scan_running))
+                    .map_err(|e| format!("hci-scan thread: {}", e))?;
+                eprintln!("HCI scan: active scanning thread started");
+                Some(rx)
+            }
+            Err(e) => {
+                eprintln!("HCI scan: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "hci"))]
+    let _ = active_scan;
+    #[cfg(all(feature = "hci", not(feature = "zmq")))]
+    let _ = scan_rx;
 
     // ZMQ config to pass to processing thread (created there since zmq::Socket is !Send)
     #[cfg(feature = "zmq")]
@@ -1439,6 +1467,44 @@ pub fn run_live(
             hb_state_for_decode = None;
             None
         };
+
+    // HCI active-scan forwarder thread: drains scan_rx, publishes on "scan:" topic
+    #[cfg(all(feature = "hci", feature = "zmq"))]
+    let _scan_forwarder: Option<std::thread::JoinHandle<()>> = scan_rx.and_then(|rx| {
+        let ep = zmq_endpoint?.to_string();
+        let sid = sensor_id.map(|s| s.to_string());
+        let curve_kf = zmq_curve_keyfile.map(|s| s.to_string());
+        let scan_running = running.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("scan-fwd".to_string())
+                .spawn(move || {
+                    let pub_socket = match bd_output::zmq_pub::ZmqPublisher::new(
+                        &ep,
+                        sid.as_deref(),
+                        curve_kf.as_deref(),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("HCI scan ZMQ: {}", e);
+                            return;
+                        }
+                    };
+                    while scan_running.load(std::sync::atomic::Ordering::Relaxed) {
+                        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                            Ok(result) => {
+                                if let Ok(val) = serde_json::to_value(&result) {
+                                    pub_socket.send_scan(&val);
+                                }
+                            }
+                            Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .expect("failed to spawn scan-fwd thread"),
+        )
+    });
 
     // GPU path
     #[cfg(feature = "gpu")]

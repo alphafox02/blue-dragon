@@ -655,15 +655,92 @@ BLE_COMPANY_IDS = {
 APPLE_CONTINUITY_TYPES = {
     0x01: "Setup",
     0x02: "iBeacon",
+    0x03: "AirPrint",
     0x05: "AirDrop",
-    0x07: "AirPods",
-    0x09: "AirPlay",
+    0x06: "HomeKit",
+    0x07: "Proximity Pairing",
+    0x08: "Hey Siri",
+    0x09: "AirPlay Target",
+    0x0A: "AirPlay Source",
+    0x0B: "Magic Switch",
     0x0C: "Handoff",
-    0x0D: "Hotspot",
-    0x0E: "Hotspot Src",
+    0x0D: "Tethering Target",
+    0x0E: "Tethering Source",
     0x0F: "Nearby Action",
     0x10: "Nearby Info",
     0x12: "Find My",
+}
+
+# Apple Nearby Info action codes (upper nibble of byte 0)
+APPLE_NEARBY_ACTIONS = {
+    0x00: "Unknown",
+    0x01: "Disabled",
+    0x03: "Idle",
+    0x05: "Audio playing",
+    0x07: "Screen on",
+    0x09: "Video playing",
+    0x0A: "Watch unlocked",
+    0x0B: "Recent interaction",
+    0x0D: "Driving",
+    0x0E: "Phone call",
+}
+
+# Apple Proximity Pairing device models (bytes 0-1 of payload)
+APPLE_DEVICE_MODELS = {
+    0x0220: "AirPods",
+    0x0520: "AirPods",
+    0x0F20: "AirPods 2",
+    0x1320: "AirPods 2",
+    0x0E20: "AirPods Pro",
+    0x1420: "AirPods Pro",
+    0x1020: "AirPods Max",
+    0x1320: "AirPods 3",
+    0x1420: "AirPods Pro 2",
+    0x1920: "AirPods Pro 2 USB-C",
+    0x1720: "AirPods 4",
+    0x1B20: "AirPods 4 ANC",
+    0x0320: "Powerbeats 3",
+    0x0620: "Beats Solo 3",
+    0x0920: "Beats Studio 3",
+    0x1020: "Beats X",
+    0x0A20: "Beats Solo Pro",
+    0x0B20: "Powerbeats Pro",
+    0x0C20: "Beats Fit Pro",
+    0x1120: "Beats Studio Buds",
+    0x1220: "Beats Flex",
+    0x1620: "Beats Studio Pro",
+    0x1820: "Beats Solo 4",
+}
+
+# Apple Nearby Action types (byte 0 of payload)
+APPLE_NEARBY_ACTION_TYPES = {
+    0x01: "Apple TV setup",
+    0x04: "WiFi password sharing",
+    0x05: "WiFi setup",
+    0x06: "Apple TV pair",
+    0x07: "Apple TV keyboard",
+    0x08: "HomePod setup",
+    0x09: "Setup new iPhone",
+    0x0B: "Speaker setup",
+    0x0C: "Apple TV connect",
+    0x0D: "Apple TV connect keyboard",
+    0x13: "Apple TV connect session",
+    0x27: "Apple TV connect session 2",
+}
+
+# Microsoft CDP device types (lower 5 bits of byte 1)
+MS_CDP_DEVICE_TYPES = {
+    1:  "Xbox One",
+    6:  "Apple iPhone",
+    7:  "Apple iPad",
+    8:  "Android",
+    9:  "Windows Desktop",
+    11: "Windows Phone",
+    12: "Linux",
+    13: "Windows IoT",
+    14: "Surface Hub",
+    15: "Windows Laptop",
+    16: "Windows Tablet",
 }
 
 AD_TYPE_FLAGS            = 0x01
@@ -926,6 +1003,168 @@ def classify_mac_type(ble_data, ci_offset=0):
     return "random"
 
 
+def _decode_apple_continuity(mfr_data, result):
+    """Decode Apple Continuity sub-messages from manufacturer data (after company ID).
+
+    Apple packs multiple TLV messages: type(1) + length(1) + value(length).
+    """
+    i = 0
+    while i + 1 < len(mfr_data):
+        msg_type = mfr_data[i]
+        # Type 0x01 has no length byte (variable, consumes rest)
+        if msg_type == 0x01:
+            break
+        if i + 1 >= len(mfr_data):
+            break
+        msg_len = mfr_data[i + 1]
+        msg_data = mfr_data[i + 2 : i + 2 + msg_len]
+        i += 2 + msg_len
+
+        result["apple_type"] = APPLE_CONTINUITY_TYPES.get(
+            msg_type, f"0x{msg_type:02x}")
+
+        # --- Nearby Info (0x10) ---
+        if msg_type == 0x10 and len(msg_data) >= 2:
+            status_flags = msg_data[0] & 0x0F
+            action_code = (msg_data[0] >> 4) & 0x0F
+            data_flags = msg_data[1]
+
+            result["apple_action"] = APPLE_NEARBY_ACTIONS.get(
+                action_code, f"0x{action_code:X}")
+
+            # Status flags
+            sf = []
+            if status_flags & 0x01:
+                sf.append("Primary iCloud")
+            if status_flags & 0x04:
+                sf.append("AirDrop Rx")
+            if sf:
+                result["apple_status"] = ", ".join(sf)
+
+            # Data flags
+            df = []
+            if data_flags & 0x04:
+                df.append("WiFi on")
+            if data_flags & 0x20:
+                df.append("Watch locked")
+            if data_flags & 0x40:
+                df.append("Watch auto-unlock")
+            if data_flags & 0x80:
+                df.append("Auto unlock")
+            if df:
+                result["apple_data_flags"] = ", ".join(df)
+
+        # --- iBeacon (0x02) ---
+        elif msg_type == 0x02 and len(msg_data) >= 21:
+            uuid_bytes = msg_data[:16]
+            import uuid as uuid_mod
+            result["ibeacon_uuid"] = str(uuid_mod.UUID(bytes=bytes(uuid_bytes)))
+            major, minor = struct.unpack(">HH", bytes(msg_data[16:20]))
+            result["ibeacon_major"] = major
+            result["ibeacon_minor"] = minor
+            result["ibeacon_power"] = struct.unpack("b", bytes(msg_data[20:21]))[0]
+
+        # --- Proximity Pairing (0x07) -- AirPods/Beats ---
+        elif msg_type == 0x07 and len(msg_data) >= 3:
+            if len(msg_data) >= 2:
+                model_id = struct.unpack("<H", bytes(msg_data[:2]))[0]
+                result["apple_model"] = APPLE_DEVICE_MODELS.get(
+                    model_id, f"0x{model_id:04X}")
+            if len(msg_data) >= 5:
+                # Battery levels: each nibble is a level (0-10, 15=unknown)
+                b2 = msg_data[2]
+                b3 = msg_data[3]
+                left = (b2 >> 4) & 0x0F
+                right = b2 & 0x0F
+                case = (b3 >> 4) & 0x0F
+                parts = []
+                if left <= 10:
+                    parts.append(f"L:{left*10}%")
+                if right <= 10:
+                    parts.append(f"R:{right*10}%")
+                if case <= 10:
+                    parts.append(f"Case:{case*10}%")
+                if parts:
+                    result["apple_battery"] = " ".join(parts)
+                # Charging state
+                charge = msg_data[4]
+                charging = []
+                if charge & 0x01:
+                    charging.append("L")
+                if charge & 0x02:
+                    charging.append("R")
+                if charge & 0x04:
+                    charging.append("Case")
+                if charging:
+                    result["apple_battery"] = (result.get("apple_battery") or "") + \
+                        " [charging: " + "+".join(charging) + "]"
+                if charge & 0x08:
+                    result["apple_battery"] = (result.get("apple_battery") or "") + \
+                        " [lid open]"
+
+        # --- Find My (0x12) -- AirTag / tracker detection ---
+        elif msg_type == 0x12 and len(msg_data) >= 2:
+            result["find_my"] = True
+            status = msg_data[0]
+            if status & 0x04:
+                result["find_my_maintained"] = True  # owner is maintaining
+
+        # --- AirPlay Target (0x09) ---
+        elif msg_type == 0x09 and len(msg_data) >= 6:
+            flags = msg_data[0]
+            ip_bytes = msg_data[2:6]
+            result["airplay_ip"] = "%d.%d.%d.%d" % tuple(ip_bytes)
+
+        # --- Nearby Action (0x0F) ---
+        elif msg_type == 0x0F and len(msg_data) >= 1:
+            action = msg_data[0]
+            result["apple_nearby_action"] = APPLE_NEARBY_ACTION_TYPES.get(
+                action, f"0x{action:02X}")
+
+        # --- Handoff (0x0C) ---
+        elif msg_type == 0x0C and len(msg_data) >= 2:
+            result["apple_handoff"] = True
+
+        # --- Tethering Target (0x0D) ---
+        elif msg_type == 0x0D and len(msg_data) >= 3:
+            battery = msg_data[2]
+            if battery <= 100:
+                result["apple_tether_battery"] = battery
+
+        # --- Tethering Source (0x0E) ---
+        elif msg_type == 0x0E and len(msg_data) >= 3:
+            battery = msg_data[2]
+            if battery <= 100:
+                result["apple_tether_battery"] = battery
+
+
+def _decode_microsoft_cdp(mfr_data, result):
+    """Decode Microsoft CDP (Connected Devices Platform) beacon."""
+    if len(mfr_data) < 27:
+        return
+    scenario_type = mfr_data[0]
+    if scenario_type != 1:
+        return
+    device_type = mfr_data[1] & 0x1F
+    result["ms_device_type"] = MS_CDP_DEVICE_TYPES.get(
+        device_type, f"Unknown ({device_type})")
+
+    device_status = (mfr_data[3] >> 4) & 0x0F
+    ds = []
+    if device_status & 0x08:
+        ds.append("NearShare")
+    if device_status & 0x04:
+        ds.append("NearShare (same user)")
+    if device_status & 0x01:
+        ds.append("Remote session")
+    if ds:
+        result["ms_device_status"] = ", ".join(ds)
+
+    flags = mfr_data[2] & 0x1F
+    if flags & 0x01:
+        result["ms_nearshare_everyone"] = True
+
+
 def parse_ad_structures(adv_data):
     """Parse AD structures from BLE advertising data payload."""
     result = {
@@ -937,6 +1176,26 @@ def parse_ad_structures(adv_data):
         "apple_type": None,
         "mfr_data": None,
         "services": [],
+        # Apple Continuity decoded fields
+        "apple_action": None,
+        "apple_status": None,
+        "apple_data_flags": None,
+        "apple_model": None,
+        "apple_battery": None,
+        "apple_nearby_action": None,
+        "apple_handoff": None,
+        "apple_tether_battery": None,
+        "airplay_ip": None,
+        "ibeacon_uuid": None,
+        "ibeacon_major": None,
+        "ibeacon_minor": None,
+        "ibeacon_power": None,
+        "find_my": False,
+        "find_my_maintained": False,
+        # Microsoft CDP fields
+        "ms_device_type": None,
+        "ms_device_status": None,
+        "ms_nearshare_everyone": False,
     }
     i = 0
     while i < len(adv_data):
@@ -984,11 +1243,13 @@ def parse_ad_structures(adv_data):
             result["manufacturer"] = BLE_COMPANY_IDS.get(cid, f"0x{cid:04x}")
             result["mfr_data"] = ad_data[2:]
 
-            # Apple Continuity protocol parsing
-            if cid == 0x004C and len(ad_data) >= 3:
-                apple_msg_type = ad_data[2]
-                result["apple_type"] = APPLE_CONTINUITY_TYPES.get(
-                    apple_msg_type, f"0x{apple_msg_type:02x}")
+            # Apple Continuity protocol -- full TLV sub-message decoding
+            if cid == 0x004C and len(ad_data) >= 4:
+                _decode_apple_continuity(ad_data[2:], result)
+
+            # Microsoft CDP beacon
+            elif cid == 0x0006 and len(ad_data) >= 29:
+                _decode_microsoft_cdp(ad_data[2:], result)
 
         i += 1 + length
 
@@ -1377,6 +1638,36 @@ class DashboardState:
                 for svc in fp.get("services") or []:
                     if svc not in d["services"]:
                         d["services"].append(svc)
+                # Apple Continuity decoded fields (always update -- state changes)
+                if fp.get("apple_action"):
+                    d["apple_action"] = fp["apple_action"]
+                if fp.get("apple_status"):
+                    d["apple_status"] = fp["apple_status"]
+                if fp.get("apple_data_flags"):
+                    d["apple_data_flags"] = fp["apple_data_flags"]
+                if fp.get("apple_model") and not d.get("apple_model"):
+                    d["apple_model"] = fp["apple_model"]
+                if fp.get("apple_battery"):
+                    d["apple_battery"] = fp["apple_battery"]
+                if fp.get("apple_nearby_action"):
+                    d["apple_nearby_action"] = fp["apple_nearby_action"]
+                if fp.get("apple_tether_battery") is not None:
+                    d["apple_tether_battery"] = fp["apple_tether_battery"]
+                if fp.get("find_my"):
+                    d["find_my"] = True
+                if fp.get("find_my_maintained"):
+                    d["find_my_maintained"] = True
+                if fp.get("ibeacon_uuid") and not d.get("ibeacon_uuid"):
+                    d["ibeacon_uuid"] = fp["ibeacon_uuid"]
+                    d["ibeacon_major"] = fp.get("ibeacon_major")
+                    d["ibeacon_minor"] = fp.get("ibeacon_minor")
+                if fp.get("airplay_ip"):
+                    d["airplay_ip"] = fp["airplay_ip"]
+                # Microsoft CDP fields (always update -- state changes)
+                if fp.get("ms_device_type") and not d.get("ms_device_type"):
+                    d["ms_device_type"] = fp["ms_device_type"]
+                if fp.get("ms_device_status"):
+                    d["ms_device_status"] = fp["ms_device_status"]
                 # Track resolved RPA addresses
                 if identity and "rpa_addrs" in d:
                     d["rpa_addrs"].add(mac)
@@ -1414,6 +1705,23 @@ class DashboardState:
                     "services": list(fp.get("services") or []),
                     "identity": identity,
                     "connectable": bool(pkt.get("connectable")),
+                    # Apple Continuity decoded
+                    "apple_action": fp.get("apple_action"),
+                    "apple_status": fp.get("apple_status"),
+                    "apple_data_flags": fp.get("apple_data_flags"),
+                    "apple_model": fp.get("apple_model"),
+                    "apple_battery": fp.get("apple_battery"),
+                    "apple_nearby_action": fp.get("apple_nearby_action"),
+                    "apple_tether_battery": fp.get("apple_tether_battery"),
+                    "find_my": fp.get("find_my", False),
+                    "find_my_maintained": fp.get("find_my_maintained", False),
+                    "ibeacon_uuid": fp.get("ibeacon_uuid"),
+                    "ibeacon_major": fp.get("ibeacon_major"),
+                    "ibeacon_minor": fp.get("ibeacon_minor"),
+                    "airplay_ip": fp.get("airplay_ip"),
+                    # Microsoft CDP
+                    "ms_device_type": fp.get("ms_device_type"),
+                    "ms_device_status": fp.get("ms_device_status"),
                 }
                 if identity:
                     d["rpa_addrs"] = {mac}
@@ -1944,6 +2252,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         cols = ["mac", "protocol", "mac_type", "identity", "rpa_count",
                 "uap", "uap_conf", "mfr", "apple",
+                "apple_action", "apple_data_flags", "apple_model",
+                "apple_battery", "find_my", "ms_device_type",
                 "name", "appear", "services", "type", "rssi", "rssi_min",
                 "rssi_avg", "tx_pwr", "est_dist", "num_sensors",
                 "est_lat", "est_lon", "est_unc", "pkts", "crc_ok",
@@ -2115,6 +2425,170 @@ def _process_gatt_message(frames):
             state._dirty = True
 
 
+def _sensor_gps(sensor_id):
+    """Look up last known GPS position for a sensor. Returns (lat, lon) or None."""
+    if not sensor_id:
+        return None
+    s = state.sensors.get(sensor_id)
+    if s and s.get("lat") is not None and s.get("lon") is not None:
+        return (s["lat"], s["lon"])
+    return None
+
+
+def _process_scan_message(frames):
+    """Process a scan: topic ZMQ message and merge active-scan data into device state."""
+    # Expected frames: [b"scan:", sensor_id_bytes, json_payload]
+    # or: [b"scan:", json_payload] (no sensor_id)
+    if len(frames) < 2:
+        return
+    try:
+        payload = frames[-1]
+        result = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+
+    mac = result.get("mac", "").lower()
+    if not mac:
+        return
+
+    # Extract sensor_id from multipart frames (same pattern as gatt:)
+    sensor_id = None
+    if len(frames) >= 3:
+        sensor_id = frames[1].decode("utf-8", errors="replace")
+
+    now = result.get("timestamp", time.time())
+    name = result.get("name")
+    rssi = result.get("rssi")
+    appearance = result.get("appearance")
+    tx_power = result.get("tx_power")
+    svc_uuids = result.get("service_uuids", [])
+    mfr_data = result.get("manufacturer_data")  # {company_id_str: [bytes]}
+    svc_data = result.get("service_data")        # {uuid_str: [bytes]}
+
+    # Build a fingerprint dict from the scan data so we can re-use
+    # the same decoder as passive packets
+    fp = {}
+    if name:
+        fp["name"] = name
+    if appearance is not None:
+        fp["appearance"] = BLE_APPEARANCE.get(
+            appearance, BLE_APPEARANCE.get(appearance & 0xFFC0, f"0x{appearance:04x}"))
+    if tx_power is not None:
+        fp["tx_power"] = tx_power
+    if svc_uuids:
+        fp["services"] = svc_uuids
+
+    # Decode manufacturer data through parse_ad_structures-style decoding
+    if mfr_data:
+        for cid_str, raw_bytes in mfr_data.items():
+            cid = int(cid_str)
+            data = bytes(raw_bytes)
+            if cid == 0x004C and len(data) >= 2:
+                fp["manufacturer"] = "Apple"
+                _decode_apple_continuity(data, fp)
+            elif cid == 0x0006 and len(data) >= 27:
+                fp["manufacturer"] = "Microsoft"
+                _decode_microsoft_cdp(data, fp)
+            elif not fp.get("manufacturer"):
+                fp["manufacturer"] = BLE_COMPANY_IDS.get(cid, f"0x{cid:04x}")
+
+    with state.lock:
+        if mac in state.devices:
+            d = state.devices[mac]
+            d["last"] = now
+            # Enrich with scan data
+            if name and not d.get("name"):
+                d["name"] = name
+            if rssi is not None:
+                if rssi > d.get("rssi", -999):
+                    d["rssi"] = rssi
+            if fp.get("manufacturer") and not d.get("mfr"):
+                d["mfr"] = fp["manufacturer"]
+            if fp.get("appearance") and not d.get("appear"):
+                d["appear"] = fp["appearance"]
+            if fp.get("tx_power") is not None and d.get("tx_pwr") is None:
+                d["tx_pwr"] = fp["tx_power"]
+            for svc in fp.get("services") or []:
+                if svc not in d.get("services", []):
+                    d.setdefault("services", []).append(svc)
+            # Apple decoded fields from scan
+            if fp.get("apple_type") and not d.get("apple"):
+                d["apple"] = fp["apple_type"]
+            if fp.get("apple_action"):
+                d["apple_action"] = fp["apple_action"]
+            if fp.get("apple_status"):
+                d["apple_status"] = fp["apple_status"]
+            if fp.get("apple_data_flags"):
+                d["apple_data_flags"] = fp["apple_data_flags"]
+            if fp.get("apple_model") and not d.get("apple_model"):
+                d["apple_model"] = fp["apple_model"]
+            if fp.get("apple_battery"):
+                d["apple_battery"] = fp["apple_battery"]
+            if fp.get("find_my"):
+                d["find_my"] = True
+            if fp.get("ms_device_type") and not d.get("ms_device_type"):
+                d["ms_device_type"] = fp["ms_device_type"]
+            if fp.get("ms_device_status"):
+                d["ms_device_status"] = fp["ms_device_status"]
+            d["active_scan"] = True
+            # Apply sensor GPS to scan-enriched device if it has no GPS yet
+            if not d.get("lat") and sensor_id:
+                gps = _sensor_gps(sensor_id)
+                if gps:
+                    d["lat"], d["lon"] = gps
+            state._dirty = True
+        else:
+            # Create new device entry from scan data alone
+            d = {
+                "mac": mac,
+                "protocol": "BLE",
+                "first": now,
+                "last": now,
+                "freq": 0,
+                "rssi": rssi if rssi is not None else -100,
+                "rssi_min": rssi if rssi is not None else -100,
+                "rssi_sum": rssi if rssi is not None else -100,
+                "rssi_cnt": 1 if rssi is not None else 0,
+                "type": "SCAN",
+                "phy": "1M",
+                "pkts": 0,
+                "crc_ok": 0,
+                "crc_bad": 0,
+                "mac_type": "",
+                "name": name or "",
+                "mfr": fp.get("manufacturer", ""),
+                "apple": fp.get("apple_type", ""),
+                "appear": fp.get("appearance", ""),
+                "tx_pwr": fp.get("tx_power"),
+                "services": list(fp.get("services") or []),
+                "identity": None,
+                "connectable": False,
+                "apple_action": fp.get("apple_action"),
+                "apple_status": fp.get("apple_status"),
+                "apple_data_flags": fp.get("apple_data_flags"),
+                "apple_model": fp.get("apple_model"),
+                "apple_battery": fp.get("apple_battery"),
+                "apple_nearby_action": fp.get("apple_nearby_action"),
+                "apple_tether_battery": fp.get("apple_tether_battery"),
+                "find_my": fp.get("find_my", False),
+                "find_my_maintained": fp.get("find_my_maintained", False),
+                "ibeacon_uuid": fp.get("ibeacon_uuid"),
+                "ibeacon_major": fp.get("ibeacon_major"),
+                "ibeacon_minor": fp.get("ibeacon_minor"),
+                "airplay_ip": fp.get("airplay_ip"),
+                "ms_device_type": fp.get("ms_device_type"),
+                "ms_device_status": fp.get("ms_device_status"),
+                "active_scan": True,
+            }
+            # Apply sensor GPS to scan-only device
+            if sensor_id:
+                gps = _sensor_gps(sensor_id)
+                if gps:
+                    d["lat"], d["lon"] = gps
+            state.devices[mac] = d
+            state._dirty = True
+
+
 def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
     """Bind SUB socket(s) and receive packets from connecting sensors."""
     ctx = zmq.Context()
@@ -2143,6 +2617,10 @@ def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
         # frame 2 = JSON payload)
         if frames and frames[0] == b"gatt:":
             _process_gatt_message(frames)
+            continue
+
+        if frames and frames[0] == b"scan:":
+            _process_scan_message(frames)
             continue
 
         _process_zmq_message(frames, pcap_file, use_gps)
@@ -2605,8 +3083,15 @@ function addrCls(t) {
 
 function mfrLabel(d) {
   let s = d.mfr || '';
-  if (d.apple) s = s ? s+' '+d.apple : d.apple;
-  if (d.appear && d.appear !== 'Unknown') s = s ? s+' ('+d.appear+')' : d.appear;
+  if (d.apple_model) {
+    s = s ? s+' '+d.apple_model : d.apple_model;
+  } else if (d.apple) {
+    s = s ? s+' '+d.apple : d.apple;
+  }
+  if (d.apple_action) s += ': ' + d.apple_action;
+  if (d.ms_device_type) s = s ? s+' '+d.ms_device_type : d.ms_device_type;
+  if (d.find_my) s = (s||'') + ' [Find My]';
+  if (d.appear && d.appear !== 'Unknown' && !d.apple_model) s = s ? s+' ('+d.appear+')' : d.appear;
   return s;
 }
 
@@ -3138,6 +3623,24 @@ function renderDetail(d) {
   html += '<div class="detail-row"><span class="lbl">First seen</span><span class="val">' + fmtT(d.first) + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">Last seen</span><span class="val">' + ago(d.last) + '</span></div>';
   if (d.num_sensors > 0) html += '<div class="detail-row"><span class="lbl">Sensors</span><span class="val">' + d.num_sensors + (d.sensor_ids ? ' (' + d.sensor_ids.join(', ') + ')' : '') + '</span></div>';
+
+  // Apple Continuity decoded fields
+  if (d.apple_action) html += '<div class="detail-row"><span class="lbl">Activity</span><span class="val">' + esc(d.apple_action) + '</span></div>';
+  if (d.apple_status) html += '<div class="detail-row"><span class="lbl">Apple status</span><span class="val">' + esc(d.apple_status) + '</span></div>';
+  if (d.apple_data_flags) html += '<div class="detail-row"><span class="lbl">Device flags</span><span class="val">' + esc(d.apple_data_flags) + '</span></div>';
+  if (d.apple_model) html += '<div class="detail-row"><span class="lbl">Model</span><span class="val">' + esc(d.apple_model) + '</span></div>';
+  if (d.apple_battery) html += '<div class="detail-row"><span class="lbl">Battery</span><span class="val">' + esc(d.apple_battery) + '</span></div>';
+  if (d.apple_nearby_action) html += '<div class="detail-row"><span class="lbl">Nearby action</span><span class="val">' + esc(d.apple_nearby_action) + '</span></div>';
+  if (d.apple_tether_battery != null) html += '<div class="detail-row"><span class="lbl">Hotspot battery</span><span class="val">' + d.apple_tether_battery + '%</span></div>';
+  if (d.find_my) html += '<div class="detail-row"><span class="lbl">Find My</span><span class="val" style="color:#f55">' + (d.find_my_maintained ? 'Tracker (maintained)' : 'Tracker detected') + '</span></div>';
+  if (d.airplay_ip) html += '<div class="detail-row"><span class="lbl">AirPlay IP</span><span class="val">' + esc(d.airplay_ip) + '</span></div>';
+  if (d.ibeacon_uuid) html += '<div class="detail-row"><span class="lbl">iBeacon UUID</span><span class="val" style="font-size:9px">' + esc(d.ibeacon_uuid) + '</span></div>';
+  if (d.ibeacon_major != null) html += '<div class="detail-row"><span class="lbl">iBeacon Major/Minor</span><span class="val">' + d.ibeacon_major + ' / ' + d.ibeacon_minor + '</span></div>';
+  // Microsoft CDP fields
+  if (d.ms_device_type) html += '<div class="detail-row"><span class="lbl">Device type</span><span class="val">' + esc(d.ms_device_type) + '</span></div>';
+  if (d.ms_device_status) html += '<div class="detail-row"><span class="lbl">MS status</span><span class="val">' + esc(d.ms_device_status) + '</span></div>';
+  if (d.lat != null && d.lon != null) html += '<div class="detail-row"><span class="lbl">Location</span><span class="val">' + d.lat.toFixed(6) + ', ' + d.lon.toFixed(6) + '</span></div>';
+  if (d.active_scan) html += '<div class="detail-row"><span class="lbl">Active scan</span><span class="val grn">enriched via HCI</span></div>';
 
   // AD services
   if (d.services && d.services.length) {
