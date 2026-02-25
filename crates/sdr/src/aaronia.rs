@@ -3,8 +3,8 @@
 //! Aaronia Spectran V6 SDR backend.
 //!
 //! Uses the RTSA API (libAaroniaRTSAAPI.so) in RAW mode to receive
-//! wideband IQ samples. At 122 MHz receiver clock with no decimation,
-//! covers the entire BLE band (80 MHz) plus guard.
+//! wideband IQ samples. At 92 MHz receiver clock with no decimation,
+//! covers all 40 BLE channels (2402-2480 MHz).
 
 use std::os::raw::c_void;
 use std::ptr;
