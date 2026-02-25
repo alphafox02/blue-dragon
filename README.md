@@ -30,23 +30,49 @@ dashboard for real-time monitoring.
 | CPU SIMD (AVX2) | Tested | i7-12700H |
 | GPU OpenCL | Tested | NVIDIA RTX 3060, Intel UHD iGPU |
 | HackRF backend | Untested | Compiles, needs hardware validation |
-| bladeRF backend | Tested | |
+| bladeRF backend | Tested | 88.7% CRC OTA at -g 30 |
 | SoapySDR backend | Tested | |
+| Aaronia Spectran V6 | Tested | 92 MHz BW, ~38% CRC OTA (tuning ongoing) |
 | HCI GATT probing | Untested | Compiles, needs end-to-end test with --hci |
+| HCI active scanning | Tested | --active-scan enriches device data |
 | Channel counts -C 60+ | Untested | -C 40 validated, higher counts need testing |
 
 ## Supported Hardware
 
-| SDR | Interface Flag | Bandwidth | Notes |
-|-----|---------------|-----------|-------|
-| USRP (B200/B210) | `-i usrp-MODEL-SERIAL` | 4-56 MHz | Best performance |
-| HackRF One | `-i hackrf-SERIAL` | 4-20 MHz | 20 MHz max sample rate |
-| bladeRF 2.0 | `-i bladerf0` | 4-96 MHz | Full-band capable |
-| SoapySDR | `-i soapy-N` | Varies | Generic SDR support |
+| SDR | Interface Flag | Bandwidth | ADC Bits | Notes |
+|-----|---------------|-----------|----------|-------|
+| USRP (B200/B210) | `-i usrp-MODEL-SERIAL` | 4-56 MHz | 12-bit | AD9361 (61.44 Msps, 56 MHz analog BW) |
+| HackRF One | `-i hackrf-SERIAL` | 4-20 MHz | 8-bit | 20 MHz max sample rate |
+| bladeRF 2.0 | `-i bladerf0` | 4-56 MHz (normal), up to 122 MHz (oversample) | 12-bit (normal) / 8-bit (oversample) | AD9361 (oversample overclocks beyond AD spec) |
+| SoapySDR | `-i soapy-N` | Varies | Varies | Generic SDR support |
+| Aaronia Spectran V6 | `-i aaronia` | 92 MHz | f32 | Real-time spectrum analyzer |
 
 To list available SDR devices:
 
     blue-dragon --list
+
+### SDR Gain Recommendations
+
+The `-g` flag sets the SDR's receive gain in dB. The optimal value depends on
+the SDR hardware and environment. **Too high clips the ADC (zero packets);
+too low buries the signal in the noise floor (low CRC rate).**
+
+| SDR | Default | OTA Recommended | Cabled (30 dB atten) | Notes |
+|-----|---------|-----------------|----------------------|-------|
+| USRP B210 | 60 | 40-50 | 60 | UHD auto-AGC not used |
+| bladeRF 2.0 | 60 | **25-35** | 50-60 | Clips at 60 OTA -- use 30 |
+| HackRF | 40 LNA / 20 VGA | TBD | TBD | Separate `--hackrf-lna` / `--hackrf-vga` |
+| Aaronia Spectran V6 | N/A | N/A | N/A | Uses reflevel, not gain (auto-scaled) |
+| SoapySDR | 60 | Device-dependent | Device-dependent | Depends on underlying hardware |
+
+**Symptoms of gain too high:** BLE count = 0, all bursts fail decode (ADC saturation
+clips the waveform so preamble/AA correlation fails). Fix: lower `-g`.
+
+**Symptoms of gain too low:** Low CRC pass rate (< 50%), low BLE packet count.
+Fix: raise `-g`.
+
+Use `--stats` to monitor CRC rate in real time. Target: > 85% for a clean
+environment, 70-90% typical for busy 2.4 GHz bands.
 
 ## Building
 
@@ -145,6 +171,26 @@ Airspy, or HackRF is the better fit for Pi deployments.
 GPU acceleration on macOS requires Metal (future work -- OpenCL is
 deprecated on macOS and Metal backend is not yet implemented).
 
+### Aaronia Spectran V6
+
+Requires the Aaronia RTSA Suite Pro installed to `/opt/aaronia-rtsa-suite/`.
+The SDK and runtime library (`libAaroniaRTSAAPI.so`) live in the
+`Aaronia-RTSA-Suite-PRO/` subdirectory. The build system embeds an rpath
+so the binary finds the library at runtime without `LD_LIBRARY_PATH`.
+
+    cargo build --release --features "aaronia,zmq"
+
+The Aaronia backend uses `spectranv6/raw` mode with `outputformat=iq` to
+get wideband IQ samples. The 92.16 MHz clock gives 92 MHz of usable
+bandwidth at `-C 92`:
+
+    blue-dragon -l -i aaronia -C 92 --check-crc --stats
+
+The `-g` flag is ignored for Aaronia. Instead, the backend sets the reference
+level to -20 dBm and auto-scales the f32 samples to match the pipeline's
+int8/int16 range. The auto-scale measures RMS over 20 packets at startup
+and uses the 25th percentile to filter out WiFi burst outliers.
+
 ### Feature Flags
 
 Features are opt-in. Build only what you need:
@@ -158,7 +204,8 @@ Features are opt-in. Build only what you need:
 | `zmq` | ZMQ packet streaming + C2 | libzmq3-dev |
 | `gps` | GPS tagging via gpsd | (no C lib -- uses TCP JSON) |
 | `gpu` | OpenCL GPU acceleration | ocl-icd-opencl-dev |
-| `hci` | Active GATT probing via HCI | libdbus-1-dev (for BlueZ D-Bus) |
+| `hci` | Active GATT probing + LE scanning via HCI | libdbus-1-dev (for BlueZ D-Bus) |
+| `aaronia` | Aaronia Spectran V6 support | Aaronia RTSA Suite Pro |
 
 ## BLE 5 PHY Support
 
@@ -249,6 +296,7 @@ GPU:
 
 HCI:
     --hci                   Enable active GATT probing via system Bluetooth adapter
+    --active-scan           Enable LE active scanning to enrich device data
 
 Wireshark:
     --install               Install as Wireshark extcap plugin
@@ -280,6 +328,18 @@ Stream with CURVE encryption:
 Capture with GPS tagging:
 
     blue-dragon -l -c 2441 -C 40 --gpsd --zmq tcp://collector:5555
+
+Capture 92 MHz with Aaronia Spectran V6:
+
+    blue-dragon -l -i aaronia -C 92 --check-crc --stats
+
+Capture full BLE band with bladeRF at recommended OTA gain:
+
+    blue-dragon -l -i bladerf0 -a -g 30 --check-crc --stats
+
+Capture with active BLE scanning for device enrichment:
+
+    blue-dragon -l -c 2441 -C 40 --hci --active-scan --zmq tcp://dashboard:5555 --check-crc
 
 Capture BLE 5 Long Range (LE Coded PHY) on advertising channels:
 
@@ -436,7 +496,7 @@ or special permissions beyond D-Bus policy are needed.
 ## Architecture
 
 ```
-SDR (USRP / HackRF / BladeRF / SoapySDR)
+SDR (USRP / HackRF / BladeRF / SoapySDR / Aaronia)
     |
     | int8 IQ samples
     v
@@ -468,6 +528,7 @@ Output
     |-- ZMQ PUB (multipart: sensor_id + GPS + PCAP record)
     |-- C2 heartbeat (JSON over ZMQ DEALER)
     |-- HCI GATT prober (opt-in, via system hci0 adapter)
+    |-- HCI LE active scanner (opt-in, enriches device data)
 ```
 
 ## Performance
@@ -512,6 +573,86 @@ path is faster than the VideoCore GPU -- do not use `gpu` on Pi.
 LE 2M and LE Coded decoding adds negligible overhead -- the additional
 PHY decoders only run when LE 1M decode fails on a burst, and the
 preamble checks fail fast on non-matching bursts.
+
+## Sample Precision
+
+All SDR backends deliver samples as signed int8 (SC8) to the pipeline,
+regardless of native ADC resolution. The PFB channelizer promotes i8 to
+i16 internally (`(sample as i16) << 8`), but the lower 8 bits are always
+zero -- effectively 8-bit precision in a 16-bit container.
+
+| SDR | Native ADC | What enters pipeline | Precision lost |
+|-----|-----------|---------------------|----------------|
+| USRP B210 | 12-bit | i8 (UHD SC8 wire format) | 4 bits (24 dB) |
+| bladeRF (normal) | 12-bit (SC16_Q11) | i8 (right-shift >> 4) | 4 bits (24 dB) |
+| bladeRF (oversample) | SC8_Q7 | i8 (native) | 5 bits (30 dB) |
+| HackRF | 8-bit | i8 (native) | None |
+| SoapySDR (CS16) | Device-dependent | i8 (right-shift >> N) | Device-dependent |
+| Aaronia Spectran V6 | 32-bit float | i8 (scaled from f32) | ~24 bits |
+
+This means the USRP and bladeRF are only using 8 of their 12 available
+ADC bits. A future i16 pipeline would preserve full ADC resolution for
+all backends except HackRF (which is natively 8-bit). This primarily
+affects dynamic range -- the ability to decode weak signals in the
+presence of strong ones.
+
+**USRP note:** The USRP B210 ADC is 12-bit, but we currently request
+SC8 wire format from UHD. Switching to SC16 would preserve all 12 bits.
+USB3 bandwidth is not a concern -- SC16 at 61.44 Msps is only 246 MB/s
+vs USB3's ~400 MB/s sustained. The AD9361's analog filter passes 56 MHz
+cleanly; at `-C 56` and below, all channels are within the analog
+bandwidth. Above that, edge channels see filter roll-off.
+
+**Aaronia note:** The Aaronia delivers 32-bit float samples. The current
+i8 quantization loses significant precision. The backend has a
+`recv_into_i16` method ready for a future i16 pipeline upgrade.
+
+## Troubleshooting
+
+### BLE count is 0 (zero packets)
+
+1. **Gain too high (most common).** The ADC is clipping. Lower `-g`:
+   - bladeRF OTA: try `-g 30` (default 60 clips)
+   - USRP OTA: try `-g 40-50`
+   - Cabled with 30 dB attenuator: `-g 60` is fine
+
+2. **Wrong interface name.** Use `--list` to find your SDR, then pass
+   the exact string to `-i`.
+
+3. **Missing `-l` flag.** Live capture requires `-l` (or `--live`).
+
+4. **Center frequency off-band.** Default 2441 MHz is good. Ensure
+   the SDR is tuned to the 2.4 GHz ISM band.
+
+### CRC rate is low (< 50%)
+
+1. **Gain too low.** Raise `-g` until CRC improves.
+2. **Gain too high.** Also causes poor CRC -- the waveform clips and
+   correlation degrades. Try lowering gain.
+3. **Heavy WiFi environment.** 2.4 GHz WiFi shares the band with BLE
+   and can raise the noise floor. Normal to see 70-85% CRC in busy
+   environments.
+4. **Not using `--check-crc`.** Without this flag, CRC is never
+   computed and shows `0/0`. This is not an error -- add `--check-crc`
+   to enable validation.
+
+### Aaronia: library not found
+
+If you see `libAaroniaRTSAAPI.so: cannot open shared object file`:
+the RTSA Suite is not installed to the expected path, or the rpath
+is not embedded. Verify the library exists:
+
+    ls /opt/aaronia-rtsa-suite/Aaronia-RTSA-Suite-PRO/libAaroniaRTSAAPI.so
+
+If installed elsewhere, either symlink or set `LD_LIBRARY_PATH`.
+Rebuilding with `--features aaronia` when the directory exists will
+embed the correct rpath automatically.
+
+### ZMQ: "Invalid argument" on bind
+
+The ZMQ endpoint format is `tcp://host:port` for connecting to a
+remote dashboard, or `tcp://*:port` for binding locally. Ensure the
+port is not already in use.
 
 ## Differences from C Version
 

@@ -7,7 +7,7 @@ blue-dragon/
 ├── crates/
 │   ├── app/          bd-app       CLI entry point, pipeline orchestration
 │   ├── dsp/          bd-dsp       PFB channelizer, FFT, burst detection, FSK demod
-│   ├── sdr/          bd-sdr       SDR hardware abstraction (USRP, HackRF, BladeRF, SoapySDR)
+│   ├── sdr/          bd-sdr       SDR hardware abstraction (USRP, HackRF, BladeRF, SoapySDR, Aaronia)
 │   ├── protocol/     bd-protocol  BLE and Classic BT packet decoding
 │   ├── output/       bd-output    PCAP writer, ZMQ streaming, GPS client, C2 control
 │   └── gpu/          bd-gpu       Optional OpenCL GPU acceleration
@@ -40,6 +40,7 @@ All SDR backends and optional features are compile-time gated:
 | `hackrf` | bd-sdr | libhackrf |
 | `bladerf` | bd-sdr | libbladeRF |
 | `soapysdr` | bd-sdr | libSoapySDR |
+| `aaronia` | bd-sdr | Aaronia RTSA Suite (libAaroniaRTSAAPI) |
 | `zmq` | bd-output | libzmq |
 | `gps` | bd-output | none (TCP JSON to gpsd) |
 | `gpu` | bd-gpu | OpenCL runtime |
@@ -84,6 +85,7 @@ All SDR backends and optional features are compile-time gated:
 | 11 | `decode` | FSK demodulation, BLE/BT protocol decode, CRC validation, PCAP output, ZMQ publish. Updates heartbeat stats. |
 | 12 | `c2-control` | ZMQ DEALER socket to dashboard ROUTER. Sends JSON heartbeat every 5s. Receives commands. (Only with `--zmq`.) |
 | 13 | `c2-dispatch` | Reads ControlCommand channel, stores gain/squelch in atomics for other threads to pick up. (Only with `--zmq`.) |
+| 14 | `hci-scan` | LE active scanning via BlueZ. Sends ScanResult to ZMQ. Rate-limited to 1 update per MAC per 10s. (Only with `--active-scan`.) |
 
 ### Inter-thread communication
 
@@ -106,7 +108,7 @@ Shared mutex: `Arc<Mutex<HeartbeatState>>` -- written by decode thread (pkt_rate
 ## Data Flow
 
 ```
-SDR (SC8: signed int8 IQ pairs)
+SDR (SC8: signed int8 IQ pairs, or f32 scaled to i8 for Aaronia)
   │
   │ sdr-recv thread: recv_into(&mut [i8])
   v
@@ -181,15 +183,68 @@ All backends implement a `Handle` type with:
 - `overflow_count() -> u64` -- underrun counter
 - `set_gain(gain)` -- runtime tunable via C2
 
-| Backend | Native Format | Conversion | Max Sample Rate |
-|---------|--------------|------------|-----------------|
-| USRP | SC8 (UHD converts 12-bit internally) | None | 56 MHz |
-| HackRF | CS8 (unsigned reinterpreted as signed) | None | 20 MHz |
-| bladeRF | SC16_Q11 (12-bit in 16-bit) | >>4 to i8 | 96 MHz (oversample) |
-| SoapySDR | CS8 preferred, CF32/CS16 fallback | Format-dependent | Device-dependent |
+| Backend | Native Format | Conversion | Effective Bits | Max Sample Rate |
+|---------|--------------|------------|----------------|-----------------|
+| USRP | SC8 (UHD converts 12-bit internally) | None | 8 | 61.44 Msps (56 MHz analog BW) |
+| HackRF | CS8 (unsigned reinterpreted as signed) | None | 8 | 20 MHz |
+| bladeRF | SC16_Q11 (12-bit) / SC8_Q7 (oversample) | >>4 to i8 | 8 (12 native up to 56 MHz) | 61.44 Msps normal (56 MHz analog BW), 122.88 Msps oversample |
+| SoapySDR | CS8 preferred, CF32/CS16 fallback | Format-dependent | 8 | Device-dependent |
+| Aaronia | f32 (32-bit float IQ) | f32 * scale -> i8 | 8 (f32 native) | 92.16 MHz |
 
 The `SdrHandle` enum dispatches to the correct backend at runtime. HackRF
 has separate LNA/VGA gain controls; all others use a single gain value.
+The Aaronia backend ignores the `-g` gain flag and instead uses an internal
+reference level (-20 dBm) with auto-scaling.
+
+### Aaronia Spectran V6
+
+The Aaronia backend (`sdr/src/aaronia.rs`) uses the RTSA API in
+`spectranv6/raw` mode to receive wideband IQ samples as 32-bit float
+pairs. Key details:
+
+- **Clock:** 92,160,000 Hz (92.16 MHz). Requested as 92 MHz but the API
+  selects the nearest supported clock, which is 92.16 MHz. At `-C 92`,
+  this gives 92 channels at 1.0017 MHz each (0.17% wider than 1 MHz).
+- **Decimation:** 1:1 (full rate, no decimation).
+- **Reference level:** -20 dBm. This sets the ADC full-scale. Lower values
+  increase sensitivity but clip on strong signals (WiFi).
+- **Auto-scale:** At startup, measures RMS over 20 packets. Uses the 25th
+  percentile RMS to compute a scale factor that maps noise floor to ~2
+  LSBs in i8. This filters out WiFi burst outliers that would inflate
+  a single-packet RMS measurement. Target: ~36 dB headroom for BLE
+  signals before clipping.
+- **Packet format:** Each RTSA API packet contains `num` complex samples
+  with `stride` floats between samples (stride >= 2). The backend reads
+  `fp32[i*stride]` (I) and `fp32[i*stride+1]` (Q) per sample.
+- **recv_into_i16:** An alternate method exists for future i16 pipeline
+  support. Scales f32 by `scale * 256` to fill the i16 range.
+- **Overflow detection:** Checks `PACKET_WARN_OVERFLOW` flag per packet.
+- **No sudo required:** The RTSA API handles USB communication internally.
+
+### Precision chain (current i8 pipeline)
+
+```
+SDR ADC (8-32 bit native)
+    |
+    | recv_into(&mut [i8]): all backends truncate/scale to signed 8-bit
+    v
+crossbeam channel: Vec<i8> (bounded, 32 slots)
+    |
+    | PFB thread: (sample as i16) << 8 -- sign-extend to i16
+    v
+PFB channelizer: i16 fixed-point arithmetic
+    |
+    | IFFT: output Complex32 (f32 pairs)
+    v
+Burst catcher / demod / decode: all f32
+```
+
+The i8-to-i16 promotion via left-shift preserves the sign but fills
+the lower 8 bits with zeros. All backends effectively deliver 8-bit
+precision regardless of native ADC resolution. A future i16 pipeline
+would change `Vec<i8>` to `Vec<i16>` and have each backend deliver
+native precision, improving dynamic range for USRP (+4 bits/24 dB),
+bladeRF (+4 bits/24 dB), and Aaronia (+8 bits/48 dB).
 
 ## GPU Path
 

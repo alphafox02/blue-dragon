@@ -1027,6 +1027,8 @@ fn detect_sdr_type(iface: &str) -> &str {
         "bladerf"
     } else if iface.starts_with("soapy") {
         "soapysdr"
+    } else if iface.starts_with("aaronia") {
+        "aaronia"
     } else {
         "usrp" // default
     }
@@ -1042,6 +1044,8 @@ enum SdrHandle {
     BladeRf(bd_sdr::bladerf::BladerfHandle),
     #[cfg(feature = "soapysdr")]
     Soapy(bd_sdr::soapysdr::SoapyHandle),
+    #[cfg(feature = "aaronia")]
+    Aaronia(bd_sdr::aaronia::AaroniaHandle),
 }
 
 // Safety: SDR C library handles are thread-safe (recv from one thread is fine).
@@ -1059,6 +1063,8 @@ impl SdrHandle {
             SdrHandle::BladeRf(h) => h.recv_into(buf),
             #[cfg(feature = "soapysdr")]
             SdrHandle::Soapy(h) => h.recv_into(buf),
+            #[cfg(feature = "aaronia")]
+            SdrHandle::Aaronia(h) => h.recv_into(buf),
         }
     }
 
@@ -1072,6 +1078,8 @@ impl SdrHandle {
             SdrHandle::BladeRf(h) => h.max_samps(),
             #[cfg(feature = "soapysdr")]
             SdrHandle::Soapy(h) => h.max_samps(),
+            #[cfg(feature = "aaronia")]
+            SdrHandle::Aaronia(h) => h.max_samps(),
         }
     }
 
@@ -1085,6 +1093,8 @@ impl SdrHandle {
             SdrHandle::BladeRf(h) => h.overflow_count(),
             #[cfg(feature = "soapysdr")]
             SdrHandle::Soapy(h) => h.overflow_count(),
+            #[cfg(feature = "aaronia")]
+            SdrHandle::Aaronia(h) => h.overflow_count(),
         }
     }
 
@@ -1104,6 +1114,8 @@ impl SdrHandle {
             SdrHandle::BladeRf(h) => h.set_gain(gain),
             #[cfg(feature = "soapysdr")]
             SdrHandle::Soapy(h) => h.set_gain(gain),
+            #[cfg(feature = "aaronia")]
+            SdrHandle::Aaronia(h) => h.set_gain(gain),
         }
     }
 }
@@ -1146,6 +1158,13 @@ fn open_sdr_handle(
                 iface, sample_rate, center_freq_hz, gain,
             )?;
             Ok(SdrHandle::Soapy(h))
+        }
+        #[cfg(feature = "aaronia")]
+        "aaronia" => {
+            let h = bd_sdr::aaronia::AaroniaHandle::open(
+                iface, sample_rate, center_freq_hz, gain, antenna,
+            )?;
+            Ok(SdrHandle::Aaronia(h))
         }
         _ => Err(format!(
             "unsupported SDR type '{}' (interface: '{}'). Compile with the appropriate feature flag.",
@@ -1567,6 +1586,7 @@ pub fn run_live(
         gps_client,
     );
 
+    // SDR recv thread: continuously drains hardware, sends i16 buffers to PFB thread.
     // SDR recv thread: continuously drains hardware, sends SC8 buffers to PFB thread
     // 32 slots provides ~2.7ms buffering at 60 MHz, absorbing scheduling jitter
     let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i8>>(32);

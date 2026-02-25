@@ -185,6 +185,17 @@ fn print_extcap_interfaces() {
             }
         }
     }
+    #[cfg(feature = "aaronia")]
+    {
+        if let Ok(devices) = bd_sdr::aaronia::list_devices() {
+            for dev in &devices {
+                println!(
+                    "interface {{value=aaronia-{}}}{{display=Blue Dragon Aaronia Spectran V6 {}}}",
+                    dev.serial, dev.serial
+                );
+            }
+        }
+    }
 }
 
 fn print_extcap_dlts() {
@@ -322,6 +333,19 @@ fn main() {
                     }
                 }
                 Err(e) => eprintln!("error listing SoapySDR devices: {}", e),
+            }
+        }
+        #[cfg(feature = "aaronia")]
+        {
+            match bd_sdr::aaronia::list_devices() {
+                Ok(devices) => {
+                    for dev in &devices {
+                        let usb = if dev.superspeed { "USB3" } else { "USB2" };
+                        eprintln!("  aaronia-{} ({})", dev.serial, usb);
+                        found += 1;
+                    }
+                }
+                Err(e) => eprintln!("error listing Aaronia devices: {}", e),
             }
         }
         if found == 0 {

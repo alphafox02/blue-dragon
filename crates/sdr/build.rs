@@ -78,6 +78,16 @@ fn main() {
         }
     }
 
+    #[cfg(feature = "aaronia")]
+    {
+        // Aaronia RTSA Suite installs to /opt/aaronia-rtsa-suite/
+        let aaronia_lib_dir = "/opt/aaronia-rtsa-suite/Aaronia-RTSA-Suite-PRO";
+        if Path::new(aaronia_lib_dir).is_dir() {
+            println!("cargo:rustc-link-search=native={}", aaronia_lib_dir);
+        }
+        println!("cargo:rustc-link-lib=AaroniaRTSAAPI");
+    }
+
     #[cfg(feature = "soapysdr")]
     {
         link_lib("SoapySDR", "SoapySDR");
