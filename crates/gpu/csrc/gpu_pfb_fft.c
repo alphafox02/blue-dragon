@@ -26,11 +26,11 @@
 #define NUM_FFT 2
 
 /* ------------------------------------------------------------------ */
-/* OpenCL PFB kernel source (int8 input)                               */
+/* OpenCL PFB kernel source (int16 input)                              */
 /* ------------------------------------------------------------------ */
 static const char *pfb_kernel_source =
 "__kernel void pfb_channelize(\n"
-"    __global const char *raw_input,\n"
+"    __global const short *raw_input,\n"
 "    __global const float *h_sub,\n"
 "    __global float *fft_buffer,\n"
 "    const uint M,\n"
@@ -74,7 +74,7 @@ static const char *pfb_kernel_source =
 "        imag_sum += si * coeff;\n"
 "    }\n"
 "\n"
-"    float scale = 1.0f / 256.0f;\n"
+"    float scale = 1.0f / 32768.0f;\n"
 "    uint out_idx = t * M + ch;\n"
 "    fft_buffer[out_idx * 2u] = real_sum * scale;\n"
 "    fft_buffer[out_idx * 2u + 1u] = imag_sum * scale;\n"
@@ -98,7 +98,7 @@ typedef struct {
     cl_mem cl_raw_buffer;
 
     float *fft_host_ptr;
-    int8_t *raw_host_ptr;
+    int16_t *raw_host_ptr;
 
     uint64_t fft_buffer_size;
     uint64_t raw_buffer_size;
@@ -124,7 +124,7 @@ static unsigned pfb_M, pfb_M2, pfb_h_sub_len;
 static unsigned g_batch_size;
 static unsigned pre_roll_steps;
 static unsigned pre_roll_bytes;
-static int8_t *pre_roll_buf;
+static int16_t *pre_roll_buf;
 
 /* Worker thread */
 static pthread_t worker_thread;
@@ -280,9 +280,9 @@ static int init_fft_context(fft_context_t *f, unsigned width,
                                       f->fft_buffer_size, NULL, &err);
     if (err != CL_SUCCESS) return -1;
 
-    /* Raw buffer: int8 [(pre_roll_steps + batch_size) * M] */
-    f->raw_buffer_size = (uint64_t)(pre_roll_steps + batch_size) * pfb_M;
-    f->raw_host_ptr = (int8_t *)calloc(1, f->raw_buffer_size);
+    /* Raw buffer: int16 [(pre_roll_steps + batch_size) * M] */
+    f->raw_buffer_size = (uint64_t)(pre_roll_steps + batch_size) * pfb_M * sizeof(int16_t);
+    f->raw_host_ptr = (int16_t *)calloc(1, f->raw_buffer_size);
     if (!f->raw_host_ptr) return -1;
 
     f->cl_raw_buffer = clCreateBuffer(cl_ctx, CL_MEM_READ_ONLY,
@@ -383,9 +383,9 @@ int gpu_pfb_init(unsigned M, unsigned h_sub_len,
     g_batch_size = batch_size;
 
     pre_roll_steps = 2 * h_sub_len - 1;
-    pre_roll_bytes = pre_roll_steps * pfb_M;
+    pre_roll_bytes = pre_roll_steps * pfb_M * sizeof(int16_t);
 
-    pre_roll_buf = (int8_t *)calloc(1, pre_roll_bytes);
+    pre_roll_buf = (int16_t *)calloc(1, pre_roll_bytes);
     if (!pre_roll_buf) return -1;
 
     /* Find OpenCL device */
@@ -450,13 +450,15 @@ int gpu_pfb_init(unsigned M, unsigned h_sub_len,
     return 0;
 }
 
-int8_t *gpu_pfb_get_buffer(void) {
+int16_t *gpu_pfb_get_buffer(void) {
     fft_context_t *f = &fft_ctx[cur_fft];
-    /* Return pointer to batch area (after pre-roll) */
-    return &f->raw_host_ptr[pre_roll_bytes];
+    /* Return pointer to batch area (after pre-roll, in int16 elements) */
+    unsigned pre_roll_elements = pre_roll_steps * pfb_M;
+    return &f->raw_host_ptr[pre_roll_elements];
 }
 
 unsigned gpu_pfb_buffer_len(void) {
+    /* Returns number of int16 elements (not bytes) */
     return g_batch_size * pfb_M;
 }
 
@@ -466,7 +468,8 @@ float *gpu_pfb_submit(void) {
 
     /* Save tail of current buffer as pre-roll for next batch */
     if (f->buffer_state == BUFFER_STATE_FILLING) {
-        size_t batch_tail = pre_roll_bytes +
+        unsigned pre_roll_elements = pre_roll_steps * pfb_M;
+        size_t batch_tail = pre_roll_elements +
                             (size_t)(g_batch_size - pre_roll_steps) * pfb_M;
         memcpy(pre_roll_buf, &f->raw_host_ptr[batch_tail], pre_roll_bytes);
     }

@@ -17,7 +17,7 @@ dashboard for real-time monitoring.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| USRP B210 capture | Tested | USB 3, up to -C 40 validated |
+| USRP B210 capture | Tested | USB 3, validated at -C 40 and -C 60 |
 | BLE LE 1M decoding | Tested | 95-96% CRC pass rate |
 | BLE LE 2M decoding | Tested | |
 | BLE LE Coded decoding | Tested | Low volume confirmed in drive tests |
@@ -32,10 +32,10 @@ dashboard for real-time monitoring.
 | HackRF backend | Untested | Compiles, needs hardware validation |
 | bladeRF backend | Tested | 88.7% CRC OTA at -g 30 |
 | SoapySDR backend | Tested | |
-| Aaronia Spectran V6 | Tested | 92 MHz BW, ~38% CRC OTA (tuning ongoing) |
+| Spectran V6 | Tested | 92 MHz BW, ~38% CRC OTA (tuning ongoing) |
 | HCI GATT probing | Untested | Compiles, needs end-to-end test with --hci |
 | HCI active scanning | Tested | --active-scan enriches device data |
-| Channel counts -C 60+ | Untested | -C 40 validated, higher counts need testing |
+| Channel counts -C 60+ | Tested | -C 40 and -C 60 validated on USRP and bladeRF |
 
 ## Supported Hardware
 
@@ -45,7 +45,7 @@ dashboard for real-time monitoring.
 | HackRF One | `-i hackrf-SERIAL` | 4-20 MHz | 8-bit | 20 MHz max sample rate |
 | bladeRF 2.0 | `-i bladerf0` | 4-56 MHz (normal), up to 122 MHz (oversample) | 12-bit (normal) / 8-bit (oversample) | AD9361 (oversample overclocks beyond AD spec) |
 | SoapySDR | `-i soapy-N` | Varies | Varies | Generic SDR support |
-| Aaronia Spectran V6 | `-i aaronia` | 92 MHz | f32 | Real-time spectrum analyzer |
+| Spectran V6 | `-i aaronia` | 92-245 MHz | f32 | Use `-C 92`, `-C 122`, or `-C 245` (device-dependent) |
 
 To list available SDR devices:
 
@@ -62,7 +62,7 @@ too low buries the signal in the noise floor (low CRC rate).**
 | USRP B210 | 60 | 40-50 | 60 | UHD auto-AGC not used |
 | bladeRF 2.0 | 60 | **25-35** | 50-60 | Clips at 60 OTA -- use 30 |
 | HackRF | 40 LNA / 20 VGA | TBD | TBD | Separate `--hackrf-lna` / `--hackrf-vga` |
-| Aaronia Spectran V6 | N/A | N/A | N/A | Uses reflevel, not gain (auto-scaled) |
+| Spectran V6 | 20 | 10-20 | N/A | `-g N` sets reflevel to -N dBm; auto-scaled f32→i16 |
 | SoapySDR | 60 | Device-dependent | Device-dependent | Depends on underlying hardware |
 
 **Symptoms of gain too high:** BLE count = 0, all bursts fail decode (ADC saturation
@@ -171,25 +171,29 @@ Airspy, or HackRF is the better fit for Pi deployments.
 GPU acceleration on macOS requires Metal (future work -- OpenCL is
 deprecated on macOS and Metal backend is not yet implemented).
 
-### Aaronia Spectran V6
+### Spectran V6
 
-Requires the Aaronia RTSA Suite Pro installed to `/opt/aaronia-rtsa-suite/`.
+Requires the RTSA Suite Pro installed to `/opt/aaronia-rtsa-suite/`.
 The SDK and runtime library (`libAaroniaRTSAAPI.so`) live in the
 `Aaronia-RTSA-Suite-PRO/` subdirectory. The build system embeds an rpath
 so the binary finds the library at runtime without `LD_LIBRARY_PATH`.
 
     cargo build --release --features "aaronia,zmq"
 
-The Aaronia backend uses `spectranv6/raw` mode with `outputformat=iq` to
-get wideband IQ samples. The 92.16 MHz clock gives 92 MHz of usable
-bandwidth at `-C 92`:
+The Spectran V6 backend uses `spectranv6/raw` mode with `outputformat=iq` to
+get wideband IQ samples. Not all clock rates are supported on all devices;
+the backend auto-detects which clocks work and errors with guidance if the
+requested `-C` value is incompatible:
 
     blue-dragon -l -i aaronia -C 92 --check-crc --stats
 
-The `-g` flag is ignored for Aaronia. Instead, the backend sets the reference
-level to -20 dBm and auto-scales the f32 samples to match the pipeline's
-int8/int16 range. The auto-scale measures RMS over 20 packets at startup
-and uses the 25th percentile to filter out WiFi burst outliers.
+Typical supported `-C` values: **92, 122, 184, 245** (device-dependent).
+Lower values like 46 or 61 may not be available on all models/firmware.
+
+The `-g` flag sets the reference level: `-g 20` = reflevel -20 dBm (most
+sensitive, default), `-g 10` = -10 dBm, `-g 0` = 0 dBm (most headroom).
+The backend auto-scales the f32 samples to i16 using RMS measured over
+20 packets at startup (25th percentile to filter WiFi burst outliers).
 
 ### Feature Flags
 
@@ -205,7 +209,7 @@ Features are opt-in. Build only what you need:
 | `gps` | GPS tagging via gpsd | (no C lib -- uses TCP JSON) |
 | `gpu` | OpenCL GPU acceleration | ocl-icd-opencl-dev |
 | `hci` | Active GATT probing + LE scanning via HCI | libdbus-1-dev (for BlueZ D-Bus) |
-| `aaronia` | Aaronia Spectran V6 support | Aaronia RTSA Suite Pro |
+| `aaronia` | Spectran V6 support | RTSA Suite Pro |
 
 ## BLE 5 PHY Support
 
@@ -329,7 +333,7 @@ Capture with GPS tagging:
 
     blue-dragon -l -c 2441 -C 40 --gpsd --zmq tcp://collector:5555
 
-Capture 92 MHz with Aaronia Spectran V6:
+Capture 92 MHz with Spectran V6:
 
     blue-dragon -l -i aaronia -C 92 --check-crc --stats
 
@@ -496,9 +500,9 @@ or special permissions beyond D-Bus policy are needed.
 ## Architecture
 
 ```
-SDR (USRP / HackRF / BladeRF / SoapySDR / Aaronia)
+SDR (USRP / HackRF / BladeRF / SoapySDR / Spectran V6)
     |
-    | int8 IQ samples
+    | int16 IQ samples (native precision)
     v
 Polyphase Channelizer (PFB, AVX2/SSE2/NEON SIMD)
     |
@@ -576,36 +580,23 @@ preamble checks fail fast on non-matching bursts.
 
 ## Sample Precision
 
-All SDR backends deliver samples as signed int8 (SC8) to the pipeline,
-regardless of native ADC resolution. The PFB channelizer promotes i8 to
-i16 internally (`(sample as i16) << 8`), but the lower 8 bits are always
-zero -- effectively 8-bit precision in a 16-bit container.
+The CPU pipeline receives int16 (i16) IQ samples from all backends,
+preserving native ADC resolution where possible. The GPU pipeline
+currently uses int8 (i8) for OpenCL kernel compatibility.
 
-| SDR | Native ADC | What enters pipeline | Precision lost |
-|-----|-----------|---------------------|----------------|
-| USRP B210 | 12-bit | i8 (UHD SC8 wire format) | 4 bits (24 dB) |
-| bladeRF (normal) | 12-bit (SC16_Q11) | i8 (right-shift >> 4) | 4 bits (24 dB) |
-| bladeRF (oversample) | SC8_Q7 | i8 (native) | 5 bits (30 dB) |
-| HackRF | 8-bit | i8 (native) | None |
-| SoapySDR (CS16) | Device-dependent | i8 (right-shift >> N) | Device-dependent |
-| Aaronia Spectran V6 | 32-bit float | i8 (scaled from f32) | ~24 bits |
+| SDR | Native ADC | CPU Pipeline (i16) | GPU Pipeline (i8) |
+|-----|-----------|-------------------|-------------------|
+| USRP B210 | 12-bit | SC16 wire format, full 12 bits | SC8, 8 bits |
+| bladeRF (normal) | 12-bit (SC16_Q11) | `<< 4` to fill i16 range | `>> 4` to i8 |
+| bladeRF (oversample) | SC8_Q7 | `<< 8` (no extra precision) | Native i8 |
+| HackRF | 8-bit | `<< 8` (no extra precision) | Native i8 |
+| SoapySDR (CS16) | Device-dependent | Dynamic left-shift | Right-shift to i8 |
+| Spectran V6 | 32-bit float | Scaled f32 → i16 | Scaled f32 → i8 |
 
-This means the USRP and bladeRF are only using 8 of their 12 available
-ADC bits. A future i16 pipeline would preserve full ADC resolution for
-all backends except HackRF (which is natively 8-bit). This primarily
-affects dynamic range -- the ability to decode weak signals in the
-presence of strong ones.
-
-**USRP note:** The USRP B210 ADC is 12-bit, but we currently request
-SC8 wire format from UHD. Switching to SC16 would preserve all 12 bits.
-USB3 bandwidth is not a concern -- SC16 at 61.44 Msps is only 246 MB/s
-vs USB3's ~400 MB/s sustained. The AD9361's analog filter passes 56 MHz
-cleanly; at `-C 56` and below, all channels are within the analog
-bandwidth. Above that, edge channels see filter roll-off.
-
-**Aaronia note:** The Aaronia delivers 32-bit float samples. The current
-i8 quantization loses significant precision. The backend has a
-`recv_into_i16` method ready for a future i16 pipeline upgrade.
+The i16 pipeline gives 12-bit SDRs (USRP, bladeRF) their full dynamic
+range -- about 24 dB more than the i8 path. HackRF is natively 8-bit,
+so both paths are equivalent. The Spectran V6 benefits from 16-bit
+quantization of its float samples instead of 8-bit.
 
 ## Troubleshooting
 
@@ -636,7 +627,7 @@ i8 quantization loses significant precision. The backend has a
    computed and shows `0/0`. This is not an error -- add `--check-crc`
    to enable validation.
 
-### Aaronia: library not found
+### Spectran V6: library not found
 
 If you see `libAaroniaRTSAAPI.so: cannot open shared object file`:
 the RTSA Suite is not installed to the expected path, or the rpath

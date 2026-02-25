@@ -20,7 +20,7 @@ mod ffi {
             batch_size: c_uint,
         ) -> c_int;
 
-        pub fn gpu_pfb_get_buffer() -> *mut i8;
+        pub fn gpu_pfb_get_buffer() -> *mut i16;
         pub fn gpu_pfb_buffer_len() -> c_uint;
         pub fn gpu_pfb_submit() -> *mut c_float;
         pub fn gpu_pfb_flush() -> *mut c_float;
@@ -106,12 +106,12 @@ impl GpuChannelizer {
         })
     }
 
-    /// Get a mutable slice to the raw int8 buffer for the current batch.
+    /// Get a mutable slice to the raw int16 buffer for the current batch.
     ///
-    /// Fill this with `batch_size * M` int8 IQ bytes (M/2 complex samples per step,
-    /// 2 bytes per complex sample, M bytes per step). The pre-roll region is already
-    /// filled from the previous batch.
-    pub fn raw_buffer(&self) -> &mut [i8] {
+    /// Fill this with `batch_size * M` int16 IQ samples (M/2 complex samples per step,
+    /// 2 int16 values per complex sample, M int16 values per step). The pre-roll region
+    /// is already filled from the previous batch.
+    pub fn raw_buffer(&self) -> &mut [i16] {
         unsafe {
             let ptr = ffi::gpu_pfb_get_buffer();
             slice::from_raw_parts_mut(ptr, self.buffer_len)

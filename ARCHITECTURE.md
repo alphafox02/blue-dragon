@@ -7,7 +7,7 @@ blue-dragon/
 ├── crates/
 │   ├── app/          bd-app       CLI entry point, pipeline orchestration
 │   ├── dsp/          bd-dsp       PFB channelizer, FFT, burst detection, FSK demod
-│   ├── sdr/          bd-sdr       SDR hardware abstraction (USRP, HackRF, BladeRF, SoapySDR, Aaronia)
+│   ├── sdr/          bd-sdr       SDR hardware abstraction (USRP, HackRF, BladeRF, SoapySDR, Spectran V6)
 │   ├── protocol/     bd-protocol  BLE and Classic BT packet decoding
 │   ├── output/       bd-output    PCAP writer, ZMQ streaming, GPS client, C2 control
 │   └── gpu/          bd-gpu       Optional OpenCL GPU acceleration
@@ -40,7 +40,7 @@ All SDR backends and optional features are compile-time gated:
 | `hackrf` | bd-sdr | libhackrf |
 | `bladerf` | bd-sdr | libbladeRF |
 | `soapysdr` | bd-sdr | libSoapySDR |
-| `aaronia` | bd-sdr | Aaronia RTSA Suite (libAaroniaRTSAAPI) |
+| `aaronia` | bd-sdr | RTSA Suite (libAaroniaRTSAAPI) |
 | `zmq` | bd-output | libzmq |
 | `gps` | bd-output | none (TCP JSON to gpsd) |
 | `gpu` | bd-gpu | OpenCL runtime |
@@ -56,7 +56,7 @@ All SDR backends and optional features are compile-time gated:
                                   v
 ┌──────────┐  bounded(32)  ┌──────────────┐  bounded(4) x N  ┌────────────────┐
 │ sdr-recv │──────────────>│   pfb-fft    │──────────────────>│  burst-0..N-1  │
-│          │  Vec<i8>      │  (or GPU)    │  BatchMsg         │  (8 workers)   │
+│          │  Vec<i16>     │  (or GPU)    │  BatchMsg         │  (8 workers)   │
 └──────────┘               └──────────────┘                   └───────┬────────┘
      ^                                                                │
      │ polls gain_pending                                   bounded(512) Burst
@@ -79,8 +79,8 @@ All SDR backends and optional features are compile-time gated:
 
 | Thread | Name | What it does |
 |--------|------|-------------|
-| 1 | `sdr-recv` | Drains SDR hardware via `recv_into()`, sends SC8 buffers to PFB. Polls `gain_pending` atomic for C2 gain changes and calls `sdr.set_gain()`. |
-| 2 | main | PFB channelizer + IFFT (CPU path) or GPU submit loop. Converts SC8 to i16, runs polyphase filter, broadcasts channel data to workers. |
+| 1 | `sdr-recv` | Drains SDR hardware via `recv_into_i16()`, sends i16 buffers to PFB. Accumulates multiple recv calls to ~4080 samples before sending (batching). Polls `gain_pending` atomic for C2 gain changes. |
+| 2 | main | PFB channelizer + IFFT (CPU path) or GPU submit loop. Feeds i16 samples directly to polyphase filter, broadcasts channel data to workers. |
 | 3-10 | `burst-0` .. `burst-7` | Each assigned a disjoint subset of BLE channels. Per-channel AGC + squelch detection. Polls `squelch_pending` atomic. Sends detected bursts to decode. |
 | 11 | `decode` | FSK demodulation, BLE/BT protocol decode, CRC validation, PCAP output, ZMQ publish. Updates heartbeat stats. |
 | 12 | `c2-control` | ZMQ DEALER socket to dashboard ROUTER. Sends JSON heartbeat every 5s. Receives commands. (Only with `--zmq`.) |
@@ -91,7 +91,7 @@ All SDR backends and optional features are compile-time gated:
 
 | Channel | Type | Capacity | Payload |
 |---------|------|----------|---------|
-| SDR -> PFB | crossbeam bounded | 32 | `Vec<i8>` (SC8 samples) |
+| SDR -> PFB | crossbeam bounded | 32 | `Vec<i16>` (native-precision samples) |
 | PFB -> workers | crossbeam bounded | 4 per worker | `BatchMsg` (channel samples) |
 | Workers -> decode | crossbeam bounded | 512 (shared) | `Burst` (IQ + metadata) |
 | C2 control -> dispatch | crossbeam bounded | 16 | `ControlCommand` enum |
@@ -108,12 +108,10 @@ Shared mutex: `Arc<Mutex<HeartbeatState>>` -- written by decode thread (pkt_rate
 ## Data Flow
 
 ```
-SDR (SC8: signed int8 IQ pairs, or f32 scaled to i8 for Aaronia)
+SDR (native precision: SC16, CS8, or f32 depending on backend)
   │
-  │ sdr-recv thread: recv_into(&mut [i8])
-  v
-Convert to i16 (left-shift by 8)
-  │
+  │ sdr-recv thread: recv_into_i16(&mut [i16])
+  │ Each backend converts to i16 at native precision
   v
 PFB Channelizer (Type 2, M channels, semi_len=4)
   │ Kaiser window prototype, fc=0.75/M, 60 dB stopband
@@ -178,59 +176,68 @@ Output
 ## SDR Backends
 
 All backends implement a `Handle` type with:
-- `recv_into(&mut [i8]) -> usize` -- receive SC8 samples
+- `recv_into_i16(&mut [i16]) -> usize` -- receive samples at native precision (CPU path)
+- `recv_into(&mut [i8]) -> usize` -- receive SC8 samples (GPU path)
 - `max_samps() -> usize` -- maximum batch size
 - `overflow_count() -> u64` -- underrun counter
 - `set_gain(gain)` -- runtime tunable via C2
 
-| Backend | Native Format | Conversion | Effective Bits | Max Sample Rate |
-|---------|--------------|------------|----------------|-----------------|
-| USRP | SC8 (UHD converts 12-bit internally) | None | 8 | 61.44 Msps (56 MHz analog BW) |
-| HackRF | CS8 (unsigned reinterpreted as signed) | None | 8 | 20 MHz |
-| bladeRF | SC16_Q11 (12-bit) / SC8_Q7 (oversample) | >>4 to i8 | 8 (12 native up to 56 MHz) | 61.44 Msps normal (56 MHz analog BW), 122.88 Msps oversample |
-| SoapySDR | CS8 preferred, CF32/CS16 fallback | Format-dependent | 8 | Device-dependent |
-| Aaronia | f32 (32-bit float IQ) | f32 * scale -> i8 | 8 (f32 native) | 92.16 MHz |
+| Backend | Native Format | CPU i16 Conversion | Effective Bits | Max Sample Rate |
+|---------|--------------|-------------------|----------------|-----------------|
+| USRP | SC16 (12-bit ADC, left-justified) | Direct from UHD | 12 | 61.44 Msps (56 MHz analog BW) |
+| HackRF | CS8 (unsigned reinterpreted as signed) | `<< 8` (no extra precision) | 8 | 20 MHz |
+| bladeRF (normal) | SC16_Q11 (12-bit) | `<< 4` to fill i16 range | 12 | 61.44 Msps (56 MHz analog BW) |
+| bladeRF (oversample) | SC8_Q7 | `<< 8` (no extra precision) | 8 | 122.88 Msps |
+| SoapySDR | CS8 preferred, CS16/CF32 fallback | Dynamic left-shift | Device-dependent | Device-dependent |
+| Spectran V6 | f32 (32-bit float IQ) | f32 * scale -> i16 | 16 | 92-245 MHz (clock-dependent) |
 
 The `SdrHandle` enum dispatches to the correct backend at runtime. HackRF
 has separate LNA/VGA gain controls; all others use a single gain value.
-The Aaronia backend ignores the `-g` gain flag and instead uses an internal
-reference level (-20 dBm) with auto-scaling.
+The Spectran V6 backend maps `-g N` to reference level -N dBm with
+auto-scaling from f32 to i16.
 
-### Aaronia Spectran V6
+### Spectran V6
 
-The Aaronia backend (`sdr/src/aaronia.rs`) uses the RTSA API in
+The Spectran V6 backend (`sdr/src/aaronia.rs`) uses the RTSA API in
 `spectranv6/raw` mode to receive wideband IQ samples as 32-bit float
 pairs. Key details:
 
-- **Clock:** 92,160,000 Hz (92.16 MHz). Requested as 92 MHz but the API
-  selects the nearest supported clock, which is 92.16 MHz. At `-C 92`,
-  this gives 92 channels at 1.0017 MHz each (0.17% wider than 1 MHz).
+- **Clock:** Device-dependent. At `-C 92`, the 92.16 MHz clock is used,
+  giving 92 channels at 1.0017 MHz each (0.17% wider than 1 MHz).
+  Not all clocks are supported on all devices; the backend probes the
+  device and errors with guidance if the requested `-C` is incompatible.
+  Typical supported clocks: 92, 122, 184, 245 MHz.
 - **Decimation:** 1:1 (full rate, no decimation).
-- **Reference level:** -20 dBm. This sets the ADC full-scale. Lower values
-  increase sensitivity but clip on strong signals (WiFi).
+- **Reference level:** Maps `-g N` to reflevel -N dBm. Default `-g 20`
+  gives -20 dBm (most sensitive). Lower `-g` values increase headroom
+  for strong WiFi signals at the cost of sensitivity.
 - **Auto-scale:** At startup, measures RMS over 20 packets. Uses the 25th
   percentile RMS to compute a scale factor that maps noise floor to ~2
-  LSBs in i8. This filters out WiFi burst outliers that would inflate
-  a single-packet RMS measurement. Target: ~36 dB headroom for BLE
-  signals before clipping.
+  LSBs in i8 (or ~512 in i16). This filters out WiFi burst outliers
+  that would inflate a single-packet RMS measurement.
 - **Packet format:** Each RTSA API packet contains `num` complex samples
   with `stride` floats between samples (stride >= 2). The backend reads
   `fp32[i*stride]` (I) and `fp32[i*stride+1]` (Q) per sample.
-- **recv_into_i16:** An alternate method exists for future i16 pipeline
-  support. Scales f32 by `scale * 256` to fill the i16 range.
+- **recv_into_i16:** CPU pipeline path. Scales f32 by `scale * 256` to
+  fill the i16 range, preserving ~16 bits of effective precision.
 - **Overflow detection:** Checks `PACKET_WARN_OVERFLOW` flag per packet.
 - **No sudo required:** The RTSA API handles USB communication internally.
 
-### Precision chain (current i8 pipeline)
+### Precision chain (CPU i16 pipeline)
 
 ```
 SDR ADC (8-32 bit native)
     |
-    | recv_into(&mut [i8]): all backends truncate/scale to signed 8-bit
+    | recv_into_i16(&mut [i16]): each backend delivers native precision
+    | USRP: SC16 wire format (12-bit, left-justified in i16)
+    | bladeRF normal: SC16_Q11 << 4 (12-bit, fills i16 range)
+    | bladeRF oversample: SC8 << 8 (8-bit, no extra precision)
+    | HackRF: CS8 << 8 (8-bit, no extra precision)
+    | Spectran V6: f32 * scale * 256 -> i16
     v
-crossbeam channel: Vec<i8> (bounded, 32 slots)
+crossbeam channel: Vec<i16> (bounded, 32 slots)
     |
-    | PFB thread: (sample as i16) << 8 -- sign-extend to i16
+    | PFB thread: feeds i16 directly (no promotion needed)
     v
 PFB channelizer: i16 fixed-point arithmetic
     |
@@ -239,12 +246,15 @@ PFB channelizer: i16 fixed-point arithmetic
 Burst catcher / demod / decode: all f32
 ```
 
-The i8-to-i16 promotion via left-shift preserves the sign but fills
-the lower 8 bits with zeros. All backends effectively deliver 8-bit
-precision regardless of native ADC resolution. A future i16 pipeline
-would change `Vec<i8>` to `Vec<i16>` and have each backend deliver
-native precision, improving dynamic range for USRP (+4 bits/24 dB),
-bladeRF (+4 bits/24 dB), and Aaronia (+8 bits/48 dB).
+The i16 pipeline preserves the full native ADC resolution for 12-bit
+SDRs (USRP, bladeRF), giving ~24 dB more dynamic range than the
+previous i8 path. The recv thread accumulates multiple recv calls
+to ~4080 samples before sending, compensating for smaller per-recv
+batch sizes with wider sample formats (e.g., USRP SC16 halves
+max_samps compared to SC8).
+
+The GPU path still uses `recv_into(&mut [i8])` and i8 buffers for
+OpenCL kernel compatibility.
 
 ## GPU Path
 

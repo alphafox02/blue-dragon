@@ -245,52 +245,155 @@ pub fn list_devices() -> Result<Vec<AaroniaInfo>, String> {
 // Receiver clock mapping
 // ---------------------------------------------------------------------------
 
-/// Map -C channel count to the best receiver clock and decimation.
-/// We want the sample rate to equal num_channels * 1e6.
-/// Available clocks: 46, 61, 77, 92, 122, 184, 245, 492 MHz.
-fn select_clock(sample_rate_hz: u32) -> (&'static str, &'static str, u32) {
-    // Receiver clock options in MHz, ascending
-    let clocks: &[(u32, &str)] = &[
-        (46_080_000, "46MHz"),
-        (61_440_000, "61MHz"),
-        (77_000_000, "77MHz"),
-        (92_160_000, "92MHz"),
-        (122_880_000, "122MHz"),
-        (184_320_000, "184MHz"),
-        (245_760_000, "245MHz"),
-    ];
+/// Receiver clock options in MHz, ascending.
+/// Not all devices support all clocks -- 46/61/77 MHz may not be available
+/// on older firmware or non-ECO models.
+const CLOCKS: &[(u32, &str)] = &[
+    (46_080_000, "46MHz"),
+    (61_440_000, "61MHz"),
+    (77_000_000, "77MHz"),
+    (92_160_000, "92MHz"),
+    (122_880_000, "122MHz"),
+    (184_320_000, "184MHz"),
+    (245_760_000, "245MHz"),
+];
+
+const DECIMATIONS: &[(u32, &str)] = &[
+    (1, "Full"),
+    (2, "1 / 2"),
+    (4, "1 / 4"),
+    (8, "1 / 8"),
+    (16, "1 / 16"),
+    (32, "1 / 32"),
+    (64, "1 / 64"),
+    (128, "1 / 128"),
+    (256, "1 / 256"),
+    (512, "1 / 512"),
+];
+
+/// Map -C channel count to a list of (clock, decimation, actual_rate) candidates.
+/// The first entry is the best match; subsequent entries are fallbacks using
+/// progressively higher clocks. This lets the caller try each until the device
+/// accepts one.
+fn select_clock_candidates(sample_rate_hz: u32) -> Vec<(&'static str, &'static str, u32)> {
+    let mut candidates = Vec::new();
 
     // Try exact match first (clock / decimation = target rate)
-    let decimations: &[(u32, &str)] = &[
-        (1, "Full"),
-        (2, "1 / 2"),
-        (4, "1 / 4"),
-        (8, "1 / 8"),
-        (16, "1 / 16"),
-        (32, "1 / 32"),
-        (64, "1 / 64"),
-        (128, "1 / 128"),
-        (256, "1 / 256"),
-        (512, "1 / 512"),
-    ];
-
-    for &(clock_hz, clock_name) in clocks {
-        for &(div, div_name) in decimations {
+    for &(clock_hz, clock_name) in CLOCKS {
+        for &(div, div_name) in DECIMATIONS {
             if clock_hz / div == sample_rate_hz {
-                return (clock_name, div_name, clock_hz / div);
+                candidates.push((clock_name, div_name, clock_hz / div));
             }
         }
     }
 
-    // No exact match -- pick smallest clock >= target rate
-    for &(clock_hz, clock_name) in clocks {
+    // Then add all clocks >= target rate with Full decimation as fallbacks
+    for &(clock_hz, clock_name) in CLOCKS {
         if clock_hz >= sample_rate_hz {
-            return (clock_name, "Full", clock_hz);
+            let entry = (clock_name, "Full", clock_hz);
+            if !candidates.contains(&entry) {
+                candidates.push(entry);
+            }
         }
     }
 
-    // Fallback to max
-    ("245MHz", "Full", 245_760_000)
+    if candidates.is_empty() {
+        candidates.push(("245MHz", "Full", 245_760_000));
+    }
+
+    candidates
+}
+
+/// Try to set receiverclock and decimation on the device, falling back to
+/// higher clocks if the preferred one is rejected.  Only accepts clocks
+/// where the actual rate is within 3% of the requested rate (otherwise the
+/// PFB channelizer bins won't align with BLE channels).
+///
+/// Returns the accepted (clock_name, decim_name, actual_rate) or an error
+/// with guidance on which -C values to use.
+unsafe fn set_clock_with_fallback(
+    d: &mut AarDevice,
+    root: &mut AarConfig,
+    sample_rate_hz: u32,
+) -> Result<(&'static str, &'static str, u32), String> {
+    let candidates = select_clock_candidates(sample_rate_hz);
+
+    // Only try candidates where actual rate is within 3% of requested.
+    // A larger mismatch causes PFB bin/BLE channel misalignment.
+    let compatible: Vec<_> = candidates
+        .iter()
+        .filter(|&&(_, _, rate)| {
+            let ratio = rate as f64 / sample_rate_hz as f64;
+            (0.97..=1.03).contains(&ratio)
+        })
+        .copied()
+        .collect();
+
+    let mut tried_clocks = Vec::new();
+    for (i, (clock_name, decim_name, actual_rate)) in compatible.iter().enumerate() {
+        let mut cfg = AarConfig { d: ptr::null_mut() };
+
+        let k = to_wchar("device/receiverclock");
+        let v = to_wchar(clock_name);
+        let res = AARTSAAPI_ConfigFind(d, root, &mut cfg, k.as_ptr());
+        if res != AAROK {
+            return Err(format!("ConfigFind(device/receiverclock) failed: 0x{:08x}", res));
+        }
+        let res = AARTSAAPI_ConfigSetString(d, &mut cfg, v.as_ptr());
+        if res != AAROK {
+            tried_clocks.push(*clock_name);
+            if i == 0 {
+                eprintln!(
+                    "Aaronia: clock {} not supported by this device, trying fallback...",
+                    clock_name
+                );
+            }
+            continue;
+        }
+
+        // Set decimation
+        let k = to_wchar("main/decimation");
+        let v = to_wchar(decim_name);
+        let res = AARTSAAPI_ConfigFind(d, root, &mut cfg, k.as_ptr());
+        if res == AAROK {
+            AARTSAAPI_ConfigSetString(d, &mut cfg, v.as_ptr());
+        }
+
+        if i > 0 {
+            eprintln!(
+                "Aaronia: using clock {} ({}) instead of {}.",
+                clock_name, decim_name, tried_clocks.join(", "),
+            );
+        }
+
+        return Ok((*clock_name, *decim_name, *actual_rate));
+    }
+
+    // No compatible clock accepted -- suggest valid -C values.
+    // Probe which clocks the device actually supports.
+    let mut supported = Vec::new();
+    for &(clock_hz, clock_name) in CLOCKS {
+        let mut cfg = AarConfig { d: ptr::null_mut() };
+        let k = to_wchar("device/receiverclock");
+        let v = to_wchar(clock_name);
+        if AARTSAAPI_ConfigFind(d, root, &mut cfg, k.as_ptr()) == AAROK
+            && AARTSAAPI_ConfigSetString(d, &mut cfg, v.as_ptr()) == AAROK
+        {
+            supported.push(clock_hz / 1_000_000);
+        }
+    }
+    let suggestions: Vec<String> = supported.iter().map(|m| format!("-C {}", m)).collect();
+    Err(format!(
+        "Aaronia: no compatible clock for -C {} (requested {} MHz sample rate). \
+         Supported values for this device: {}",
+        sample_rate_hz / 1_000_000,
+        sample_rate_hz / 1_000_000,
+        if suggestions.is_empty() {
+            "none detected".to_string()
+        } else {
+            suggestions.join(", ")
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +428,8 @@ impl AaroniaSource {
             ));
         };
 
-        let (_, _, actual_rate) = select_clock(sample_rate);
+        let candidates = select_clock_candidates(sample_rate);
+        let actual_rate = candidates.first().map(|c| c.2).unwrap_or(245_760_000);
 
         Ok(Self {
             serial,
@@ -345,9 +449,6 @@ impl AaroniaSource {
 impl SdrSource for AaroniaSource {
     fn start(&mut self, tx: Sender<SampleBuf>) -> Result<(), String> {
         self.running.store(true, Ordering::SeqCst);
-
-        let (clock_name, decim_name, actual_rate) = select_clock(self.sample_rate);
-        self.actual_sample_rate = actual_rate;
 
         unsafe {
             // Initialize library
@@ -415,12 +516,15 @@ impl SdrSource for AaroniaSource {
             let mut config = AarConfig { d: ptr::null_mut() };
             AARTSAAPI_ConfigRoot(&mut d, &mut root);
 
-            // String configs
+            // Set receiver clock with fallback
+            let (clock_name, decim_name, actual_rate) =
+                set_clock_with_fallback(&mut d, &mut root, self.sample_rate)?;
+            self.actual_sample_rate = actual_rate;
+
+            // Other string configs
             let str_configs: &[(&str, &str)] = &[
                 ("device/receiverchannel", "Rx1"),
                 ("device/outputformat", "iq"),
-                ("device/receiverclock", clock_name),
-                ("main/decimation", decim_name),
                 ("calibration/preamp", "Amp"),
                 ("calibration/rffilter", "Auto Extended"),
                 ("device/gaincontrol", "manual"),
@@ -439,12 +543,10 @@ impl SdrSource for AaroniaSource {
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, self.center_freq as f64);
 
-            // Reference level -- [-20, 10] dBm with preamp "Auto"
-            let reflevel = if (-20.0..=10.0).contains(&self.gain) {
-                self.gain
-            } else {
-                -20.0
-            };
+            // Reference level -- [-20, 10] dBm with preamp "Auto".
+            // Map -g N to reflevel = -N dBm (higher gain = lower reflevel = more sensitive).
+            // Default -g 60 clamps to -20 dBm (most sensitive, same as before).
+            let reflevel = (-self.gain).clamp(-20.0, 10.0);
             let key = to_wchar("main/reflevel");
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, reflevel);
@@ -612,9 +714,8 @@ unsafe impl Send for AaroniaHandle {}
 
 impl AaroniaHandle {
     /// Open a Spectran V6 in raw mode and start streaming.
-    /// `gain` is interpreted as reflevel in dBm (range [-20, 10]).
-    /// If out of range (e.g. the default 60 from USRP), defaults to -20 dBm
-    /// (maximum sensitivity for BLE).
+    /// `gain` maps to reflevel as -gain dBm, clamped to [-20, 10].
+    /// -g 20 = reflevel -20 dBm (most sensitive, default), -g 0 = 0 dBm.
     pub fn open(
         iface: &str,
         sample_rate: u32,
@@ -632,8 +733,6 @@ impl AaroniaHandle {
                 iface
             ));
         };
-
-        let (clock_name, decim_name, actual_rate) = select_clock(sample_rate);
 
         unsafe {
             let install_path = to_wchar(AARONIA_INSTALL_DIR);
@@ -697,11 +796,13 @@ impl AaroniaHandle {
             let mut config = AarConfig { d: ptr::null_mut() };
             AARTSAAPI_ConfigRoot(&mut d, &mut root);
 
+            // Set receiver clock with fallback
+            let (clock_name, decim_name, actual_rate) =
+                set_clock_with_fallback(&mut d, &mut root, sample_rate)?;
+
             let configs: &[(&str, &str)] = &[
                 ("device/receiverchannel", "Rx1"),
                 ("device/outputformat", "iq"),
-                ("device/receiverclock", clock_name),
-                ("main/decimation", decim_name),
                 ("calibration/preamp", "Amp"),
                 ("calibration/rffilter", "Auto Extended"),
                 ("device/gaincontrol", "manual"),
@@ -724,12 +825,8 @@ impl AaroniaHandle {
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, center_freq as f64);
 
-            // With preamp "Auto", reflevel range is [-20, 10] dBm
-            let reflevel = if (-20.0..=10.0).contains(&gain) {
-                gain
-            } else {
-                -20.0
-            };
+            // Map -g N to reflevel = -N dBm (higher gain = lower reflevel = more sensitive).
+            let reflevel = (-gain).clamp(-20.0, 10.0);
             let key = to_wchar("main/reflevel");
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, reflevel);
@@ -995,7 +1092,8 @@ impl AaroniaHandle {
             AARTSAAPI_ConfigRoot(d_ptr, &mut root);
             let key = to_wchar("main/reflevel");
             AARTSAAPI_ConfigFind(d_ptr, &mut root, &mut config, key.as_ptr());
-            AARTSAAPI_ConfigSetFloat(d_ptr, &mut config, gain);
+            let reflevel = (-gain).clamp(-20.0, 10.0);
+            AARTSAAPI_ConfigSetFloat(d_ptr, &mut config, reflevel);
         }
     }
 

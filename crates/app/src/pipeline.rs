@@ -1053,18 +1053,18 @@ enum SdrHandle {
 unsafe impl Send for SdrHandle {}
 
 impl SdrHandle {
-    fn recv_into(&mut self, buf: &mut [i8]) -> usize {
+    fn recv_into_i16(&mut self, buf: &mut [i16]) -> usize {
         match self {
             #[cfg(feature = "usrp")]
-            SdrHandle::Usrp(h) => h.recv_into(buf),
+            SdrHandle::Usrp(h) => h.recv_into_i16(buf),
             #[cfg(feature = "hackrf")]
-            SdrHandle::HackRf(h) => h.recv_into(buf),
+            SdrHandle::HackRf(h) => h.recv_into_i16(buf),
             #[cfg(feature = "bladerf")]
-            SdrHandle::BladeRf(h) => h.recv_into(buf),
+            SdrHandle::BladeRf(h) => h.recv_into_i16(buf),
             #[cfg(feature = "soapysdr")]
-            SdrHandle::Soapy(h) => h.recv_into(buf),
+            SdrHandle::Soapy(h) => h.recv_into_i16(buf),
             #[cfg(feature = "aaronia")]
-            SdrHandle::Aaronia(h) => h.recv_into(buf),
+            SdrHandle::Aaronia(h) => h.recv_into_i16(buf),
         }
     }
 
@@ -1587,18 +1587,23 @@ pub fn run_live(
     );
 
     // SDR recv thread: continuously drains hardware, sends i16 buffers to PFB thread.
-    // SDR recv thread: continuously drains hardware, sends SC8 buffers to PFB thread
-    // 32 slots provides ~2.7ms buffering at 60 MHz, absorbing scheduling jitter
-    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i8>>(32);
+    // Accumulates multiple recv calls to ~4080 complex samples before sending,
+    // compensating for smaller max_samps with SC16 wire format.
+    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(32);
     let sdr_overflow = overflow_count.clone();
     let sdr_running = running.clone();
-    let sdr_buf_size = max_samps * 2;
+    let sdr_buf_size = max_samps * 2; // i16 elements per recv
 
     let sdr_gain_pending = gain_pending.clone();
     let sdr_thread = std::thread::Builder::new()
         .name("sdr-recv".to_string())
         .spawn(move || {
-            let mut buf = vec![0i8; sdr_buf_size];
+            let target_samples = max_samps.max(4080);
+            let target_elems = target_samples * 2;
+            let mut recv_buf = vec![0i16; sdr_buf_size];
+            let mut send_buf = vec![0i16; target_elems + sdr_buf_size];
+            let mut send_pos: usize = 0;
+
             while sdr_running.load(Ordering::Relaxed) {
                 // Check for runtime gain change from C2
                 let pending_gain = sdr_gain_pending.swap(i32::MIN, Ordering::Relaxed);
@@ -1607,16 +1612,20 @@ pub fn run_live(
                     sdr.set_gain(gain_db, None, None);
                 }
 
-                let num_rx = sdr.recv_into(&mut buf);
+                let num_rx = sdr.recv_into_i16(&mut recv_buf);
                 if num_rx == 0 {
                     continue;
                 }
                 sdr_overflow.store(sdr.overflow_count(), Ordering::Relaxed);
                 let n = num_rx * 2;
-                let mut send_buf = vec![0i8; n];
-                send_buf.copy_from_slice(&buf[..n]);
-                if sdr_tx.send(send_buf).is_err() {
-                    break;
+                send_buf[send_pos..send_pos + n].copy_from_slice(&recv_buf[..n]);
+                send_pos += n;
+
+                if send_pos >= target_elems {
+                    if sdr_tx.send(send_buf[..send_pos].to_vec()).is_err() {
+                        break;
+                    }
+                    send_pos = 0;
                 }
             }
         })
@@ -1625,7 +1634,6 @@ pub fn run_live(
     // PFB+FFT processing thread (main thread)
     let mut channelizer = PfbChannelizer::new(num_channels, semi_len, &prototype);
     let mut fft = BatchFft::new(num_channels);
-    let mut i16_buf = vec![0i16; max_samps * 2];
     let mut fft_buf = vec![Complex32::new(0.0, 0.0); num_channels];
     let mut float_tmp = vec![0.0f32; num_channels * 2];
 
@@ -1634,12 +1642,8 @@ pub fn run_live(
     let mut batch = Vec::with_capacity(batch_floats);
     let mut batch_steps: usize = 0;
 
-    for sc8_buf in sdr_rx.iter() {
-        let n = sc8_buf.len();
-        for i in 0..n {
-            i16_buf[i] = (sc8_buf[i] as i16) << 8;
-        }
-        drop(sc8_buf); // free SC8 buffer immediately
+    for i16_buf in sdr_rx.iter() {
+        let n = i16_buf.len();
 
         let step = num_channels;
         let num_blocks = n / step;
@@ -1776,8 +1780,9 @@ fn run_live_gpu_loop(
         gps_client,
     );
 
-    // SDR recv thread: continuously drains hardware, prevents overflow during GPU submit
-    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i8>>(32);
+    // SDR recv thread: continuously drains hardware, prevents overflow during GPU submit.
+    // Accumulates multiple recv calls to ~4080 complex samples before sending.
+    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(32);
     let sdr_overflow = overflow_count.clone();
     let sdr_running = running.clone();
     let sdr_buf_size = max_samps * 2;
@@ -1787,7 +1792,12 @@ fn run_live_gpu_loop(
         .name("sdr-recv-gpu".to_string())
         .spawn(move || {
             let mut sdr = sdr;
-            let mut buf = vec![0i8; sdr_buf_size];
+            let target_samples = max_samps.max(4080);
+            let target_elems = target_samples * 2;
+            let mut recv_buf = vec![0i16; sdr_buf_size];
+            let mut send_buf = vec![0i16; target_elems + sdr_buf_size];
+            let mut send_pos: usize = 0;
+
             while sdr_running.load(Ordering::Relaxed) {
                 // Check for runtime gain change from C2
                 let pending_gain = sdr_gain_pending.swap(i32::MIN, Ordering::Relaxed);
@@ -1796,16 +1806,20 @@ fn run_live_gpu_loop(
                     sdr.set_gain(gain_db, None, None);
                 }
 
-                let num_rx = sdr.recv_into(&mut buf);
+                let num_rx = sdr.recv_into_i16(&mut recv_buf);
                 if num_rx == 0 {
                     continue;
                 }
                 sdr_overflow.store(sdr.overflow_count(), Ordering::Relaxed);
                 let n = num_rx * 2;
-                let mut send_buf = vec![0i8; n];
-                send_buf.copy_from_slice(&buf[..n]);
-                if sdr_tx.send(send_buf).is_err() {
-                    break;
+                send_buf[send_pos..send_pos + n].copy_from_slice(&recv_buf[..n]);
+                send_pos += n;
+
+                if send_pos >= target_elems {
+                    if sdr_tx.send(send_buf[..send_pos].to_vec()).is_err() {
+                        break;
+                    }
+                    send_pos = 0;
                 }
             }
         })
@@ -1814,16 +1828,13 @@ fn run_live_gpu_loop(
     let mut pos: usize = 0;
     let mut raw_buf = gpu.raw_buffer();
 
-    for sc8_buf in sdr_rx.iter() {
-        // Copy SC8 data into GPU raw buffer, handling partial fills
+    for i16_buf in sdr_rx.iter() {
+        // Copy i16 data into GPU raw buffer, handling partial fills
         let mut src_pos = 0usize;
-        let n = sc8_buf.len();
+        let n = i16_buf.len();
         while src_pos < n {
             let copy_len = (n - src_pos).min(buffer_len - pos);
-            // Safety: i8 and i8 have same layout
-            raw_buf[pos..pos + copy_len].copy_from_slice(
-                unsafe { std::slice::from_raw_parts(sc8_buf[src_pos..].as_ptr() as *const i8, copy_len) },
-            );
+            raw_buf[pos..pos + copy_len].copy_from_slice(&i16_buf[src_pos..src_pos + copy_len]);
             pos += copy_len;
             src_pos += copy_len;
 

@@ -386,6 +386,70 @@ impl SoapyHandle {
         }
     }
 
+    /// Receive samples into an i16 buffer with full native precision.
+    /// CS16 mode: left-shift to fill i16 range. CS8 mode: sign-extend via << 8.
+    /// Returns: number of complex samples received, or 0 on timeout/error.
+    pub fn recv_into_i16(&mut self, buf: &mut [i16]) -> usize {
+        let max_samps = (buf.len() / 2).min(self.mtu);
+
+        if self.use_cs8 {
+            // CS8: receive i8, sign-extend to i16
+            let mut cs8_buf = vec![0i8; max_samps * 2];
+            let ret = unsafe {
+                soapy_shim_read(
+                    self.dev,
+                    self.stream,
+                    cs8_buf.as_mut_ptr() as *mut c_void,
+                    max_samps,
+                )
+            };
+
+            if ret == SOAPY_SDR_OVERFLOW {
+                self.overflow_count += 1;
+                return 0;
+            }
+            if ret < 0 {
+                return 0;
+            }
+
+            let n = ret as usize;
+            for i in 0..n * 2 {
+                buf[i] = (cs8_buf[i] as i16) << 8;
+            }
+            n
+        } else {
+            // CS16: receive native, left-shift to fill i16 range
+            let ret = unsafe {
+                soapy_shim_read(
+                    self.dev,
+                    self.stream,
+                    self.cs16_buf.as_mut_ptr() as *mut c_void,
+                    max_samps,
+                )
+            };
+
+            if ret == SOAPY_SDR_OVERFLOW {
+                self.overflow_count += 1;
+                return 0;
+            }
+            if ret < 0 {
+                return 0;
+            }
+
+            let n = ret as usize;
+            // Shift left to fill i16 range (inverse of the >> shift used for i8)
+            // cs16_shift was computed as log2(fullScale) - 7 for i8 output.
+            // For i16 output, we shift left by (15 - log2(fullScale)).
+            // e.g. SC16_Q11 (fullScale=2048, log2=11): shift left 4
+            // e.g. USRP int16 (fullScale=32768, log2=15): shift left 0 (already full range)
+            let left_shift = 15u32.saturating_sub(self.cs16_shift + 7);
+            for i in 0..n * 2 {
+                buf[i] = self.cs16_buf[i] << left_shift;
+            }
+            n
+        }
+    }
+
     pub fn set_gain(&self, gain: f64) {
         unsafe {
             soapy_shim_set_gain(self.dev, gain);
