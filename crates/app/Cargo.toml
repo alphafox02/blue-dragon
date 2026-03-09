@@ -3,6 +3,19 @@ name = "blue-dragon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "BLE 5 sniffer with wideband SDR capture"
+authors = ["CEMAXECUTER LLC"]
+homepage = "https://github.com/alphafox02/blue-dragon"
+repository = "https://github.com/alphafox02/blue-dragon"
+
+[package.metadata.deb]
+maintainer = "alphafox02 <awdmesh@gmail.com>"
+section = "comm"
+priority = "optional"
+assets = [
+    ["target/release/blue-dragon", "usr/bin/", "755"],
+]
+depends = "$auto"
 
 [[bin]]
 name = "blue-dragon"
