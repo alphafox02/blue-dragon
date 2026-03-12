@@ -20,6 +20,9 @@ pub mod aaronia;
 #[cfg(feature = "rfnm")]
 pub mod rfnm;
 
+#[cfg(feature = "bladerf-ble")]
+pub mod bladerf_ble;
+
 use crossbeam::channel::Sender;
 
 /// Sample buffer: a block of interleaved int16 IQ samples

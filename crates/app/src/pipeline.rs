@@ -1028,6 +1028,8 @@ fn detect_sdr_type(iface: &str) -> &str {
         "usrp"
     } else if iface.starts_with("hackrf") {
         "hackrf"
+    } else if iface.starts_with("bladerf-ble") {
+        "bladerf-ble"
     } else if iface.starts_with("bladerf") {
         "bladerf"
     } else if iface.starts_with("soapy") {
@@ -1205,6 +1207,147 @@ fn open_sdr_handle(
             sdr_type, iface,
         )),
     }
+}
+
+/// Run live FPGA packet capture pipeline (bladeRF with BLE FPGA image).
+///
+/// Unlike `run_live`, this bypasses all DSP (PFB, FFT, FM demod, bit slicer)
+/// since the FPGA performs channelization, demodulation, and framing.
+/// We simply read decoded BLE packets from USB and write them to output.
+#[cfg(feature = "bladerf-ble")]
+#[allow(clippy::too_many_arguments)]
+pub fn run_live_fpga(
+    iface: &str,
+    center_freq_mhz: u32,
+    sample_rate: u32,
+    gain: f64,
+    pcap_path: Option<&Path>,
+    check_crc: bool,
+    print_stats: bool,
+    zmq_endpoint: Option<&str>,
+    zmq_curve_keyfile: Option<&str>,
+    sensor_id: Option<&str>,
+    gpsd_enabled: bool,
+    running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let center_freq_hz = center_freq_mhz as u64 * 1_000_000;
+
+    eprintln!(
+        "bladeRF-BLE FPGA mode: {} MHz center, {} MS/s, gain {} dB",
+        center_freq_mhz, sample_rate / 1_000_000, gain,
+    );
+
+    let mut handle = bd_sdr::bladerf_ble::BladerfBleHandle::open(
+        iface,
+        sample_rate,
+        center_freq_hz,
+        gain as i32,
+    )?;
+
+    // PCAP writer
+    let mut pcap_writer: Option<PcapWriter<BufWriter<File>>> = if let Some(path) = pcap_path {
+        let file = File::create(path)
+            .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
+        let writer = BufWriter::new(file);
+        Some(PcapWriter::new(writer)
+            .map_err(|e| format!("failed to write PCAP header: {}", e))?)
+    } else {
+        None
+    };
+
+    // ZMQ publisher
+    #[cfg(feature = "zmq")]
+    let zmq_pub: Option<Arc<Mutex<bd_output::zmq_pub::ZmqPublisher>>> = if let Some(ep) = zmq_endpoint {
+        let pub_socket = bd_output::zmq_pub::ZmqPublisher::new(ep, zmq_curve_keyfile, sensor_id)
+            .map_err(|e| format!("ZMQ: {}", e))?;
+        Some(Arc::new(Mutex::new(pub_socket)))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "zmq"))]
+    let _ = (zmq_endpoint, zmq_curve_keyfile, sensor_id);
+
+    // GPS client
+    #[cfg(feature = "gps")]
+    let mut gps_client: Option<bd_output::gps::GpsClient> = if gpsd_enabled {
+        bd_output::gps::GpsClient::new("localhost", 2947).ok()
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gps"))]
+    let _ = gpsd_enabled;
+
+    let start_time = Instant::now();
+    let mut total_pkts: u64 = 0;
+    let mut crc_ok_count: u64 = 0;
+    let mut last_stats = Instant::now();
+
+    eprintln!("streaming... press Ctrl-C to stop");
+
+    while running.load(Ordering::Relaxed) {
+        let packets = handle.recv_packets();
+
+        for pkt in &packets {
+            if check_crc && !pkt.crc_valid {
+                continue;
+            }
+
+            total_pkts += 1;
+            if pkt.crc_valid {
+                crc_ok_count += 1;
+            }
+
+            // GPS fix
+            #[cfg(feature = "gps")]
+            let gps_fix = gps_client.as_mut().and_then(|c| c.get_fix());
+            #[cfg(not(feature = "gps"))]
+            let gps_fix: Option<bd_output::pcap::GpsFix> = None;
+
+            // PCAP output
+            if let Some(ref mut writer) = pcap_writer {
+                let _ = writer.write_ble(pkt, gps_fix.as_ref());
+            }
+
+            // ZMQ output
+            #[cfg(feature = "zmq")]
+            if let Some(ref pub_socket) = zmq_pub {
+                if let Ok(p) = pub_socket.lock() {
+                    p.send_ble(pkt, gps_fix.as_ref());
+                }
+            }
+        }
+
+        // Stats output
+        if print_stats && last_stats.elapsed().as_secs() >= 10 {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let crc_pct = if total_pkts > 0 {
+                100.0 * crc_ok_count as f64 / total_pkts as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[{:.0}s] {} BLE packets, CRC {:.1}%",
+                elapsed, total_pkts, crc_pct,
+            );
+            last_stats = Instant::now();
+        }
+    }
+
+    // Final stats
+    let elapsed = start_time.elapsed().as_secs_f64();
+    if print_stats && elapsed > 0.0 {
+        let crc_pct = if total_pkts > 0 {
+            100.0 * crc_ok_count as f64 / total_pkts as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "final: {} BLE packets in {:.1}s, CRC {:.1}%",
+            total_pkts, elapsed, crc_pct,
+        );
+    }
+
+    Ok(())
 }
 
 /// Run live SDR capture pipeline.

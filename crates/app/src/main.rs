@@ -207,6 +207,17 @@ fn print_extcap_interfaces() {
             }
         }
     }
+    #[cfg(feature = "bladerf-ble")]
+    {
+        if let Ok(devices) = bd_sdr::bladerf::list_devices() {
+            for dev in &devices {
+                println!(
+                    "interface {{value=bladerf-ble{}}}{{display=Blue Dragon bladeRF-BLE {}}}",
+                    dev.instance, dev.serial
+                );
+            }
+        }
+    }
 }
 
 fn print_extcap_dlts() {
@@ -371,6 +382,18 @@ fn main() {
                 Err(e) => eprintln!("error listing RFNM devices: {}", e),
             }
         }
+        #[cfg(feature = "bladerf-ble")]
+        {
+            match bd_sdr::bladerf::list_devices() {
+                Ok(devices) => {
+                    for dev in &devices {
+                        eprintln!("  bladerf-ble{} (serial={}, FPGA mode)", dev.instance, dev.serial);
+                        found += 1;
+                    }
+                }
+                Err(e) => eprintln!("error listing bladeRF-BLE devices: {}", e),
+            }
+        }
         if found == 0 {
             eprintln!("  (no SDR devices found)");
         }
@@ -442,6 +465,30 @@ fn main() {
                 None
             }
         });
+
+        // Route bladerf-ble interfaces to the FPGA packet pipeline
+        #[cfg(feature = "bladerf-ble")]
+        if iface.starts_with("bladerf-ble") {
+            let sample_rate = channels as u32 * 1_000_000;
+            if let Err(e) = pipeline::run_live_fpga(
+                iface,
+                center_freq,
+                sample_rate,
+                cli.gain,
+                cli.write.as_deref(),
+                cli.check_crc,
+                cli.stats,
+                cli.zmq.as_deref(),
+                cli.zmq_curve_key.as_deref(),
+                sensor_id.as_deref(),
+                cli.gpsd,
+                running,
+            ) {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
 
         if let Err(e) = pipeline::run_live(
             iface,
