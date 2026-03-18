@@ -408,7 +408,7 @@ impl BladerfBleHandle {
                 data: raw,
             };
 
-            if self.pkt_count < 20 {
+            if self.pkt_count < 100 {
                 eprintln!("  [accept] ch={} len={} phy={} crc_ok={} freq={} MHz bin={} crc_comp={:06x} crc_recv={:06x}",
                     channel, length, phy_byte, crc_ok, freq, bin_idx, crc_computed, crc_received);
             }
