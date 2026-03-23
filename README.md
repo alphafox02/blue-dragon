@@ -31,6 +31,7 @@ dashboard for real-time monitoring.
 | GPU OpenCL | Tested | NVIDIA RTX 3060, Intel UHD iGPU |
 | HackRF backend | Untested | Compiles, needs hardware validation |
 | bladeRF backend | Tested | 88.7% CRC OTA at -g 30 |
+| bladeRF-BLE (FPGA) | In progress | FPGA channelizer, decoded PDUs over USB |
 | SoapySDR backend | Tested | |
 | Spectran V6 | Tested | 92 MHz BW, ~38% CRC OTA (tuning ongoing) |
 | RFNM (Lime) | Tested | Full BLE band (122.88 Msps), 71-78% CRC OTA |
@@ -45,6 +46,7 @@ dashboard for real-time monitoring.
 | USRP (B200/B210) | `-i usrp-MODEL-SERIAL` | 4-56 MHz | 12-bit | AD9361 (61.44 Msps, 56 MHz analog BW) |
 | HackRF One | `-i hackrf-SERIAL` | 4-20 MHz | 8-bit | 20 MHz max sample rate |
 | bladeRF 2.0 | `-i bladerf0` | 4-56 MHz (normal), up to 122 MHz (oversample) | 12-bit (normal) / 8-bit (oversample) | AD9361 (oversample overclocks beyond AD spec) |
+| bladeRF 2.0 xA9 (FPGA) | `-i bladerf-ble` | 80 MHz (all 40 BLE ch) | 12-bit | Requires [bladerf-ble](https://github.com/alphafox02/bladerf-ble) FPGA bitstream |
 | SoapySDR | `-i soapy-N` | Varies | Varies | Generic SDR support |
 | Spectran V6 | `-i aaronia` | 92-245 MHz | f32 | Use `-C 92`, `-C 122`, or `-C 245` (device-dependent) |
 | RFNM (Lime) | `-i rfnm` or `-i rfnm-SERIAL` | 122 MHz | 12-bit | 122.88 Msps base clock, all 40 BLE channels |
@@ -214,6 +216,25 @@ The 122.88 MHz base clock doesn't divide evenly into 1 MHz channels
 resamples to correct the timing drift. This is transparent and does not
 affect other SDR backends.
 
+### bladeRF-BLE (FPGA Channelizer)
+
+The bladeRF 2.0 micro xA9 has enough FPGA resources to run the entire
+PFB channelizer, FM demodulator, and BLE packet framer on-chip. Only
+decoded BLE PDUs are sent over USB, eliminating the IQ bandwidth
+bottleneck and enabling full 80 MHz BLE coverage from a Raspberry Pi
+or any host without GPU/AVX2.
+
+This requires the [bladerf-ble](https://github.com/alphafox02/bladerf-ble)
+FPGA bitstream loaded onto the bladeRF, plus the host backend:
+
+    cargo build --release --features "bladerf-ble,zmq"
+
+    bladeRF-cli -l ble.rbf
+    blue-dragon -l -i bladerf-ble -C 80 -c 2441 --check-crc --stats
+
+See the [bladerf-ble README](https://github.com/alphafox02/bladerf-ble)
+for FPGA build instructions.
+
 ### Feature Flags
 
 Features are opt-in. Build only what you need:
@@ -223,6 +244,7 @@ Features are opt-in. Build only what you need:
 | `usrp` | USRP B200/B210 support (default) | libuhd-dev |
 | `hackrf` | HackRF One support | libhackrf-dev |
 | `bladerf` | bladeRF 2.0 support | libbladerf-dev |
+| `bladerf-ble` | bladeRF 2.0 xA9 FPGA channelizer | libbladerf-dev + [bladerf-ble](https://github.com/alphafox02/bladerf-ble) bitstream |
 | `soapysdr` | SoapySDR generic support | libsoapysdr-dev |
 | `zmq` | ZMQ packet streaming + C2 | libzmq3-dev |
 | `gps` | GPS tagging via gpsd | (no C lib -- uses TCP JSON) |
@@ -524,7 +546,7 @@ or special permissions beyond D-Bus policy are needed.
 ## Architecture
 
 ```
-SDR (USRP / HackRF / BladeRF / SoapySDR / Spectran V6)
+SDR (USRP / HackRF / BladeRF / SoapySDR / Spectran V6 / RFNM)
     |
     | int16 IQ samples (native precision)
     v

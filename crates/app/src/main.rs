@@ -467,9 +467,10 @@ fn main() {
         });
 
         // Route bladerf-ble interfaces to the FPGA packet pipeline
+        // FPGA has 64-point PFB hardwired for 80 Msps (AD9361 oversample/8-bit mode)
         #[cfg(feature = "bladerf-ble")]
         if iface.starts_with("bladerf-ble") {
-            let sample_rate = channels as u32 * 1_000_000;
+            let sample_rate: u32 = 80_000_000;
             if let Err(e) = pipeline::run_live_fpga(
                 iface,
                 center_freq,

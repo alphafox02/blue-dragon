@@ -312,20 +312,12 @@ impl BladerfBleHandle {
                     let pfb_cnt = u32::from_le_bytes([data[pay+12], data[pay+13], data[pay+14], data[pay+15]]);
                     let burst_cnt = u32::from_le_bytes([data[pay+8], data[pay+9], data[pay+10], data[pay+11]]);
                     let fpga_pkt_cnt = u32::from_le_bytes([data[pay+4], data[pay+5], data[pay+6], data[pay+7]]);
-                    // Diagnostics: ADC non-zero counts and pipeline trace flags
+                    // Diagnostics: ADC non-zero count and AA match count
                     let adc_nz = u16::from_le_bytes([data[pay+2], data[pay+3]]);
-                    let low16 = u16::from_le_bytes([data[pay+0], data[pay+1]]);
-                    let filt_trace = low16 >> 7; // upper 9 bits: pipeline trace from filt_max[15:7]
-                    let pfb_out_nz = low16 & 0x7F;  // lower 7 bits: post-FFT non-zero count (upper 7 of 16)
-                    // Pipeline trace bits: [8]=filt_active, [7]=s1_fired,
-                    // [6]=dly_nonzero, [5]=mac_nonzero, [4:0]=mac_nz_count>>7
-                    let filt_active = (filt_trace >> 8) & 1;
-                    let s1_fired = (filt_trace >> 7) & 1;
-                    let dly_nz = (filt_trace >> 6) & 1;
-                    let mac_nz = (filt_trace >> 5) & 1;
+                    let aa_cnt = u16::from_le_bytes([data[pay+0], data[pay+1]]);
                     let seq = data[pos + 12]; // flags field = seq#
-                    eprintln!("  [FPGA heartbeat #{}] pfb_valid={}, burst_start={}, pkt_eop={}, adc_nz={}, filt[act={} s1={} dly={} mac={}], pfb_out_nz={}",
-                        seq, pfb_cnt, burst_cnt, fpga_pkt_cnt, adc_nz, filt_active, s1_fired, dly_nz, mac_nz, pfb_out_nz);
+                    eprintln!("  [FPGA heartbeat #{}] pfb_valid={}, burst_start={}, pkt_eop={}, adc_nz={}, aa_found={}",
+                        seq, pfb_cnt, burst_cnt, fpga_pkt_cnt, adc_nz, aa_cnt);
                     pos += total;
                 } else {
                     self.residual.extend_from_slice(&data[pos..]);
