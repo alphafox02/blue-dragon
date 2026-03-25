@@ -116,7 +116,7 @@ fn demod_burst(fm_samples: &[i16], ble_channel: u8) -> Vec<DemodPacket> {
             if errors < global_best_errors {
                 global_best_errors = errors;
             }
-            if errors <= 2 {
+            if errors <= 4 {
                 let pdu_start = i + 1;
                 if let Some(pkt) = decode_pdu(&bits[pdu_start..], ble_channel, errors as u8) {
                     results.push(pkt);
@@ -545,14 +545,29 @@ impl BladerfBleHandle {
                 break;
             }
 
-            // Extract FM samples from payload (16-bit LE signed, serialized as byte pairs)
+            // Extract IQ pairs from payload (4 bytes per sample: I_lo, I_hi, Q_lo, Q_hi)
             let payload_start = pos + WORD_SIZE;
-            let num_samples = length / 2;
-            let mut fm_samples = Vec::with_capacity(num_samples);
+            let num_samples = length / 4;
+            let mut iq_i = Vec::with_capacity(num_samples);
+            let mut iq_q = Vec::with_capacity(num_samples);
             for i in 0..num_samples {
-                let lo = data[payload_start + i * 2] as u16;
-                let hi = data[payload_start + i * 2 + 1] as u16;
-                fm_samples.push((lo | (hi << 8)) as i16);
+                let base = payload_start + i * 4;
+                if base + 3 >= data.len() { break; }
+                let i_val = (data[base] as u16 | ((data[base+1] as u16) << 8)) as i16;
+                let q_val = (data[base+2] as u16 | ((data[base+3] as u16) << 8)) as i16;
+                iq_i.push(i_val);
+                iq_q.push(q_val);
+            }
+
+            // Compute FM demod in software: arg(x[n] * conj(x[n-1]))
+            let mut fm_samples = Vec::with_capacity(num_samples);
+            if num_samples > 1 {
+                for n in 1..iq_i.len() {
+                    let re = (iq_i[n] as f64) * (iq_i[n-1] as f64) + (iq_q[n] as f64) * (iq_q[n-1] as f64);
+                    let im = (iq_q[n] as f64) * (iq_i[n-1] as f64) - (iq_i[n] as f64) * (iq_q[n-1] as f64);
+                    let phase = im.atan2(re);
+                    fm_samples.push((phase * 16384.0 / std::f64::consts::PI) as i16);
+                }
             }
 
             // Software demodulation: CFO correction, interpolation, AA search, CRC
