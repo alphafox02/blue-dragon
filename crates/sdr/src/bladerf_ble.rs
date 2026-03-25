@@ -68,59 +68,79 @@ fn demod_burst(fm_samples: &[i16], ble_channel: u8) -> Vec<DemodPacket> {
         return Vec::new(); // Too short for preamble + AA + min PDU
     }
 
-    // Step 1: CFO correction via IIR tracker
-    let mut cfo: f64 = 0.0;
+    // Step 1: Two-pass CFO correction.
+    // Pass 1: run IIR over entire burst to find the converged DC offset.
+    // Pass 2: subtract the converged offset from all samples.
+    // This gives correct bit decisions from the first sample (no convergence lag).
     let alpha = 0.125; // 1/8
+    let mut cfo: f64 = 0.0;
+    for &s in fm_samples {
+        cfo += alpha * (s as f64 - cfo);
+    }
+    // Pass 2: subtract converged CFO
     let mut corrected = Vec::with_capacity(fm_samples.len());
     for &s in fm_samples {
-        let sf = s as f64;
-        let c = sf - cfo;
-        cfo += alpha * (sf - cfo);
-        corrected.push(c);
+        corrected.push(s as f64 - cfo);
     }
 
-    // Step 2: Interpolation resampling from SPS=1.25 to SPS=1.0
-    // Phase accumulator: advance by 4 (DENOM) per input, output when >= 5 (NUMER)
+    // Step 2+3: Try all 5 possible starting phases for the resampler.
+    // The burst detector fires at an unknown phase relative to symbol timing.
+    // Exhaustive search over 5 phase offsets finds the correct alignment.
     let sps_numer = 5u32;
     let sps_denom = 4u32;
-    let mut phase = 0u32;
-    let mut bits = Vec::with_capacity(fm_samples.len());
-    let mut prev = corrected[0];
-
-    for &cur in &corrected[1..] {
-        phase += sps_denom;
-        if phase >= sps_numer {
-            // Interpolate to symbol center
-            let frac = (sps_numer as f64 - (phase - sps_denom) as f64) / sps_denom as f64;
-            let interp = prev * (1.0 - frac) + cur * frac;
-            bits.push(if interp > 0.0 { 1u8 } else { 0u8 });
-            phase -= sps_numer;
-        }
-        prev = cur;
-    }
-
-    // Step 3: AA search (sliding 32-bit window)
     let target = bit_reverse_32(BLE_ADV_AA);
     let mut results = Vec::new();
+    let mut global_best_errors = 32u32;
 
-    if bits.len() < 32 {
-        return results;
-    }
+    for phase_offset in 0..sps_numer {
+        // Resample with this starting phase
+        let mut phase = phase_offset;
+        let mut bits = Vec::with_capacity(fm_samples.len());
+        let mut prev = corrected[0];
 
-    let mut sr: u32 = 0;
-    for i in 0..bits.len() {
-        sr = (sr << 1) | (bits[i] as u32);
-        if i < 31 { continue; }
+        for &cur in &corrected[1..] {
+            phase += sps_denom;
+            if phase >= sps_numer {
+                let frac = (sps_numer as f64 - (phase - sps_denom) as f64) / sps_denom as f64;
+                let interp = prev * (1.0 - frac) + cur * frac;
+                bits.push(if interp > 0.0 { 1u8 } else { 0u8 });
+                phase -= sps_numer;
+            }
+            prev = cur;
+        }
 
-        let xor = sr ^ target;
-        let errors = xor.count_ones();
-        if errors <= 2 {
-            // AA found! Decode PDU starting at next bit
-            let pdu_start = i + 1;
-            if let Some(pkt) = decode_pdu(&bits[pdu_start..], ble_channel, errors as u8) {
-                results.push(pkt);
+        if bits.len() < 40 { continue; } // Need preamble + AA minimum
+
+        // AA search
+        let mut sr: u32 = 0;
+        for i in 0..bits.len() {
+            sr = (sr << 1) | (bits[i] as u32);
+            if i < 31 { continue; }
+
+            let xor = sr ^ target;
+            let errors = xor.count_ones();
+            if errors < global_best_errors {
+                global_best_errors = errors;
+            }
+            if errors <= 6 {
+                let pdu_start = i + 1;
+                if let Some(pkt) = decode_pdu(&bits[pdu_start..], ble_channel, errors as u8) {
+                    results.push(pkt);
+                    // Found a valid AA match at this phase -- don't search further phases
+                    // to avoid duplicate detections
+                    break;
+                }
             }
         }
+        if !results.is_empty() { break; }
+    }
+
+    // Debug: report best AA match quality per burst
+    static DEBUG_CNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let cnt = DEBUG_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cnt < 100 && ble_channel == 37 {
+        eprintln!("    [demod ch37] best_aa_err={} found={} samples={}",
+            global_best_errors, results.len(), fm_samples.len());
     }
 
     results
@@ -542,6 +562,13 @@ impl BladerfBleHandle {
             }
 
             // Software demodulation: CFO correction, interpolation, AA search, CRC
+            // Debug: show first few FM samples and burst info
+            if self.pkt_count < 20 && num_samples > 10 {
+                eprintln!("  [burst] ch={} bin={} samples={} first_10: {:?}",
+                    channel, bin_idx, num_samples,
+                    &fm_samples[..10.min(num_samples)]);
+            }
+
             let demod_results = demod_burst(&fm_samples, channel);
 
             let now = SystemTime::now()
