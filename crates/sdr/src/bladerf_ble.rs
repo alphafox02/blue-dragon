@@ -68,19 +68,13 @@ fn demod_burst(fm_samples: &[i16], ble_channel: u8) -> Vec<DemodPacket> {
         return Vec::new(); // Too short for preamble + AA + min PDU
     }
 
-    // Step 1: Two-pass CFO correction.
-    // Pass 1: run IIR over entire burst to find the converged DC offset.
-    // Pass 2: subtract the converged offset from all samples.
-    // This gives correct bit decisions from the first sample (no convergence lag).
-    let alpha = 0.125; // 1/8
-    let mut cfo: f64 = 0.0;
-    for &s in fm_samples {
-        cfo += alpha * (s as f64 - cfo);
-    }
-    // Pass 2: subtract converged CFO
+    // Step 1: CFO correction via arithmetic mean.
+    // The DC offset of the FM output equals the carrier frequency offset.
+    // Subtracting the mean centers the GFSK swing around zero.
+    let mean: f64 = fm_samples.iter().map(|&s| s as f64).sum::<f64>() / fm_samples.len() as f64;
     let mut corrected = Vec::with_capacity(fm_samples.len());
     for &s in fm_samples {
-        corrected.push(s as f64 - cfo);
+        corrected.push(s as f64 - mean);
     }
 
     // Step 2+3: Try all 5 possible starting phases for the resampler.
@@ -138,9 +132,9 @@ fn demod_burst(fm_samples: &[i16], ble_channel: u8) -> Vec<DemodPacket> {
     // Debug: report best AA match quality per burst
     static DEBUG_CNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let cnt = DEBUG_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if cnt < 100 && ble_channel == 37 {
-        eprintln!("    [demod ch37] best_aa_err={} found={} samples={}",
-            global_best_errors, results.len(), fm_samples.len());
+    if cnt < 200 && (ble_channel == 37 || global_best_errors <= 4) {
+        eprintln!("    [demod ch{}] best_aa_err={} found={} samples={}",
+            ble_channel, global_best_errors, results.len(), fm_samples.len());
     }
 
     results
@@ -562,11 +556,24 @@ impl BladerfBleHandle {
             }
 
             // Software demodulation: CFO correction, interpolation, AA search, CRC
-            // Debug: show first few FM samples and burst info
-            if self.pkt_count < 20 && num_samples > 10 {
-                eprintln!("  [burst] ch={} bin={} samples={} first_10: {:?}",
-                    channel, bin_idx, num_samples,
-                    &fm_samples[..10.min(num_samples)]);
+            // Debug: show burst stats
+            if self.pkt_count < 100 && (channel == 37 || channel == 38) && num_samples > 20 {
+                // Histogram: count samples in ranges
+                let mut neg_big = 0i32; // < -8000
+                let mut neg_sm = 0i32;  // -8000..0
+                let mut pos_sm = 0i32;  // 0..8000
+                let mut pos_big = 0i32; // > 8000
+                let mut sum: f64 = 0.0;
+                for &s in &fm_samples {
+                    sum += s as f64;
+                    if s < -8000 { neg_big += 1; }
+                    else if s < 0 { neg_sm += 1; }
+                    else if s < 8000 { pos_sm += 1; }
+                    else { pos_big += 1; }
+                }
+                let mean = sum / num_samples as f64;
+                eprintln!("  [burst] ch={} bin={} n={} mean={:.0} hist: <-8k:{} -8k..0:{} 0..8k:{} >8k:{}",
+                    channel, bin_idx, num_samples, mean, neg_big, neg_sm, pos_sm, pos_big);
             }
 
             let demod_results = demod_burst(&fm_samples, channel);
