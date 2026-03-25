@@ -116,7 +116,7 @@ fn demod_burst(fm_samples: &[i16], ble_channel: u8) -> Vec<DemodPacket> {
             if errors < global_best_errors {
                 global_best_errors = errors;
             }
-            if errors <= 6 {
+            if errors <= 2 {
                 let pdu_start = i + 1;
                 if let Some(pkt) = decode_pdu(&bits[pdu_start..], ble_channel, errors as u8) {
                     results.push(pkt);
@@ -557,7 +557,7 @@ impl BladerfBleHandle {
 
             // Software demodulation: CFO correction, interpolation, AA search, CRC
             // Debug: show burst stats
-            if self.pkt_count < 100 && (channel == 37 || channel == 38) && num_samples > 20 {
+            if self.pkt_count < 200 && num_samples > 20 {
                 // Histogram: count samples in ranges
                 let mut neg_big = 0i32; // < -8000
                 let mut neg_sm = 0i32;  // -8000..0
