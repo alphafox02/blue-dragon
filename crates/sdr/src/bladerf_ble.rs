@@ -1,11 +1,15 @@
 // Copyright 2026 CEMAXECUTER LLC
 //
-// bladeRF BLE FPGA backend: reads decoded BLE packets from the bladeRF
-// when loaded with the BLE channelizer FPGA image.
+// bladeRF BLE FPGA backend: hybrid FPGA+host BLE decoder.
 //
-// The FPGA performs all DSP (PFB channelizer, FM demod, bit slicing,
-// framing, CRC) and sends decoded packets over USB as 128-bit words.
-// This backend parses those words into BlePacket structs.
+// The FPGA handles wideband DSP: PFB channelizer (80 Msps, 64 bins),
+// FM discriminator (CORDIC), and burst detection.  During active bursts,
+// raw FM demod samples are streamed to the host over USB as 128-bit words.
+//
+// The host performs protocol-level decoding: interpolation resampling
+// (SPS 1.25 -> 1.0), bit slicing, access address search, data whitening
+// removal, and CRC-24 verification.  This avoids the SPS=1.25 limitation
+// of the FPGA bit slicer (no timing recovery in fixed-point VHDL).
 //
 // Packet format (128-bit words, header first):
 //   Word 0: Header
@@ -43,11 +47,205 @@ const FPGA_MAGIC: u8 = 0xBE;
 // 128-bit word = 16 bytes
 const WORD_SIZE: usize = 16;
 
-// Max PDU = 258 bytes -> ceil(258/16) = 17 payload words + 1 header = 18
-const MAX_PKT_WORDS: usize = 18;
+// Max burst FM samples: ~600 samples for a max-length BLE packet at SPS=1.25
+// ceil(600*2 / 16) = 75 payload words + 1 header
+const MAX_PKT_WORDS: usize = 76;
 
 // Max BLE channel: 0-39 (FPGA maps PFB bins to BLE channel numbers)
 const MAX_BLE_CHAN: u8 = 39;
+
+// BLE advertising access address
+const BLE_ADV_AA: u32 = 0x8E89BED6;
+
+// ---------------------------------------------------------------------------
+// Software BLE demodulator for FPGA burst FM samples
+// ---------------------------------------------------------------------------
+
+/// Demodulate a burst of FM samples into BLE packets.
+/// Returns decoded packets (may be 0 or 1 per burst).
+fn demod_burst(fm_samples: &[i16], ble_channel: u8) -> Vec<DemodPacket> {
+    if fm_samples.len() < 60 {
+        return Vec::new(); // Too short for preamble + AA + min PDU
+    }
+
+    // Step 1: CFO correction via IIR tracker
+    let mut cfo: f64 = 0.0;
+    let alpha = 0.125; // 1/8
+    let mut corrected = Vec::with_capacity(fm_samples.len());
+    for &s in fm_samples {
+        let sf = s as f64;
+        let c = sf - cfo;
+        cfo += alpha * (sf - cfo);
+        corrected.push(c);
+    }
+
+    // Step 2: Interpolation resampling from SPS=1.25 to SPS=1.0
+    // Phase accumulator: advance by 4 (DENOM) per input, output when >= 5 (NUMER)
+    let sps_numer = 5u32;
+    let sps_denom = 4u32;
+    let mut phase = 0u32;
+    let mut bits = Vec::with_capacity(fm_samples.len());
+    let mut prev = corrected[0];
+
+    for &cur in &corrected[1..] {
+        phase += sps_denom;
+        if phase >= sps_numer {
+            // Interpolate to symbol center
+            let frac = (sps_numer as f64 - (phase - sps_denom) as f64) / sps_denom as f64;
+            let interp = prev * (1.0 - frac) + cur * frac;
+            bits.push(if interp > 0.0 { 1u8 } else { 0u8 });
+            phase -= sps_numer;
+        }
+        prev = cur;
+    }
+
+    // Step 3: AA search (sliding 32-bit window)
+    let target = bit_reverse_32(BLE_ADV_AA);
+    let mut results = Vec::new();
+
+    if bits.len() < 32 {
+        return results;
+    }
+
+    let mut sr: u32 = 0;
+    for i in 0..bits.len() {
+        sr = (sr << 1) | (bits[i] as u32);
+        if i < 31 { continue; }
+
+        let xor = sr ^ target;
+        let errors = xor.count_ones();
+        if errors <= 2 {
+            // AA found! Decode PDU starting at next bit
+            let pdu_start = i + 1;
+            if let Some(pkt) = decode_pdu(&bits[pdu_start..], ble_channel, errors as u8) {
+                results.push(pkt);
+            }
+        }
+    }
+
+    results
+}
+
+/// Decoded packet from software demod (before building BlePacket)
+struct DemodPacket {
+    pdu_bytes: Vec<u8>,
+    crc_ok: bool,
+    crc_computed: u32,
+    crc_received: u32,
+    aa_errors: u8,
+}
+
+/// Decode PDU + CRC from bit stream after AA match.
+fn decode_pdu(bits: &[u8], ble_channel: u8, aa_errors: u8) -> Option<DemodPacket> {
+    if bits.len() < 16 {
+        return None; // Need at least 2 header bytes
+    }
+
+    // Initialize whitening LFSR (BLE spec: d0=1, d1..d6=channel)
+    let mut lfsr: u8 = ((ble_channel & 0x3F) << 1) | 1;
+
+    // Dewhiten and assemble bytes, feeding dewhitened bits to CRC
+    let mut crc: u32 = 0xAAAAAA; // Reflected init
+    let mut pdu_bytes = Vec::new();
+    let mut byte_val: u8 = 0;
+    let mut bit_idx = 0;
+
+    // We don't know the length yet -- read header first (2 bytes = 16 bits)
+    let max_bits = bits.len().min(258 * 8 + 24); // max PDU + CRC
+
+    for i in 0..max_bits {
+        if i >= bits.len() { break; }
+
+        // Dewhiten
+        let whiten_bit = lfsr & 1;
+        let dewhitened = bits[i] ^ whiten_bit;
+
+        // Step LFSR (Fibonacci: feedback = d0 XOR d4)
+        let feedback = (lfsr & 1) ^ ((lfsr >> 4) & 1);
+        lfsr = (feedback << 6) | (lfsr >> 1);
+
+        // Check if we're in PDU or CRC region
+        let pdu_len = if pdu_bytes.len() >= 2 {
+            pdu_bytes[1] as usize + 2 // length field + 2 header bytes
+        } else {
+            258 // unknown, assume max
+        };
+
+        let pdu_bits = pdu_len * 8;
+        let crc_end = pdu_bits + 24;
+
+        if i < pdu_bits {
+            // PDU region: feed to CRC and assemble byte
+            // CRC: reflected LFSR, poly 0xDA6000
+            let fb = ((crc & 1) ^ (dewhitened as u32)) as u32;
+            crc >>= 1;
+            if fb != 0 {
+                crc ^= 0xDA6000;
+            }
+
+            // Assemble byte LSB-first
+            byte_val |= dewhitened << (bit_idx & 7);
+            bit_idx += 1;
+            if bit_idx & 7 == 0 {
+                pdu_bytes.push(byte_val);
+                byte_val = 0;
+
+                // Check length after 2 header bytes
+                if pdu_bytes.len() == 2 {
+                    let length = pdu_bytes[1] as usize;
+                    if length > 255 {
+                        return None;
+                    }
+                }
+            }
+        } else if i < crc_end {
+            // CRC region: collect received CRC bits
+            // (CRC engine continues to process -- if all correct, result = 0)
+            let fb = ((crc & 1) ^ (dewhitened as u32)) as u32;
+            crc >>= 1;
+            if fb != 0 {
+                crc ^= 0xDA6000;
+            }
+        } else {
+            break;
+        }
+    }
+
+    if pdu_bytes.len() < 2 {
+        return None;
+    }
+
+    // CRC check: if all bits are correct, the CRC register should be 0
+    let crc_ok = crc == 0;
+
+    Some(DemodPacket {
+        pdu_bytes,
+        crc_ok,
+        crc_computed: crc,
+        crc_received: 0, // We use self-checking property
+        aa_errors,
+    })
+}
+
+fn bit_reverse_32(mut v: u32) -> u32 {
+    let mut r: u32 = 0;
+    for _ in 0..32 {
+        r = (r << 1) | (v & 1);
+        v >>= 1;
+    }
+    r
+}
+
+fn ble_chan_to_freq_mhz(ch: u8) -> u32 {
+    match ch {
+        37 => 2402,
+        38 => 2426,
+        39 => 2480,
+        c if c <= 10 => 2404 + (c as u32) * 2,
+        c if c <= 36 => 2406 + (c as u32) * 2,
+        _ => 2402,
+    }
+}
 
 
 extern "C" {
@@ -92,17 +290,7 @@ const BLADERF_GAIN_MGC: c_int = 1;
 const BLADERF_FEATURE_OVERSAMPLE: c_uint = 1;
 
 /// Convert BLE channel number (0-39) to center frequency in MHz.
-fn ble_chan_to_freq_mhz(ble_chan: u8) -> u32 {
-    match ble_chan {
-        37 => 2402,
-        38 => 2426,
-        39 => 2480,
-        ch if ch <= 10 => 2404 + 2 * ch as u32,
-        ch => 2428 + 2 * (ch as u32 - 11),
-    }
-}
-
-/// Handle for reading decoded BLE packets from a bladeRF with BLE FPGA image.
+/// Handle for reading burst FM samples from a bladeRF with BLE FPGA image.
 pub struct BladerfBleHandle {
     dev: *mut BladerfDevice,
     pub running: Arc<AtomicBool>,
@@ -326,17 +514,9 @@ impl BladerfBleHandle {
                 continue;
             }
 
-            // Validate header
-            if channel > MAX_BLE_CHAN || length == 0 || length > 258 {
-                if self.pkt_count == 0 && self.overflow_count < 20 {
-                    eprintln!("  [reject] ch={} len={} phy={} crc_ok={} raw=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-                        channel, length, phy_byte, crc_ok,
-                        data[pos], data[pos+1], data[pos+2], data[pos+3],
-                        data[pos+4], data[pos+5], data[pos+6], data[pos+7],
-                        data[pos+8], data[pos+9], data[pos+10], data[pos+11],
-                        data[pos+12], data[pos+13], data[pos+14], data[pos+15]);
-                    self.overflow_count += 1;
-                }
+            // Validate header: length is in bytes (FM samples * 2)
+            // Max burst: ~600 samples * 2 = 1200 bytes
+            if channel > MAX_BLE_CHAN || length == 0 || length > 1200 {
                 pos += WORD_SIZE;
                 continue;
             }
@@ -346,66 +526,64 @@ impl BladerfBleHandle {
             let total_bytes = (1 + payload_words) * WORD_SIZE;
 
             if pos + total_bytes > data.len() {
-                // Incomplete packet -- save residual for next call
+                // Incomplete burst -- save residual for next call
                 self.residual.extend_from_slice(&data[pos..]);
                 break;
             }
 
-            // Extract PDU bytes from payload words
+            // Extract FM samples from payload (16-bit LE signed, serialized as byte pairs)
             let payload_start = pos + WORD_SIZE;
-            let mut pdu_data = Vec::with_capacity(length);
-            for i in 0..length {
-                pdu_data.push(data[payload_start + i]);
+            let num_samples = length / 2;
+            let mut fm_samples = Vec::with_capacity(num_samples);
+            for i in 0..num_samples {
+                let lo = data[payload_start + i * 2] as u16;
+                let hi = data[payload_start + i * 2 + 1] as u16;
+                fm_samples.push((lo | (hi << 8)) as i16);
             }
 
-            // Build BlePacket
+            // Software demodulation: CFO correction, interpolation, AA search, CRC
+            let demod_results = demod_burst(&fm_samples, channel);
+
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
 
-            let phy = match phy_byte {
-                1 => BlePhy::Phy2M,
-                2 => BlePhy::PhyCoded,
-                _ => BlePhy::Phy1M,
-            };
+            for dpkt in demod_results {
+                let freq = ble_chan_to_freq_mhz(channel);
+                let pdu_len = dpkt.pdu_bytes.len();
 
-            let freq = ble_chan_to_freq_mhz(channel);
+                // Build raw packet: AA + PDU + CRC placeholder
+                let mut raw = Vec::with_capacity(4 + pdu_len + 3);
+                raw.extend_from_slice(&BLE_ADV_AA.to_le_bytes());
+                raw.extend_from_slice(&dpkt.pdu_bytes);
+                raw.extend_from_slice(&[0x00, 0x00, 0x00]);
 
-            // Build raw packet data: AA (4 bytes) + PDU + CRC (3 bytes)
-            // The FPGA sends only the PDU body (after de-whitening).
-            // For PCAP compatibility, prepend the advertising AA and append CRC placeholder.
-            let aa: u32 = 0x8E89BED6; // TODO: support data channel AAs
-            let mut raw = Vec::with_capacity(4 + length + 3);
-            raw.extend_from_slice(&aa.to_le_bytes());
-            raw.extend_from_slice(&pdu_data);
-            // CRC placeholder (FPGA validated it but doesn't send the raw CRC bytes)
-            raw.extend_from_slice(&[0x00, 0x00, 0x00]);
+                let pkt = BlePacket {
+                    aa: BLE_ADV_AA,
+                    rssi_db: rssi as i32,
+                    noise_db: -100,
+                    freq,
+                    len: raw.len(),
+                    timestamp: Timespec {
+                        tv_sec: now.as_secs() as u64,
+                        tv_nsec: now.subsec_nanos() as u64,
+                    },
+                    crc_checked: true,
+                    crc_valid: dpkt.crc_ok,
+                    is_data: channel <= 36,
+                    conn_valid: false,
+                    phy: BlePhy::Phy1M,
+                    ext_header: None,
+                    data: raw,
+                };
 
-            let pkt = BlePacket {
-                aa,
-                rssi_db: rssi as i32,
-                noise_db: -100, // FPGA doesn't report noise floor
-                freq,
-                len: raw.len(),
-                timestamp: Timespec {
-                    tv_sec: now.as_secs() as u64,
-                    tv_nsec: now.subsec_nanos() as u64,
-                },
-                crc_checked: true,
-                crc_valid: crc_ok,
-                is_data: channel <= 36,
-                conn_valid: false,
-                phy,
-                ext_header: None,
-                data: raw,
-            };
-
-            if self.pkt_count < 100 {
-                eprintln!("  [accept] ch={} len={} phy={} crc_ok={} freq={} MHz bin={} crc_comp={:06x} crc_recv={:06x}",
-                    channel, length, phy_byte, crc_ok, freq, bin_idx, crc_computed, crc_received);
+                if self.pkt_count < 200 {
+                    eprintln!("  [demod] ch={} len={} crc_ok={} freq={} MHz bin={} aa_err={} fm_samples={}",
+                        channel, pdu_len, dpkt.crc_ok, freq, bin_idx, dpkt.aa_errors, num_samples);
+                }
+                packets.push(pkt);
+                self.pkt_count += 1;
             }
-            packets.push(pkt);
-            self.pkt_count += 1;
             pos += total_bytes;
         }
 
