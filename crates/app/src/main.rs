@@ -27,6 +27,11 @@ struct Cli {
     #[arg(long, default_value = "ci16")]
     format: String,
 
+    /// Sample rate for file input (Hz, e.g. 100000000 for 100 Msps).
+    /// Overrides -C when used with -f. Accepts Hz or Msps with 'M' suffix (e.g. 100M).
+    #[arg(long)]
+    sample_rate: Option<String>,
+
     /// Center frequency in MHz
     #[arg(short = 'c', long, default_value = "2441")]
     center_freq: u32,
@@ -400,11 +405,41 @@ fn main() {
             }
         };
 
+        // --sample-rate overrides -C for file input: compute channels from rate
+        let file_channels = if let Some(ref sr) = cli.sample_rate {
+            let rate_hz: u64 = if let Some(mhz) = sr.strip_suffix('M').or_else(|| sr.strip_suffix('m')) {
+                match mhz.parse::<f64>() {
+                    Ok(m) => (m * 1_000_000.0) as u64,
+                    Err(_) => {
+                        eprintln!("invalid --sample-rate: {}", sr);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match sr.parse::<u64>() {
+                    Ok(hz) => hz,
+                    Err(_) => {
+                        eprintln!("invalid --sample-rate: {} (use Hz or e.g. 100M)", sr);
+                        std::process::exit(1);
+                    }
+                }
+            };
+            let ch = (rate_hz / 1_000_000) as usize;
+            if ch == 0 {
+                eprintln!("--sample-rate too low: {} (minimum 1 MHz)", sr);
+                std::process::exit(1);
+            }
+            eprintln!("file input: {} Msps -> {} channels, center {} MHz", rate_hz / 1_000_000, ch, center_freq);
+            ch
+        } else {
+            channels
+        };
+
         if let Err(e) = pipeline::run_file(
             file,
             format,
             center_freq,
-            channels,
+            file_channels,
             cli.write.as_deref(),
             cli.check_crc,
             cli.squelch,
