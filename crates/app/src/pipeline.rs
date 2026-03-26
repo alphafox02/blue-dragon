@@ -1024,7 +1024,9 @@ fn broadcast_batch(
 
 /// Detect SDR backend type from interface string.
 fn detect_sdr_type(iface: &str) -> &str {
-    if iface.starts_with("usrp") {
+    if iface.starts_with("vita49") {
+        "vita49"
+    } else if iface.starts_with("usrp") {
         "usrp"
     } else if iface.starts_with("hackrf") {
         "hackrf"
@@ -1055,6 +1057,7 @@ enum SdrHandle {
     Aaronia(bd_sdr::aaronia::AaroniaHandle),
     #[cfg(feature = "rfnm")]
     Rfnm(bd_sdr::rfnm::RfnmHandle),
+    Vita49(bd_sdr::vita49::Vita49Handle),
 }
 
 // Safety: SDR C library handles are thread-safe (recv from one thread is fine).
@@ -1076,6 +1079,7 @@ impl SdrHandle {
             SdrHandle::Aaronia(h) => h.recv_into_i16(buf),
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.recv_into_i16(buf),
+            SdrHandle::Vita49(h) => h.recv_into_i16(buf),
         }
     }
 
@@ -1093,6 +1097,7 @@ impl SdrHandle {
             SdrHandle::Aaronia(h) => h.max_samps(),
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.max_samps(),
+            SdrHandle::Vita49(h) => h.max_samps(),
         }
     }
 
@@ -1110,6 +1115,7 @@ impl SdrHandle {
             SdrHandle::Aaronia(h) => h.overflow_count(),
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.overflow_count(),
+            SdrHandle::Vita49(h) => h.overflow_count(),
         }
     }
 
@@ -1119,6 +1125,7 @@ impl SdrHandle {
         match self {
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.actual_sample_rate(),
+            SdrHandle::Vita49(h) => h.sample_rate() as u64,
             _ => requested as u64,
         }
     }
@@ -1143,6 +1150,7 @@ impl SdrHandle {
             SdrHandle::Aaronia(h) => h.set_gain(gain),
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.set_gain(gain),
+            SdrHandle::Vita49(h) => h.set_gain(gain),
         }
     }
 }
@@ -1160,6 +1168,10 @@ fn open_sdr_handle(
 ) -> Result<SdrHandle, String> {
     let sdr_type = detect_sdr_type(iface);
     match sdr_type {
+        "vita49" => {
+            let h = bd_sdr::vita49::Vita49Handle::open(iface, sample_rate, center_freq_hz, gain)?;
+            Ok(SdrHandle::Vita49(h))
+        }
         #[cfg(feature = "usrp")]
         "usrp" => {
             let h = bd_sdr::usrp::UsrpHandle::open(iface, sample_rate, center_freq_hz, gain, antenna)?;

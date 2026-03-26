@@ -1,6 +1,7 @@
 // Copyright 2025-2026 CEMAXECUTER LLC
 
 pub mod file;
+pub mod vita49;
 
 #[cfg(feature = "usrp")]
 pub mod usrp;
