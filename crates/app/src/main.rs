@@ -429,6 +429,10 @@ fn main() {
                 eprintln!("--sample-rate too low: {} (minimum 1 MHz)", sr);
                 std::process::exit(1);
             }
+            if rate_hz % 1_000_000 != 0 {
+                eprintln!("WARNING: sample rate {} Hz is not an exact multiple of 1 MHz; using {} channels ({}M of {:.3}M)",
+                    rate_hz, ch, ch, rate_hz as f64 / 1_000_000.0);
+            }
             eprintln!("file input: {} Msps -> {} channels, center {} MHz", rate_hz / 1_000_000, ch, center_freq);
             ch
         } else {

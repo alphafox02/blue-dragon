@@ -12,8 +12,7 @@
 // Default bind: 0.0.0.0:4991
 
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 4991;
@@ -63,11 +62,12 @@ pub struct Vita49Handle {
     pkt_buf: Vec<u8>,
     /// Residual i16 samples from previous packet not yet consumed
     residual: Vec<i16>,
+    residual_offset: usize,
+    /// Reusable buffer for format conversion when payload exceeds remaining buf space
+    convert_buf: Vec<i16>,
     sample_rate: u32,
     center_freq: u64,
     iq_format: IqFormat,
-    ctx_logged: bool,
-    running: Arc<AtomicBool>,
     gap_count: AtomicU64,
     last_seq: u8,
     have_seq: bool,
@@ -99,15 +99,32 @@ impl Vita49Handle {
         {
             use std::os::unix::io::AsRawFd;
             let fd = sock.as_raw_fd();
-            let buf_sz: libc::c_int = 4 * 1024 * 1024;
+            let requested: libc::c_int = 4 * 1024 * 1024;
             unsafe {
                 libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_RCVBUF,
-                    &buf_sz as *const _ as *const libc::c_void,
+                    &requested as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
+                let mut actual: libc::c_int = 0;
+                let mut len: libc::socklen_t =
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &mut actual as *mut _ as *mut libc::c_void,
+                    &mut len,
+                );
+                if actual < requested {
+                    eprintln!(
+                        "vita49: WARNING: SO_RCVBUF {} bytes (requested {}). \
+                         Increase with: sudo sysctl net.core.rmem_max={}",
+                        actual, requested, requested
+                    );
+                }
             }
         }
 
@@ -117,11 +134,11 @@ impl Vita49Handle {
             sock,
             pkt_buf: vec![0u8; VRT_MAX_PKT],
             residual: Vec::with_capacity(8192),
+            residual_offset: 0,
+            convert_buf: vec![0i16; VRT_MAX_PKT / 2],
             sample_rate,
             center_freq: center_freq_hz,
             iq_format: IqFormat::Ci16,
-            ctx_logged: false,
-            running: Arc::new(AtomicBool::new(true)),
             gap_count: AtomicU64::new(0),
             last_seq: 0,
             have_seq: false,
@@ -134,11 +151,18 @@ impl Vita49Handle {
     pub fn recv_into_i16(&mut self, buf: &mut [i16]) -> usize {
         let mut written = 0usize;
 
-        // Drain residual first
-        if !self.residual.is_empty() {
-            let n = self.residual.len().min(buf.len());
-            buf[..n].copy_from_slice(&self.residual[..n]);
-            self.residual.drain(..n);
+        // Drain residual first (use offset to avoid memmove)
+        let residual_remaining = self.residual.len() - self.residual_offset;
+        if residual_remaining > 0 {
+            let n = residual_remaining.min(buf.len());
+            buf[..n].copy_from_slice(
+                &self.residual[self.residual_offset..self.residual_offset + n],
+            );
+            self.residual_offset += n;
+            if self.residual_offset == self.residual.len() {
+                self.residual.clear();
+                self.residual_offset = 0;
+            }
             written = n;
             if written >= buf.len() {
                 return written / 2;
@@ -161,16 +185,11 @@ impl Vita49Handle {
                 Err(_) => break,
             };
 
-            let pkt = &self.pkt_buf[..len];
-
-            // Copy packet to avoid borrow conflicts with self
-            let vrl_off = vrl_strip(&self.pkt_buf[..len]);
-            let vrt_len = len - vrl_off;
+            let (vrt_start, vrt_len) = vrl_strip(&self.pkt_buf[..len]);
             if vrt_len < 4 {
                 continue;
             }
-            // Work from the original buffer using absolute offsets
-            let vrt_start = vrl_off;
+            let vrt_end = vrt_start + vrt_len;
 
             let w0 = u32::from_be_bytes([
                 self.pkt_buf[vrt_start],
@@ -180,17 +199,16 @@ impl Vita49Handle {
             ]);
             let pkt_type = ((w0 >> 28) & 0xF) as u8;
 
-            // Handle context packets
+            // Handle context packets (parse without copying pkt_buf)
             if pkt_type == VRT_TYPE_IF_CONTEXT || pkt_type == VRT_TYPE_EXT_CONTEXT {
-                if !self.ctx_logged {
-                    let vrt_copy: Vec<u8> = self.pkt_buf[vrt_start..len].to_vec();
-                    self.handle_context(&vrt_copy);
+                if let Some(ctx) = parse_context(&self.pkt_buf[vrt_start..vrt_end]) {
+                    self.apply_context(ctx);
                 }
                 continue;
             }
 
             // Parse signal data
-            let vrt_slice = &self.pkt_buf[vrt_start..len];
+            let vrt_slice = &self.pkt_buf[vrt_start..vrt_end];
             let (payload_off, payload_bytes) = match parse_signal_header(vrt_slice) {
                 Some(v) => v,
                 None => continue,
@@ -207,27 +225,61 @@ impl Vita49Handle {
             self.last_seq = count;
             self.have_seq = true;
 
-            let payload = &self.pkt_buf[vrt_start + payload_off..vrt_start + payload_off + payload_bytes];
+            let payload_start = vrt_start + payload_off;
+            let payload_end = payload_start + payload_bytes;
+            let payload = &self.pkt_buf[payload_start..payload_end];
 
-            // Convert to i16
-            let samples = match self.iq_format {
-                IqFormat::Ci8 => convert_ci8(payload),
-                IqFormat::Ci16 => convert_ci16_be(payload),
-                IqFormat::Cf32 => convert_cf32_be(payload),
+            // Calculate how many i16 values this payload produces
+            let total_values = match self.iq_format {
+                IqFormat::Ci8 => payload.len(),
+                IqFormat::Ci16 => payload.len() / 2,
+                IqFormat::Cf32 => payload.len() / 4,
             };
-
-            if samples.is_empty() {
+            if total_values == 0 {
                 continue;
             }
 
-            // Copy as much as fits into buf, save rest as residual
             let space = buf.len() - written;
-            let n = samples.len().min(space);
-            buf[written..written + n].copy_from_slice(&samples[..n]);
-            written += n;
 
-            if n < samples.len() {
-                self.residual.extend_from_slice(&samples[n..]);
+            if total_values <= space {
+                // Fast path: convert directly into caller's buf (no intermediate alloc)
+                let dst = &mut buf[written..written + total_values];
+                match self.iq_format {
+                    IqFormat::Ci8 => { convert_ci8_into(payload, dst); }
+                    IqFormat::Ci16 => { convert_ci16_be_into(payload, dst); }
+                    IqFormat::Cf32 => { convert_cf32_be_into(payload, dst); }
+                }
+                written += total_values;
+            } else {
+                // Overflow: fill remaining buf, spill rest into residual
+                let dst = &mut buf[written..];
+                let direct = match self.iq_format {
+                    IqFormat::Ci8 => convert_ci8_into(payload, dst),
+                    IqFormat::Ci16 => convert_ci16_be_into(payload, dst),
+                    IqFormat::Cf32 => convert_cf32_be_into(payload, dst),
+                };
+                written += direct;
+
+                // Convert the overflow portion into convert_buf, then save as residual
+                let overflow_values = total_values - direct;
+                if overflow_values > 0 {
+                    let overflow_payload = match self.iq_format {
+                        IqFormat::Ci8 => &payload[direct..],
+                        IqFormat::Ci16 => &payload[direct * 2..],
+                        IqFormat::Cf32 => &payload[direct * 4..],
+                    };
+                    if self.convert_buf.len() < overflow_values {
+                        self.convert_buf.resize(overflow_values, 0);
+                    }
+                    let n = match self.iq_format {
+                        IqFormat::Ci8 => convert_ci8_into(overflow_payload, &mut self.convert_buf),
+                        IqFormat::Ci16 => convert_ci16_be_into(overflow_payload, &mut self.convert_buf),
+                        IqFormat::Cf32 => convert_cf32_be_into(overflow_payload, &mut self.convert_buf),
+                    };
+                    self.residual.clear();
+                    self.residual_offset = 0;
+                    self.residual.extend_from_slice(&self.convert_buf[..n]);
+                }
             }
 
             if written >= buf.len() {
@@ -259,27 +311,31 @@ impl Vita49Handle {
         self.center_freq
     }
 
-    pub fn running(&self) -> &Arc<AtomicBool> {
-        &self.running
-    }
 
-    fn handle_context(&mut self, vrt: &[u8]) {
-        if let Some(ctx) = parse_context(vrt) {
-            if let Some(sr) = ctx.sample_rate {
-                self.sample_rate = sr as u32;
+    /// Apply auto-detected metadata from a VRT context packet.
+    /// Logs on first detection and on any subsequent change.
+    fn apply_context(&mut self, ctx: ContextInfo) {
+        if let Some(sr) = ctx.sample_rate {
+            let new_rate = sr as u32;
+            if new_rate != self.sample_rate {
+                self.sample_rate = new_rate;
                 eprintln!("vita49: auto-detected sample_rate={} Hz ({} Msps)",
                     sr as u64, sr as u64 / 1_000_000);
             }
-            if let Some(freq) = ctx.center_freq {
-                self.center_freq = freq as u64;
+        }
+        if let Some(freq) = ctx.center_freq {
+            let new_freq = freq as u64;
+            if new_freq != self.center_freq {
+                self.center_freq = new_freq;
                 eprintln!("vita49: auto-detected rf_freq={} Hz ({} MHz)",
-                    freq as u64, freq as u64 / 1_000_000);
+                    new_freq, new_freq / 1_000_000);
             }
-            if let Some(fmt) = ctx.format {
+        }
+        if let Some(fmt) = ctx.format {
+            if fmt != self.iq_format {
                 self.iq_format = fmt;
                 eprintln!("vita49: auto-detected format={:?}", fmt);
             }
-            self.ctx_logged = true;
         }
     }
 }
@@ -291,15 +347,18 @@ struct ContextInfo {
     format: Option<IqFormat>,
 }
 
-/// Strip VRL wrapper ("VRLP" magic). Returns offset to VRT packet start.
-fn vrl_strip(pkt: &[u8]) -> usize {
+/// Strip VRL wrapper ("VRLP" magic). Returns (vrt_offset, vrt_len).
+/// VRL frame: 8-byte header ("VRLP" + frame size) + VRT packet + 4-byte trailer.
+fn vrl_strip(pkt: &[u8]) -> (usize, usize) {
     if pkt.len() >= 12 {
         let magic = u32::from_be_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
         if magic == 0x56524C50 {
-            return 8;
+            let vrt_start = 8;
+            let vrt_len = pkt.len() - 8 - 4; // exclude header and trailer
+            return (vrt_start, vrt_len);
         }
     }
-    0
+    (0, pkt.len())
 }
 
 /// Parse VRT signal data header. Returns (payload_offset, payload_bytes).
@@ -398,11 +457,13 @@ fn parse_context(vrt: &[u8]) -> Option<ContextInfo> {
         }
 
         if bit == CIF_RF_REF_FREQ {
-            let val = read_be64(vrt, off_w);
-            info.center_freq = Some(val as f64 / (1u64 << 20) as f64);
+            // 64-bit signed fixed-point Hz, 20-bit fraction (VITA 49.0 section 7.1.5.6)
+            let val = read_be64_signed(vrt, off_w);
+            info.center_freq = Some(val as f64 / (1i64 << 20) as f64);
         } else if bit == CIF_SAMPLE_RATE {
-            let val = read_be64(vrt, off_w);
-            info.sample_rate = Some(val as f64 / (1u64 << 20) as f64);
+            // 64-bit signed fixed-point Hz, 20-bit fraction (VITA 49.0 section 7.1.5.12)
+            let val = read_be64_signed(vrt, off_w);
+            info.sample_rate = Some(val as f64 / (1i64 << 20) as f64);
         } else if bit == CIF_DATA_FORMAT {
             let fmt_w1 = read_be32(vrt, off_w);
             info.format = parse_data_format(fmt_w1);
@@ -438,28 +499,32 @@ fn parse_data_format(fmt_word1: u32) -> Option<IqFormat> {
     }
 }
 
-fn convert_ci8(payload: &[u8]) -> Vec<i16> {
-    payload.iter().map(|&b| (b as i8 as i16) << 8).collect()
+/// Convert CI8 payload into dst. Returns number of i16 values written.
+fn convert_ci8_into(payload: &[u8], dst: &mut [i16]) -> usize {
+    let n = payload.len().min(dst.len());
+    for i in 0..n {
+        dst[i] = (payload[i] as i8 as i16) << 8;
+    }
+    n
 }
 
-fn convert_ci16_be(payload: &[u8]) -> Vec<i16> {
-    let n = payload.len() / 2;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        out.push(i16::from_be_bytes([payload[i * 2], payload[i * 2 + 1]]));
+/// Convert big-endian CI16 payload into dst. Returns number of i16 values written.
+fn convert_ci16_be_into(payload: &[u8], dst: &mut [i16]) -> usize {
+    let max = dst.len().min(payload.len() / 2);
+    for (i, chunk) in payload.chunks_exact(2).take(max).enumerate() {
+        dst[i] = i16::from_be_bytes([chunk[0], chunk[1]]);
     }
-    out
+    max
 }
 
-fn convert_cf32_be(payload: &[u8]) -> Vec<i16> {
-    let n = payload.len() / 4;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let b = i * 4;
-        let f = f32::from_be_bytes([payload[b], payload[b + 1], payload[b + 2], payload[b + 3]]);
-        out.push((f * 32767.0).clamp(-32768.0, 32767.0) as i16);
+/// Convert big-endian CF32 payload into dst. Returns number of i16 values written.
+fn convert_cf32_be_into(payload: &[u8], dst: &mut [i16]) -> usize {
+    let max = dst.len().min(payload.len() / 4);
+    for (i, chunk) in payload.chunks_exact(4).take(max).enumerate() {
+        let f = f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        dst[i] = (f * 32767.0).clamp(-32768.0, 32767.0) as i16;
     }
-    out
+    max
 }
 
 fn read_be32(data: &[u8], word_offset: usize) -> u32 {
@@ -467,10 +532,12 @@ fn read_be32(data: &[u8], word_offset: usize) -> u32 {
     u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
 
-fn read_be64(data: &[u8], word_offset: usize) -> u64 {
+/// Read signed 64-bit big-endian value from two consecutive 32-bit words.
+/// VITA 49 frequency and sample rate fields are signed fixed-point.
+fn read_be64_signed(data: &[u8], word_offset: usize) -> i64 {
     let hi = read_be32(data, word_offset) as u64;
     let lo = read_be32(data, word_offset + 1) as u64;
-    (hi << 32) | lo
+    ((hi << 32) | lo) as i64
 }
 
 fn parse_endpoint(iface: &str) -> Result<(String, u16), String> {
