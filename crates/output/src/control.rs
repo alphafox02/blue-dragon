@@ -57,6 +57,13 @@ pub enum ControlCommand {
         duration_secs: u32,
         req_id: Option<String>,
     },
+    L2capFlood {
+        mac: String,
+        count: u32,
+        hold_secs: u32,
+        psm: u16,
+        req_id: Option<String>,
+    },
 }
 
 /// Shared state for heartbeat reporting.
@@ -401,6 +408,32 @@ impl ControlClient {
                 };
                 if self.cmd_tx.try_send(command).is_ok() {
                     self.send_response(req_id, "ok", &format!("spoof advertisement queued ({}s)", duration));
+                } else {
+                    self.send_response(req_id, "error", "command queue full");
+                }
+            }
+            "l2cap_flood" => {
+                let mac = match root.get("mac").and_then(|m| m.as_str()) {
+                    Some(m) => m.to_string(),
+                    None => {
+                        self.send_response(req_id, "error", "missing mac");
+                        return;
+                    }
+                };
+                let count = root.get("count").and_then(|c| c.as_u64()).unwrap_or(10) as u32;
+                let hold_secs = root.get("hold_secs").and_then(|h| h.as_u64()).unwrap_or(30) as u32;
+                let psm = root.get("psm").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+
+                let command = ControlCommand::L2capFlood {
+                    mac: mac.clone(),
+                    count,
+                    hold_secs,
+                    psm,
+                    req_id: req_id.map(|s| s.to_string()),
+                };
+                if self.cmd_tx.try_send(command).is_ok() {
+                    self.send_response(req_id, "ok",
+                        &format!("L2CAP flood queued: {} connections to {} for {}s", count, mac, hold_secs));
                 } else {
                     self.send_response(req_id, "error", "command queue full");
                 }

