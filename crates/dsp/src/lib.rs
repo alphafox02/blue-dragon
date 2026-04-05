@@ -6,3 +6,4 @@ pub mod burst;
 pub mod pfb;
 pub mod window;
 pub mod fft;
+pub mod modulator;
