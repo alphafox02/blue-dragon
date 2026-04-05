@@ -5,6 +5,7 @@ pub mod ble_connection;
 pub mod btbb;
 pub mod crypto;
 pub mod fec;
+pub mod fuzz;
 pub mod smp;
 pub mod vuln;
 
