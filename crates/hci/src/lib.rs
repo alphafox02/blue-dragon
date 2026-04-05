@@ -45,6 +45,17 @@ pub struct GattResult {
     pub timestamp: f64,
 }
 
+/// Result of a GATT write operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GattWriteResult {
+    pub mac: String,
+    pub service_uuid: String,
+    pub char_uuid: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub timestamp: f64,
+}
+
 /// Check if a BLE PDU type indicates a connectable device.
 /// ADV_IND (0) and ADV_DIRECT_IND (1) are connectable.
 pub fn is_connectable(pdu_type: u8) -> bool {
@@ -108,6 +119,59 @@ impl HciProber {
                     device_name: None,
                     services: Vec::new(),
                     error: Some("GATT query timed out".to_string()),
+                    timestamp: now,
+                },
+            }
+        })
+    }
+    /// Write a value to a specific GATT characteristic.
+    /// `data` is the raw bytes to write (hex-decoded by caller).
+    /// If `service_uuid` is None, searches all services for the characteristic.
+    pub fn write_characteristic(
+        &self,
+        mac: &str,
+        service_uuid: Option<&str>,
+        char_uuid: &str,
+        data: &[u8],
+    ) -> GattWriteResult {
+        let mac_owned = mac.to_string();
+        let char_uuid_owned = char_uuid.to_string();
+        let svc_uuid_owned = service_uuid.map(|s| s.to_string());
+        let data_owned = data.to_vec();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        self.rt.block_on(async {
+            match timeout(
+                GATT_TIMEOUT,
+                write_gatt_char(&mac_owned, svc_uuid_owned.as_deref(), &char_uuid_owned, &data_owned),
+            )
+            .await
+            {
+                Ok(Ok(svc)) => GattWriteResult {
+                    mac: mac_owned,
+                    service_uuid: svc,
+                    char_uuid: char_uuid_owned,
+                    success: true,
+                    error: None,
+                    timestamp: now,
+                },
+                Ok(Err(e)) => GattWriteResult {
+                    mac: mac_owned,
+                    service_uuid: svc_uuid_owned.unwrap_or_default(),
+                    char_uuid: char_uuid_owned,
+                    success: false,
+                    error: Some(e),
+                    timestamp: now,
+                },
+                Err(_) => GattWriteResult {
+                    mac: mac_owned,
+                    service_uuid: svc_uuid_owned.unwrap_or_default(),
+                    char_uuid: char_uuid_owned,
+                    success: false,
+                    error: Some("GATT write timed out".to_string()),
                     timestamp: now,
                 },
             }
@@ -441,4 +505,126 @@ async fn discover_gatt(mac: &str) -> Result<GattResult, String> {
         error: None,
         timestamp: 0.0,
     })
+}
+
+/// Write a value to a specific GATT characteristic.
+/// Returns the service UUID that contained the characteristic.
+async fn write_gatt_char(
+    mac: &str,
+    service_uuid: Option<&str>,
+    char_uuid: &str,
+    data: &[u8],
+) -> Result<String, String> {
+    let addr: Address = mac
+        .parse()
+        .map_err(|e| format!("invalid MAC '{}': {}", mac, e))?;
+
+    let session = Session::new()
+        .await
+        .map_err(|e| format!("BlueZ session error: {}", e))?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .map_err(|e| format!("no HCI adapter: {}", e))?;
+
+    // Start discovery to ensure BlueZ knows about the device
+    let _disco = adapter
+        .discover_devices()
+        .await
+        .map_err(|e| format!("discovery error: {}", e))?;
+
+    // Wait briefly for the device to appear
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let device = adapter
+        .device(addr)
+        .map_err(|e| format!("device {} not found: {}", mac, e))?;
+
+    let was_connected = device.is_connected().await.unwrap_or(false);
+    if !was_connected {
+        timeout(CONNECT_TIMEOUT, device.connect())
+            .await
+            .map_err(|_| format!("connect to {} timed out", mac))?
+            .map_err(|e| format!("connect to {} failed: {}", mac, e))?;
+    }
+
+    // Wait for service resolution
+    for _ in 0..50 {
+        if device.is_services_resolved().await.unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let target_char_uuid: bluer::Uuid = char_uuid
+        .parse()
+        .map_err(|e| format!("invalid characteristic UUID '{}': {}", char_uuid, e))?;
+
+    let target_svc_uuid: Option<bluer::Uuid> = if let Some(s) = service_uuid {
+        Some(s.parse().map_err(|e| format!("invalid service UUID '{}': {}", s, e))?)
+    } else {
+        None
+    };
+
+    // Search services for the target characteristic
+    let svc_list = device
+        .services()
+        .await
+        .map_err(|e| format!("failed to enumerate services: {}", e))?;
+
+    for svc in &svc_list {
+        let svc_uuid_val = match svc.uuid().await {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        // Filter by service UUID if specified
+        if let Some(ref target) = target_svc_uuid {
+            if svc_uuid_val != *target {
+                continue;
+            }
+        }
+
+        if let Ok(chars) = svc.characteristics().await {
+            for ch in &chars {
+                let ch_uuid_val = match ch.uuid().await {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                if ch_uuid_val != target_char_uuid {
+                    continue;
+                }
+
+                // Found the characteristic -- attempt write
+                let flags = ch.flags().await.unwrap_or_default();
+                if flags.write || flags.write_without_response {
+                    ch.write(data)
+                        .await
+                        .map_err(|e| format!("write failed: {}", e))?;
+                } else {
+                    if !was_connected {
+                        let _ = device.disconnect().await;
+                    }
+                    return Err(format!(
+                        "characteristic {} does not support write (flags: {:?})",
+                        char_uuid,
+                        flags_to_strings(&flags)
+                    ));
+                }
+
+                if !was_connected {
+                    let _ = device.disconnect().await;
+                }
+                return Ok(svc_uuid_val.to_string());
+            }
+        }
+    }
+
+    if !was_connected {
+        let _ = device.disconnect().await;
+    }
+    Err(format!(
+        "characteristic {} not found on device {}",
+        char_uuid, mac
+    ))
 }

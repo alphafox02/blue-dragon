@@ -1587,6 +1587,37 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                                         ControlCommand::QueryGatt { .. } => {
                                             eprintln!("C2: GATT query ignored (compiled without hci feature)");
                                         }
+                                        #[cfg(feature = "hci")]
+                                        ControlCommand::WriteGatt { mac, char_uuid, service_uuid, data, req_id: _ } => {
+                                            if let Some(ref prober) = dispatch_hci {
+                                                eprintln!("C2: GATT write {} bytes to {} on {}",
+                                                    data.len(), char_uuid, mac);
+                                                let result = prober.write_characteristic(
+                                                    &mac,
+                                                    service_uuid.as_deref(),
+                                                    &char_uuid,
+                                                    &data,
+                                                );
+                                                if result.success {
+                                                    eprintln!("C2: GATT write success on {} (svc {})",
+                                                        mac, result.service_uuid);
+                                                } else {
+                                                    eprintln!("C2: GATT write failed on {}: {}",
+                                                        mac, result.error.as_deref().unwrap_or("unknown"));
+                                                }
+                                                if let Some(ref pub_socket) = gatt_zmq_pub {
+                                                    if let Ok(val) = serde_json::to_value(&result) {
+                                                        pub_socket.send_gatt(&val);
+                                                    }
+                                                }
+                                            } else {
+                                                eprintln!("C2: GATT write for {} ignored (no HCI adapter)", mac);
+                                            }
+                                        }
+                                        #[cfg(not(feature = "hci"))]
+                                        ControlCommand::WriteGatt { .. } => {
+                                            eprintln!("C2: GATT write ignored (compiled without hci feature)");
+                                        }
                                     },
                                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
                                     Err(_) => break,
