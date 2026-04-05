@@ -6,6 +6,7 @@ pub mod btbb;
 pub mod crypto;
 pub mod fec;
 pub mod smp;
+pub mod vuln;
 
 /// Frequency in MHz to BLE channel number mapping
 pub fn freq_to_channel(freq_mhz: u32) -> u32 {
