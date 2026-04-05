@@ -93,6 +93,7 @@ pub fn run_file(
     let aa_correlator_2m = AaCorrelator::with_sps(1); // LE 2M: SPS=1
     let syndrome_map = SyndromeMap::new(1);
     let mut conn_table = ConnectionTable::new();
+    let mut smp_parser = bd_protocol::smp::SmpParser::new();
 
     // Initialize DSP -- Type 2 PFB matching C code (semi_len m=4)
     let semi_len = 4;
@@ -320,6 +321,23 @@ pub fn run_file(
                                     conn_table.parse_connect_ind(&p, burst_ts.tv_sec);
                                 }
 
+                                // Parse SMP from data channel packets
+                                if p.aa != ble::BLE_ADV_AA && p.crc_valid && p.is_data {
+                                    if let Some((cid, payload)) = bd_protocol::smp::extract_l2cap(&p.data) {
+                                        for event in smp_parser.parse_l2cap(p.aa, cid, payload, true) {
+                                            match &event {
+                                                bd_protocol::smp::SmpEvent::WeakPairing { aa, reason } => {
+                                                    eprintln!("SMP WARNING: 0x{:08X}: {}", aa, reason);
+                                                }
+                                                bd_protocol::smp::SmpEvent::LtkDistributed { aa, .. } => {
+                                                    eprintln!("SMP: 0x{:08X} LTK captured", aa);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Track CRC stats
                                 if p.crc_checked {
                                     total_crc += 1;
@@ -430,6 +448,7 @@ fn process_burst(
     aa_correlator_2m: &AaCorrelator,
     syndrome_map: &SyndromeMap,
     conn_table: &mut ConnectionTable,
+    smp_parser: &mut bd_protocol::smp::SmpParser,
     pcap_writer: &mut Option<PcapWriter<BufWriter<File>>>,
     #[cfg(feature = "zmq")] zmq_pub: &Option<bd_output::zmq_pub::ZmqPublisher>,
     gps_fix: Option<&bd_output::pcap::GpsFix>,
@@ -650,6 +669,36 @@ fn process_burst(
 
         if p.aa == ble::BLE_ADV_AA && p.crc_valid {
             conn_table.parse_connect_ind(&p, burst_ts.tv_sec);
+        }
+
+        // Parse SMP from data channel packets (non-advertising AA with valid CRC)
+        if p.aa != ble::BLE_ADV_AA && p.crc_valid && p.is_data {
+            if let Some((l2cap_cid, l2cap_payload)) = bd_protocol::smp::extract_l2cap(&p.data) {
+                // Direction: assume central is the initiator for now
+                // (proper direction tracking requires connection role from CONNECT_IND)
+                let from_central = true;
+                let smp_events = smp_parser.parse_l2cap(p.aa, l2cap_cid, l2cap_payload, from_central);
+                for event in &smp_events {
+                    match event {
+                        bd_protocol::smp::SmpEvent::FeaturesExchanged { aa, method, security, .. } => {
+                            eprintln!("SMP: connection 0x{:08X} pairing {:?} ({:?})", aa, method, security);
+                        }
+                        bd_protocol::smp::SmpEvent::WeakPairing { aa, reason } => {
+                            eprintln!("SMP WARNING: connection 0x{:08X}: {}", aa, reason);
+                        }
+                        bd_protocol::smp::SmpEvent::LtkDistributed { aa, .. } => {
+                            eprintln!("SMP: connection 0x{:08X} LTK captured", aa);
+                        }
+                        bd_protocol::smp::SmpEvent::IrkDistributed { aa, .. } => {
+                            eprintln!("SMP: connection 0x{:08X} IRK captured", aa);
+                        }
+                        bd_protocol::smp::SmpEvent::PairingFailed { aa, reason } => {
+                            eprintln!("SMP: connection 0x{:08X} pairing failed (reason {})", aa, reason);
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
         // Debug: show ADV_EXT_IND packets with AuxPtr to find coded secondary channel
@@ -900,6 +949,7 @@ fn spawn_parallel_pipeline(
         let aa_correlator_2m = aa_correlator_2m;
         let syndrome_map = syndrome_map;
         let mut conn_table = conn_table;
+        let mut smp_parser = bd_protocol::smp::SmpParser::new();
         let mut pcap_writer = pcap_writer;
 
         std::thread::Builder::new()
@@ -943,6 +993,7 @@ fn spawn_parallel_pipeline(
                         &aa_correlator_2m,
                         &syndrome_map,
                         &mut conn_table,
+                        &mut smp_parser,
                         &mut pcap_writer,
                         #[cfg(feature = "zmq")]
                         &zmq_pub,
