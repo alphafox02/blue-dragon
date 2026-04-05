@@ -27,6 +27,11 @@ struct Cli {
     #[arg(long, default_value = "ci16")]
     format: String,
 
+    /// Sample rate for file input (Hz, e.g. 100000000 for 100 Msps).
+    /// Overrides -C when used with -f. Accepts Hz or Msps with 'M' suffix (e.g. 100M).
+    #[arg(long)]
+    sample_rate: Option<String>,
+
     /// Center frequency in MHz
     #[arg(short = 'c', long, default_value = "2441")]
     center_freq: u32,
@@ -400,11 +405,45 @@ fn main() {
             }
         };
 
+        // --sample-rate overrides -C for file input: compute channels from rate
+        let file_channels = if let Some(ref sr) = cli.sample_rate {
+            let rate_hz: u64 = if let Some(mhz) = sr.strip_suffix('M').or_else(|| sr.strip_suffix('m')) {
+                match mhz.parse::<f64>() {
+                    Ok(m) => (m * 1_000_000.0) as u64,
+                    Err(_) => {
+                        eprintln!("invalid --sample-rate: {}", sr);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match sr.parse::<u64>() {
+                    Ok(hz) => hz,
+                    Err(_) => {
+                        eprintln!("invalid --sample-rate: {} (use Hz or e.g. 100M)", sr);
+                        std::process::exit(1);
+                    }
+                }
+            };
+            let ch = (rate_hz / 1_000_000) as usize;
+            if ch == 0 {
+                eprintln!("--sample-rate too low: {} (minimum 1 MHz)", sr);
+                std::process::exit(1);
+            }
+            if rate_hz % 1_000_000 != 0 {
+                eprintln!("WARNING: sample rate {} Hz is not an exact multiple of 1 MHz; using {} channels ({}M of {:.3}M)",
+                    rate_hz, ch, ch, rate_hz as f64 / 1_000_000.0);
+            }
+            eprintln!("file input: {} Msps -> {} channels, center {} MHz", rate_hz / 1_000_000, ch, center_freq);
+            ch
+        } else {
+            channels
+        };
+
         if let Err(e) = pipeline::run_file(
             file,
             format,
             center_freq,
-            channels,
+            file_channels,
             cli.write.as_deref(),
             cli.check_crc,
             cli.squelch,
@@ -443,28 +482,28 @@ fn main() {
             }
         });
 
-        if let Err(e) = pipeline::run_live(
+        if let Err(e) = pipeline::run_live(pipeline::LiveConfig {
             iface,
-            center_freq,
-            channels,
-            cli.gain,
-            cli.squelch,
-            cli.hackrf_lna,
-            cli.hackrf_vga,
-            cli.antenna.as_deref(),
-            cli.write.as_deref(),
-            cli.check_crc,
-            cli.stats,
+            center_freq_mhz: center_freq,
+            num_channels: channels,
+            gain: cli.gain,
+            squelch_db: cli.squelch,
+            hackrf_lna: cli.hackrf_lna,
+            hackrf_vga: cli.hackrf_vga,
+            antenna: cli.antenna.as_deref(),
+            pcap_path: cli.write.as_deref(),
+            check_crc: cli.check_crc,
+            print_stats: cli.stats,
             use_gpu,
-            cli.zmq.as_deref(),
-            cli.zmq_curve_key.as_deref(),
-            sensor_id.as_deref(),
-            cli.gpsd,
-            cli.hci,
-            cli.active_scan,
-            cli.coded_scan,
+            zmq_endpoint: cli.zmq.as_deref(),
+            zmq_curve_keyfile: cli.zmq_curve_key.as_deref(),
+            sensor_id: sensor_id.as_deref(),
+            gpsd_enabled: cli.gpsd,
+            hci_enabled: cli.hci,
+            active_scan: cli.active_scan,
+            coded_scan: cli.coded_scan,
             running,
-        ) {
+        }) {
             eprintln!("error: {}", e);
             std::process::exit(1);
         }

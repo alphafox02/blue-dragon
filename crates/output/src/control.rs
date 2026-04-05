@@ -162,7 +162,7 @@ impl ControlClient {
     }
 
     fn send_heartbeat(&self) {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let uptime = self.start_time.elapsed().as_secs();
 
         let mut hb = json!({

@@ -72,14 +72,18 @@ pub struct ZmqGpsFrame {
     pub altitude: f64,
 }
 
-/// Convert double to PPI fixed3_7 format (for lat/lon, unsigned with +180 offset)
+/// Convert double to PPI fixed3_7 format (for lat/lon, unsigned with +180 offset).
+/// Clamps to valid range to prevent garbage from corrupted GPS data.
 fn ppi_fixed3_7(val: f64) -> u32 {
-    ((val + 180.0) * 1e7) as u32
+    let clamped = val.clamp(-180.0, 180.0);
+    ((clamped + 180.0) * 1e7) as u32
 }
 
-/// Convert double to PPI fixed6_4 format (for altitude, unsigned with +180000m offset)
+/// Convert double to PPI fixed6_4 format (for altitude, unsigned with +180000m offset).
+/// Clamps to prevent underflow from invalid altitude values.
 fn ppi_fixed6_4(val: f64) -> u32 {
-    ((val + 180000.0) * 1e4) as u32
+    let clamped = val.clamp(-180000.0, 900000.0);
+    ((clamped + 180000.0) * 1e4) as u32
 }
 
 /// Write PPI header
