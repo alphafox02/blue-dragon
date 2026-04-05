@@ -21,6 +21,12 @@ pub mod aaronia;
 #[cfg(feature = "rfnm")]
 pub mod rfnm;
 
+#[cfg(feature = "whad")]
+pub mod whad;
+#[cfg(feature = "whad")]
+#[allow(clippy::all)]
+mod whad_proto;
+
 use crossbeam::channel::Sender;
 
 /// IQ sample format (shared across file, VITA 49, and other backends)

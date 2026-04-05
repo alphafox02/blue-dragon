@@ -62,6 +62,25 @@ fn link_lib(pkg_name: &str, lib_name: &str) {
 fn main() {
     add_search_paths();
 
+    // Compile WHAD protobuf definitions
+    let proto_root = "proto";
+    let proto_files = [
+        "whad/protocol/whad.proto",
+        "whad/protocol/device.proto",
+        "whad/protocol/generic.proto",
+        "whad/protocol/ble/ble.proto",
+    ];
+    let proto_paths: Vec<String> = proto_files.iter().map(|f| format!("{}/{}", proto_root, f)).collect();
+    if proto_paths.iter().all(|p| Path::new(p).exists()) {
+        prost_build::Config::new()
+            .out_dir("src/whad_proto")
+            .compile_protos(
+                &proto_paths.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                &[proto_root],
+            )
+            .expect("failed to compile WHAD proto files");
+    }
+
     #[cfg(feature = "usrp")]
     link_lib("uhd", "uhd");
 

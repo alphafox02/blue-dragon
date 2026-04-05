@@ -8,15 +8,19 @@ license.workspace = true
 crossbeam.workspace = true
 libc = "0.2"
 log.workspace = true
+prost = "0.13"
+serialport = { version = "4", optional = true }
 
 [build-dependencies]
 cc = "1"
+prost-build = "0.13"
 
 [features]
 default = ["usrp"]
 hackrf = []
 bladerf = []
 usrp = []
+whad = ["dep:serialport"]
 soapysdr = []
 aaronia = []
 rfnm = []
