@@ -85,6 +85,15 @@ impl ZmqPublisher {
         let _ = self.socket.send(json_bytes.as_bytes(), zmq::DONTWAIT);
     }
 
+    /// Publish an SMP pairing event as JSON on the "smp:" topic.
+    pub fn send_smp(&self, event_json: &str) {
+        let _ = self.socket.send("smp:", zmq::DONTWAIT | zmq::SNDMORE);
+        if let Some(ref id) = self.sensor_id {
+            let _ = self.socket.send(id.as_bytes(), zmq::DONTWAIT | zmq::SNDMORE);
+        }
+        let _ = self.socket.send(event_json.as_bytes(), zmq::DONTWAIT);
+    }
+
     /// Publish an active-scan result as JSON on the "scan:" topic.
     pub fn send_scan(&self, result: &serde_json::Value) {
         let _ = self.socket.send("scan:", zmq::DONTWAIT | zmq::SNDMORE);

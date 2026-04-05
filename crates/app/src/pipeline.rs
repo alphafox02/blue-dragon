@@ -93,6 +93,7 @@ pub fn run_file(
     let aa_correlator_2m = AaCorrelator::with_sps(1); // LE 2M: SPS=1
     let syndrome_map = SyndromeMap::new(1);
     let mut conn_table = ConnectionTable::new();
+    let mut smp_parser = bd_protocol::smp::SmpParser::new();
 
     // Initialize DSP -- Type 2 PFB matching C code (semi_len m=4)
     let semi_len = 4;
@@ -320,6 +321,23 @@ pub fn run_file(
                                     conn_table.parse_connect_ind(&p, burst_ts.tv_sec);
                                 }
 
+                                // Parse SMP from data channel packets
+                                if p.aa != ble::BLE_ADV_AA && p.crc_valid && p.is_data {
+                                    if let Some((cid, payload)) = bd_protocol::smp::extract_l2cap(&p.data) {
+                                        for event in smp_parser.parse_l2cap(p.aa, cid, payload, true) {
+                                            match &event {
+                                                bd_protocol::smp::SmpEvent::WeakPairing { aa, reason } => {
+                                                    eprintln!("SMP WARNING: 0x{:08X}: {}", aa, reason);
+                                                }
+                                                bd_protocol::smp::SmpEvent::LtkDistributed { aa, .. } => {
+                                                    eprintln!("SMP: 0x{:08X} LTK captured", aa);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Track CRC stats
                                 if p.crc_checked {
                                     total_crc += 1;
@@ -430,6 +448,7 @@ fn process_burst(
     aa_correlator_2m: &AaCorrelator,
     syndrome_map: &SyndromeMap,
     conn_table: &mut ConnectionTable,
+    smp_parser: &mut bd_protocol::smp::SmpParser,
     pcap_writer: &mut Option<PcapWriter<BufWriter<File>>>,
     #[cfg(feature = "zmq")] zmq_pub: &Option<bd_output::zmq_pub::ZmqPublisher>,
     gps_fix: Option<&bd_output::pcap::GpsFix>,
@@ -650,6 +669,43 @@ fn process_burst(
 
         if p.aa == ble::BLE_ADV_AA && p.crc_valid {
             conn_table.parse_connect_ind(&p, burst_ts.tv_sec);
+        }
+
+        // Parse SMP from data channel packets (non-advertising AA with valid CRC)
+        if p.aa != ble::BLE_ADV_AA && p.crc_valid && p.is_data {
+            if let Some((l2cap_cid, l2cap_payload)) = bd_protocol::smp::extract_l2cap(&p.data) {
+                // Direction: assume central is the initiator for now
+                // (proper direction tracking requires connection role from CONNECT_IND)
+                let from_central = true;
+                let smp_events = smp_parser.parse_l2cap(p.aa, l2cap_cid, l2cap_payload, from_central);
+                for event in &smp_events {
+                    // Log to stderr
+                    match event {
+                        bd_protocol::smp::SmpEvent::FeaturesExchanged { aa, method, security, .. } => {
+                            eprintln!("SMP: connection 0x{:08X} pairing {:?} ({:?})", aa, method, security);
+                        }
+                        bd_protocol::smp::SmpEvent::WeakPairing { aa, reason } => {
+                            eprintln!("SMP WARNING: connection 0x{:08X}: {}", aa, reason);
+                        }
+                        bd_protocol::smp::SmpEvent::LtkDistributed { aa, .. } => {
+                            eprintln!("SMP: connection 0x{:08X} LTK captured", aa);
+                        }
+                        bd_protocol::smp::SmpEvent::IrkDistributed { aa, .. } => {
+                            eprintln!("SMP: connection 0x{:08X} IRK captured", aa);
+                        }
+                        bd_protocol::smp::SmpEvent::PairingFailed { aa, reason } => {
+                            eprintln!("SMP: connection 0x{:08X} pairing failed (reason {})", aa, reason);
+                        }
+                        _ => {}
+                    }
+                    // Stream to dashboard via ZMQ
+                    #[cfg(feature = "zmq")]
+                    if let Some(ref pub_socket) = zmq_pub {
+                        let json = format_smp_event(event);
+                        pub_socket.send_smp(&json);
+                    }
+                }
+            }
         }
 
         // Debug: show ADV_EXT_IND packets with AuxPtr to find coded secondary channel
@@ -900,6 +956,7 @@ fn spawn_parallel_pipeline(
         let aa_correlator_2m = aa_correlator_2m;
         let syndrome_map = syndrome_map;
         let mut conn_table = conn_table;
+        let mut smp_parser = bd_protocol::smp::SmpParser::new();
         let mut pcap_writer = pcap_writer;
 
         std::thread::Builder::new()
@@ -943,6 +1000,7 @@ fn spawn_parallel_pipeline(
                         &aa_correlator_2m,
                         &syndrome_map,
                         &mut conn_table,
+                        &mut smp_parser,
                         &mut pcap_writer,
                         #[cfg(feature = "zmq")]
                         &zmq_pub,
@@ -1027,6 +1085,54 @@ fn spawn_parallel_pipeline(
 
 /// Broadcast a batch to all worker threads.
 #[inline]
+/// Format an SMP event as a JSON string for ZMQ streaming.
+fn format_smp_event(event: &bd_protocol::smp::SmpEvent) -> String {
+    use bd_protocol::smp::SmpEvent;
+    match event {
+        SmpEvent::PairingStarted { aa } => {
+            format!(r#"{{"event":"pairing_started","aa":"0x{:08X}"}}"#, aa)
+        }
+        SmpEvent::FeaturesExchanged { aa, method, security, initiator, responder } => {
+            format!(
+                r#"{{"event":"features_exchanged","aa":"0x{:08X}","method":"{:?}","security":"{:?}","init_io":"{}","resp_io":"{}"}}"#,
+                aa, method, security,
+                initiator.io_capability_str(), responder.io_capability_str()
+            )
+        }
+        SmpEvent::WeakPairing { aa, reason } => {
+            format!(r#"{{"event":"weak_pairing","aa":"0x{:08X}","reason":"{}"}}"#, aa, reason.replace('"', "'"))
+        }
+        SmpEvent::LtkDistributed { aa, ltk } => {
+            let hex: String = ltk.iter().map(|b| format!("{:02x}", b)).collect();
+            format!(r#"{{"event":"ltk_distributed","aa":"0x{:08X}","ltk":"{}"}}"#, aa, hex)
+        }
+        SmpEvent::IrkDistributed { aa, irk } => {
+            let hex: String = irk.iter().map(|b| format!("{:02x}", b)).collect();
+            format!(r#"{{"event":"irk_distributed","aa":"0x{:08X}","irk":"{}"}}"#, aa, hex)
+        }
+        SmpEvent::CsrkDistributed { aa, csrk } => {
+            let hex: String = csrk.iter().map(|b| format!("{:02x}", b)).collect();
+            format!(r#"{{"event":"csrk_distributed","aa":"0x{:08X}","csrk":"{}"}}"#, aa, hex)
+        }
+        SmpEvent::IdentityAddress { aa, addr_type, addr } => {
+            let mac: String = addr.iter().rev().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":");
+            format!(r#"{{"event":"identity_address","aa":"0x{:08X}","addr_type":{},"addr":"{}"}}"#, aa, addr_type, mac)
+        }
+        SmpEvent::PairingFailed { aa, reason } => {
+            format!(r#"{{"event":"pairing_failed","aa":"0x{:08X}","reason":{}}}"#, aa, reason)
+        }
+        SmpEvent::PairingConfirm { aa, from_initiator, .. } => {
+            format!(r#"{{"event":"pairing_confirm","aa":"0x{:08X}","from_initiator":{}}}"#, aa, from_initiator)
+        }
+        SmpEvent::PairingRandom { aa, from_initiator, .. } => {
+            format!(r#"{{"event":"pairing_random","aa":"0x{:08X}","from_initiator":{}}}"#, aa, from_initiator)
+        }
+        SmpEvent::PublicKey { aa, from_initiator } => {
+            format!(r#"{{"event":"public_key","aa":"0x{:08X}","from_initiator":{}}}"#, aa, from_initiator)
+        }
+    }
+}
+
 fn broadcast_batch(
     txs: &[channel::Sender<BatchMsg>],
     data: Vec<f32>,
@@ -1485,6 +1591,10 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
             {
                 let mut s = hb_state.lock().unwrap_or_else(|e| e.into_inner());
                 s.gain = gain;
+                if sdr_type == SdrType::HackRf {
+                    s.hackrf_lna = Some(hackrf_lna);
+                    s.hackrf_vga = Some(hackrf_vga);
+                }
                 s.squelch = squelch_db;
             }
 
@@ -1545,11 +1655,17 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                             while disp_running.load(Ordering::Relaxed) {
                                 match cmd_rx.recv_timeout(std::time::Duration::from_secs(1)) {
                                     Ok(cmd) => match cmd {
-                                        ControlCommand::SetGain { gain, lna: _, vga: _, req_id: _ } => {
+                                        ControlCommand::SetGain { gain, lna, vga, req_id: _ } => {
                                             // Store gain * 10 as integer
                                             gp.store((gain * 10.0) as i32, Ordering::Relaxed);
                                             if let Ok(mut s) = hb.lock() {
                                                 s.gain = gain;
+                                                if let Some(l) = lna {
+                                                    s.hackrf_lna = Some(l as u32);
+                                                }
+                                                if let Some(v) = vga {
+                                                    s.hackrf_vga = Some(v as u32);
+                                                }
                                             }
                                             eprintln!("C2: gain set to {:.1} dB", gain);
                                         }
