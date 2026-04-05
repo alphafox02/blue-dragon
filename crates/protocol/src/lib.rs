@@ -3,6 +3,7 @@
 pub mod ble;
 pub mod ble_connection;
 pub mod btbb;
+pub mod crypto;
 pub mod fec;
 pub mod smp;
 
