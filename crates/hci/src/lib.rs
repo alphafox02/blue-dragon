@@ -1,5 +1,7 @@
 // Copyright 2025-2026 CEMAXECUTER LLC
 
+pub mod relay;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
