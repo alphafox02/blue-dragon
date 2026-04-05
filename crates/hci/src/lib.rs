@@ -180,6 +180,157 @@ impl HciProber {
 }
 
 // ---------------------------------------------------------------------------
+// Advertisement spoofing
+// ---------------------------------------------------------------------------
+
+/// Configuration for a spoofed BLE advertisement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpoofAdvConfig {
+    /// Local name to advertise
+    pub name: Option<String>,
+    /// Manufacturer data: company_id -> raw bytes
+    pub manufacturer_data: HashMap<u16, Vec<u8>>,
+    /// Service UUIDs to advertise
+    pub service_uuids: Vec<String>,
+    /// Service data: UUID -> raw bytes
+    pub service_data: HashMap<String, Vec<u8>>,
+    /// TX power level to include
+    pub tx_power: Option<i16>,
+    /// Whether to advertise as connectable (peripheral) vs broadcast
+    pub connectable: bool,
+    /// Duration in seconds (0 = until stopped)
+    pub duration_secs: u32,
+}
+
+/// Result of a spoof operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpoofAdvResult {
+    pub success: bool,
+    pub error: Option<String>,
+    pub duration_secs: u32,
+    pub timestamp: f64,
+}
+
+/// Spoof a BLE advertisement using the system HCI adapter.
+/// Blocks for the specified duration, then stops advertising.
+pub fn spoof_advertisement(config: &SpoofAdvConfig) -> SpoofAdvResult {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return SpoofAdvResult {
+                success: false,
+                error: Some(format!("runtime error: {}", e)),
+                duration_secs: 0,
+                timestamp: now_ts(),
+            };
+        }
+    };
+
+    rt.block_on(async {
+        match run_spoof_adv(config).await {
+            Ok(duration) => SpoofAdvResult {
+                success: true,
+                error: None,
+                duration_secs: duration,
+                timestamp: now_ts(),
+            },
+            Err(e) => SpoofAdvResult {
+                success: false,
+                error: Some(e),
+                duration_secs: 0,
+                timestamp: now_ts(),
+            },
+        }
+    })
+}
+
+async fn run_spoof_adv(config: &SpoofAdvConfig) -> Result<u32, String> {
+    use bluer::adv;
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+
+    let session = Session::new()
+        .await
+        .map_err(|e| format!("BlueZ session error: {}", e))?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .map_err(|e| format!("no HCI adapter: {}", e))?;
+
+    if !adapter.is_powered().await.unwrap_or(false) {
+        return Err("HCI adapter not powered".into());
+    }
+
+    // Build the advertisement
+    let mut adv = adv::Advertisement {
+        advertisement_type: if config.connectable {
+            adv::Type::Peripheral
+        } else {
+            adv::Type::Broadcast
+        },
+        local_name: config.name.clone(),
+        ..Default::default()
+    };
+
+    // Service UUIDs
+    for uuid_str in &config.service_uuids {
+        if let Ok(uuid) = uuid_str.parse::<bluer::Uuid>() {
+            adv.service_uuids.insert(uuid);
+        }
+    }
+
+    // Manufacturer data
+    for (&company_id, data) in &config.manufacturer_data {
+        adv.manufacturer_data.insert(company_id, data.clone());
+    }
+
+    // Service data
+    for (uuid_str, data) in &config.service_data {
+        if let Ok(uuid) = uuid_str.parse::<bluer::Uuid>() {
+            adv.service_data.insert(uuid, data.clone());
+        }
+    }
+
+    // TX power
+    if let Some(tx) = config.tx_power {
+        adv.tx_power = Some(tx);
+    }
+
+    // Register the advertisement (starts broadcasting)
+    let handle = adapter
+        .advertise(adv)
+        .await
+        .map_err(|e| format!("failed to start advertising: {}", e))?;
+
+    eprintln!("HCI spoof: advertising started (connectable={})", config.connectable);
+
+    let duration = config.duration_secs;
+    if duration > 0 {
+        tokio::time::sleep(Duration::from_secs(duration as u64)).await;
+    } else {
+        // Run until adapter is powered off or process exits
+        // For C2-controlled operation, this would be cancelled externally
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+
+    // Dropping the handle stops advertising
+    drop(handle);
+    eprintln!("HCI spoof: advertising stopped");
+
+    Ok(duration)
+}
+
+fn now_ts() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+// ---------------------------------------------------------------------------
 // Active scanner (--active-scan)
 // ---------------------------------------------------------------------------
 

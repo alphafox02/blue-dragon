@@ -50,6 +50,13 @@ pub enum ControlCommand {
         data: Vec<u8>,
         req_id: Option<String>,
     },
+    SpoofAdv {
+        name: Option<String>,
+        service_uuids: Vec<String>,
+        connectable: bool,
+        duration_secs: u32,
+        req_id: Option<String>,
+    },
 }
 
 /// Shared state for heartbeat reporting.
@@ -375,6 +382,33 @@ impl ControlClient {
                 };
                 if self.cmd_tx.try_send(command).is_ok() {
                     self.send_response(req_id, "ok", &format!("GATT write queued for {}", mac));
+                } else {
+                    self.send_response(req_id, "error", "command queue full");
+                }
+            }
+            "spoof_adv" => {
+                let name = root.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+                let connectable = root.get("connectable").and_then(|c| c.as_bool()).unwrap_or(false);
+                let duration = root.get("duration").and_then(|d| d.as_u64()).unwrap_or(30) as u32;
+                let service_uuids: Vec<String> = root
+                    .get("service_uuids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let command = ControlCommand::SpoofAdv {
+                    name,
+                    service_uuids,
+                    connectable,
+                    duration_secs: duration,
+                    req_id: req_id.map(|s| s.to_string()),
+                };
+                if self.cmd_tx.try_send(command).is_ok() {
+                    self.send_response(req_id, "ok", &format!("spoof advertisement queued ({}s)", duration));
                 } else {
                     self.send_response(req_id, "error", "command queue full");
                 }

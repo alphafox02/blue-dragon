@@ -1734,6 +1734,35 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                                         ControlCommand::WriteGatt { .. } => {
                                             eprintln!("C2: GATT write ignored (compiled without hci feature)");
                                         }
+                                        #[cfg(feature = "hci")]
+                                        ControlCommand::SpoofAdv { name, service_uuids, connectable, duration_secs, req_id: _ } => {
+                                            eprintln!("C2: spoof advertisement (name={:?}, connectable={}, {}s)",
+                                                name, connectable, duration_secs);
+                                            let config = bd_hci::SpoofAdvConfig {
+                                                name,
+                                                manufacturer_data: std::collections::HashMap::new(),
+                                                service_uuids,
+                                                service_data: std::collections::HashMap::new(),
+                                                tx_power: None,
+                                                connectable,
+                                                duration_secs,
+                                            };
+                                            // Run in a separate thread to not block C2 dispatch
+                                            std::thread::Builder::new()
+                                                .name("spoof-adv".to_string())
+                                                .spawn(move || {
+                                                    let result = bd_hci::spoof_advertisement(&config);
+                                                    if !result.success {
+                                                        eprintln!("C2: spoof failed: {}",
+                                                            result.error.unwrap_or_default());
+                                                    }
+                                                })
+                                                .ok();
+                                        }
+                                        #[cfg(not(feature = "hci"))]
+                                        ControlCommand::SpoofAdv { .. } => {
+                                            eprintln!("C2: spoof ignored (compiled without hci feature)");
+                                        }
                                     },
                                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
                                     Err(_) => break,
