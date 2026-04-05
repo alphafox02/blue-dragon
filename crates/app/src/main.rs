@@ -482,28 +482,28 @@ fn main() {
             }
         });
 
-        if let Err(e) = pipeline::run_live(
+        if let Err(e) = pipeline::run_live(pipeline::LiveConfig {
             iface,
-            center_freq,
-            channels,
-            cli.gain,
-            cli.squelch,
-            cli.hackrf_lna,
-            cli.hackrf_vga,
-            cli.antenna.as_deref(),
-            cli.write.as_deref(),
-            cli.check_crc,
-            cli.stats,
+            center_freq_mhz: center_freq,
+            num_channels: channels,
+            gain: cli.gain,
+            squelch_db: cli.squelch,
+            hackrf_lna: cli.hackrf_lna,
+            hackrf_vga: cli.hackrf_vga,
+            antenna: cli.antenna.as_deref(),
+            pcap_path: cli.write.as_deref(),
+            check_crc: cli.check_crc,
+            print_stats: cli.stats,
             use_gpu,
-            cli.zmq.as_deref(),
-            cli.zmq_curve_key.as_deref(),
-            sensor_id.as_deref(),
-            cli.gpsd,
-            cli.hci,
-            cli.active_scan,
-            cli.coded_scan,
+            zmq_endpoint: cli.zmq.as_deref(),
+            zmq_curve_keyfile: cli.zmq_curve_key.as_deref(),
+            sensor_id: sensor_id.as_deref(),
+            gpsd_enabled: cli.gpsd,
+            hci_enabled: cli.hci,
+            active_scan: cli.active_scan,
+            coded_scan: cli.coded_scan,
             running,
-        ) {
+        }) {
             eprintln!("error: {}", e);
             std::process::exit(1);
         }

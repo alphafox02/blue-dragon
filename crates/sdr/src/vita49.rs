@@ -50,12 +50,7 @@ const CIF_FIELDS: &[(u32, u32)] = &[
     (CIF_DATA_FORMAT, 2), // data packet payload format
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum IqFormat {
-    Ci8,
-    Ci16,
-    Cf32,
-}
+use crate::IqFormat;
 
 pub struct Vita49Handle {
     sock: UdpSocket,
@@ -499,33 +494,8 @@ fn parse_data_format(fmt_word1: u32) -> Option<IqFormat> {
     }
 }
 
-/// Convert CI8 payload into dst. Returns number of i16 values written.
-fn convert_ci8_into(payload: &[u8], dst: &mut [i16]) -> usize {
-    let n = payload.len().min(dst.len());
-    for i in 0..n {
-        dst[i] = (payload[i] as i8 as i16) << 8;
-    }
-    n
-}
-
-/// Convert big-endian CI16 payload into dst. Returns number of i16 values written.
-fn convert_ci16_be_into(payload: &[u8], dst: &mut [i16]) -> usize {
-    let max = dst.len().min(payload.len() / 2);
-    for (i, chunk) in payload.chunks_exact(2).take(max).enumerate() {
-        dst[i] = i16::from_be_bytes([chunk[0], chunk[1]]);
-    }
-    max
-}
-
-/// Convert big-endian CF32 payload into dst. Returns number of i16 values written.
-fn convert_cf32_be_into(payload: &[u8], dst: &mut [i16]) -> usize {
-    let max = dst.len().min(payload.len() / 4);
-    for (i, chunk) in payload.chunks_exact(4).take(max).enumerate() {
-        let f = f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        dst[i] = (f * 32767.0).clamp(-32768.0, 32767.0) as i16;
-    }
-    max
-}
+// IQ conversion: delegate to shared crate::convert functions
+use crate::convert::{ci8_to_i16 as convert_ci8_into, ci16_be_to_i16 as convert_ci16_be_into, cf32_be_to_i16 as convert_cf32_be_into};
 
 fn read_be32(data: &[u8], word_offset: usize) -> u32 {
     let off = word_offset * 4;

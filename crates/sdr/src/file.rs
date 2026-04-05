@@ -6,16 +6,8 @@ use std::path::Path;
 use crossbeam::channel::Sender;
 use crate::{SampleBuf, SdrSource};
 
-/// IQ sample format for file input
-#[derive(Debug, Clone, Copy)]
-pub enum SampleFormat {
-    /// Complex int8 (CS8): pairs of i8
-    Ci8,
-    /// Complex int16 (CS16): pairs of i16, little-endian
-    Ci16,
-    /// Complex float32 (CF32): pairs of f32, little-endian
-    Cf32,
-}
+/// IQ sample format for file input (alias for shared IqFormat)
+pub type SampleFormat = crate::IqFormat;
 
 /// IQ file reader: reads samples from a file and sends them as SampleBuf blocks.
 pub struct FileSource {

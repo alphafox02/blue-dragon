@@ -1043,24 +1043,50 @@ fn broadcast_batch(
     }
 }
 
+/// SDR backend type, detected from interface string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SdrType {
+    Vita49,
+    Usrp,
+    HackRf,
+    BladeRf,
+    SoapySdr,
+    Aaronia,
+    Rfnm,
+}
+
+impl std::fmt::Display for SdrType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SdrType::Vita49 => write!(f, "vita49"),
+            SdrType::Usrp => write!(f, "usrp"),
+            SdrType::HackRf => write!(f, "hackrf"),
+            SdrType::BladeRf => write!(f, "bladerf"),
+            SdrType::SoapySdr => write!(f, "soapysdr"),
+            SdrType::Aaronia => write!(f, "aaronia"),
+            SdrType::Rfnm => write!(f, "rfnm"),
+        }
+    }
+}
+
 /// Detect SDR backend type from interface string.
-fn detect_sdr_type(iface: &str) -> &str {
+fn detect_sdr_type(iface: &str) -> SdrType {
     if iface.starts_with("vita49") {
-        "vita49"
+        SdrType::Vita49
     } else if iface.starts_with("usrp") {
-        "usrp"
+        SdrType::Usrp
     } else if iface.starts_with("hackrf") {
-        "hackrf"
+        SdrType::HackRf
     } else if iface.starts_with("bladerf") {
-        "bladerf"
+        SdrType::BladeRf
     } else if iface.starts_with("soapy") {
-        "soapysdr"
+        SdrType::SoapySdr
     } else if iface.starts_with("aaronia") {
-        "aaronia"
+        SdrType::Aaronia
     } else if iface.starts_with("rfnm") {
-        "rfnm"
+        SdrType::Rfnm
     } else {
-        "usrp" // default
+        SdrType::Usrp // default
     }
 }
 
@@ -1189,50 +1215,51 @@ fn open_sdr_handle(
 ) -> Result<SdrHandle, String> {
     let sdr_type = detect_sdr_type(iface);
     match sdr_type {
-        "vita49" => {
+        SdrType::Vita49 => {
             let h = bd_sdr::vita49::Vita49Handle::open(iface, sample_rate, center_freq_hz, gain)?;
             Ok(SdrHandle::Vita49(h))
         }
         #[cfg(feature = "usrp")]
-        "usrp" => {
+        SdrType::Usrp => {
             let h = bd_sdr::usrp::UsrpHandle::open(iface, sample_rate, center_freq_hz, gain, antenna)?;
             Ok(SdrHandle::Usrp(h))
         }
         #[cfg(feature = "hackrf")]
-        "hackrf" => {
+        SdrType::HackRf => {
             let h = bd_sdr::hackrf::HackrfHandle::open(
                 iface, sample_rate, center_freq_hz, hackrf_lna, hackrf_vga,
             )?;
             Ok(SdrHandle::HackRf(h))
         }
         #[cfg(feature = "bladerf")]
-        "bladerf" => {
+        SdrType::BladeRf => {
             let h = bd_sdr::bladerf::BladerfHandle::open(
                 iface, sample_rate, center_freq_hz, gain as i32, antenna,
             )?;
             Ok(SdrHandle::BladeRf(h))
         }
         #[cfg(feature = "soapysdr")]
-        "soapysdr" => {
+        SdrType::SoapySdr => {
             let h = bd_sdr::soapysdr::SoapyHandle::open(
                 iface, sample_rate, center_freq_hz, gain,
             )?;
             Ok(SdrHandle::Soapy(h))
         }
         #[cfg(feature = "aaronia")]
-        "aaronia" => {
+        SdrType::Aaronia => {
             let h = bd_sdr::aaronia::AaroniaHandle::open(
                 iface, sample_rate, center_freq_hz, gain, antenna,
             )?;
             Ok(SdrHandle::Aaronia(h))
         }
         #[cfg(feature = "rfnm")]
-        "rfnm" => {
+        SdrType::Rfnm => {
             let h = bd_sdr::rfnm::RfnmHandle::open(
                 iface, sample_rate, center_freq_hz, gain, antenna,
             )?;
             Ok(SdrHandle::Rfnm(h))
         }
+        #[allow(unreachable_patterns)]
         _ => Err(format!(
             "unsupported SDR type '{}' (interface: '{}'). Compile with the appropriate feature flag.",
             sdr_type, iface,
@@ -1240,30 +1267,39 @@ fn open_sdr_handle(
     }
 }
 
+/// Configuration for live SDR capture.
+pub struct LiveConfig<'a> {
+    pub iface: &'a str,
+    pub center_freq_mhz: u32,
+    pub num_channels: usize,
+    pub gain: f64,
+    pub squelch_db: f32,
+    pub hackrf_lna: u32,
+    pub hackrf_vga: u32,
+    pub antenna: Option<&'a str>,
+    pub pcap_path: Option<&'a Path>,
+    pub check_crc: bool,
+    pub print_stats: bool,
+    pub use_gpu: bool,
+    pub zmq_endpoint: Option<&'a str>,
+    pub zmq_curve_keyfile: Option<&'a str>,
+    pub sensor_id: Option<&'a str>,
+    pub gpsd_enabled: bool,
+    pub hci_enabled: bool,
+    pub active_scan: bool,
+    pub coded_scan: bool,
+    pub running: Arc<AtomicBool>,
+}
+
 /// Run live SDR capture pipeline.
-#[allow(clippy::too_many_arguments)]
-pub fn run_live(
-    iface: &str,
-    center_freq_mhz: u32,
-    num_channels: usize,
-    gain: f64,
-    squelch_db: f32,
-    hackrf_lna: u32,
-    hackrf_vga: u32,
-    antenna: Option<&str>,
-    pcap_path: Option<&Path>,
-    check_crc: bool,
-    print_stats: bool,
-    use_gpu: bool,
-    zmq_endpoint: Option<&str>,
-    zmq_curve_keyfile: Option<&str>,
-    sensor_id: Option<&str>,
-    gpsd_enabled: bool,
-    hci_enabled: bool,
-    active_scan: bool,
-    coded_scan: bool,
-    running: Arc<AtomicBool>,
-) -> Result<(), String> {
+pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
+    let LiveConfig {
+        iface, center_freq_mhz, num_channels, gain, squelch_db,
+        hackrf_lna, hackrf_vga, antenna, pcap_path, check_crc,
+        print_stats, use_gpu, zmq_endpoint, zmq_curve_keyfile,
+        sensor_id, gpsd_enabled, hci_enabled, active_scan, coded_scan,
+        running,
+    } = cfg;
     let sample_rate = num_channels as u32 * 1_000_000;
     let center_freq_hz = center_freq_mhz as u64 * 1_000_000;
 
@@ -1443,7 +1479,7 @@ pub fn run_live(
 
             let hb_state = Arc::new(Mutex::new(
                 bd_output::control::HeartbeatState::new(
-                    &sid, sdr_type, center_freq_mhz, num_channels as u32,
+                    &sid, &sdr_type.to_string(), center_freq_mhz, num_channels as u32,
                 ),
             ));
             {
