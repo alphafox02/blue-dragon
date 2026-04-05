@@ -567,3 +567,221 @@ fn parse_endpoint(iface: &str) -> Result<(String, u16), String> {
         iface
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_endpoint_default() {
+        let (addr, port) = parse_endpoint("vita49").unwrap();
+        assert_eq!(addr, "0.0.0.0");
+        assert_eq!(port, DEFAULT_PORT);
+    }
+
+    #[test]
+    fn test_parse_endpoint_port_only() {
+        let (addr, port) = parse_endpoint("vita49:5000").unwrap();
+        assert_eq!(addr, "0.0.0.0");
+        assert_eq!(port, 5000);
+    }
+
+    #[test]
+    fn test_parse_endpoint_ip_port() {
+        let (addr, port) = parse_endpoint("vita49:192.168.1.100:4991").unwrap();
+        assert_eq!(addr, "192.168.1.100");
+        assert_eq!(port, 4991);
+    }
+
+    #[test]
+    fn test_parse_endpoint_invalid() {
+        assert!(parse_endpoint("vita49xyz").is_err());
+    }
+
+    #[test]
+    fn test_vrl_strip_no_wrapper() {
+        let pkt = [0x10, 0x00, 0x00, 0x04]; // VRT signal data, 4 words
+        let (off, len) = vrl_strip(&pkt);
+        assert_eq!(off, 0);
+        assert_eq!(len, 4);
+    }
+
+    #[test]
+    fn test_vrl_strip_with_wrapper() {
+        // VRLP magic + 4 bytes frame size + VRT data + 4 byte trailer
+        let mut pkt = vec![0x56, 0x52, 0x4C, 0x50]; // "VRLP"
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x10]); // frame size
+        pkt.extend_from_slice(&[0x10, 0x00, 0x00, 0x04]); // VRT header
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // trailer
+        let (off, len) = vrl_strip(&pkt);
+        assert_eq!(off, 8);
+        assert_eq!(len, 4); // 16 total - 8 header - 4 trailer = 4
+    }
+
+    #[test]
+    fn test_parse_signal_header_type0() {
+        // Type 0 (no stream ID), no class, no timestamp, 4 words total
+        let mut pkt = vec![0u8; 16]; // 4 words
+        let w0: u32 = (0x0 << 28) | 4; // type=0, size=4
+        pkt[0..4].copy_from_slice(&w0.to_be_bytes());
+        let (off, payload) = parse_signal_header(&pkt).unwrap();
+        assert_eq!(off, 4);   // 1 header word
+        assert_eq!(payload, 12); // 3 payload words
+    }
+
+    #[test]
+    fn test_parse_signal_header_type1_with_ts() {
+        // Type 1 (stream ID), TSI=1, TSF=1, 10 words total
+        let mut pkt = vec![0u8; 40]; // 10 words
+        let w0: u32 = (0x1 << 28) | (1 << 22) | (1 << 20) | 10; // type=1, tsi=1, tsf=1, size=10
+        pkt[0..4].copy_from_slice(&w0.to_be_bytes());
+        let (off, payload) = parse_signal_header(&pkt).unwrap();
+        // header: 1 (base) + 1 (stream_id) + 1 (tsi) + 2 (tsf) = 5 words = 20 bytes
+        assert_eq!(off, 20);
+        assert_eq!(payload, 20); // 5 payload words
+    }
+
+    #[test]
+    fn test_parse_signal_header_rejects_context() {
+        let mut pkt = vec![0u8; 16];
+        let w0: u32 = (0x4 << 28) | 4; // type=4 (IF context)
+        pkt[0..4].copy_from_slice(&w0.to_be_bytes());
+        assert!(parse_signal_header(&pkt).is_none());
+    }
+
+    #[test]
+    fn test_parse_context_sample_rate() {
+        // Construct a minimal IF context packet with sample rate = 40 MHz
+        // Type 4, stream_id present, CIF0 with only sample_rate bit set
+        let pkt_size_w: u32 = 5; // header(1) + stream_id(1) + cif0(1) + sample_rate(2)
+        let w0: u32 = (0x4 << 28) | pkt_size_w;
+        let stream_id: u32 = 0x12345678;
+        let cif0: u32 = CIF_SAMPLE_RATE;
+        // 40 MHz = 40_000_000 Hz, fixed-point with 20-bit fraction: 40_000_000 << 20
+        let rate_fixed: i64 = 40_000_000i64 << 20;
+
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&w0.to_be_bytes());
+        pkt.extend_from_slice(&stream_id.to_be_bytes());
+        pkt.extend_from_slice(&cif0.to_be_bytes());
+        pkt.extend_from_slice(&(rate_fixed as u64).to_be_bytes());
+
+        let ctx = parse_context(&pkt).unwrap();
+        let sr = ctx.sample_rate.unwrap();
+        assert!((sr - 40_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_parse_context_rf_freq() {
+        // RF frequency = 2441 MHz
+        let pkt_size_w: u32 = 5;
+        let w0: u32 = (0x4 << 28) | pkt_size_w;
+        let stream_id: u32 = 0;
+        let cif0: u32 = CIF_RF_REF_FREQ;
+        let freq_fixed: i64 = 2_441_000_000i64 << 20;
+
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&w0.to_be_bytes());
+        pkt.extend_from_slice(&stream_id.to_be_bytes());
+        pkt.extend_from_slice(&cif0.to_be_bytes());
+        pkt.extend_from_slice(&(freq_fixed as u64).to_be_bytes());
+
+        let ctx = parse_context(&pkt).unwrap();
+        let freq = ctx.center_freq.unwrap();
+        assert!((freq - 2_441_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_parse_data_format_ci16() {
+        // real_cpx=1 (complex), dif=0 (signed int), data_bits=16 (item_size=15)
+        let word: u32 = (1 << 29) | (0 << 24) | 15;
+        assert_eq!(parse_data_format(word), Some(IqFormat::Ci16));
+    }
+
+    #[test]
+    fn test_parse_data_format_cf32() {
+        // real_cpx=1 (complex), dif=14 (float32), data_bits=32 (item_size=31)
+        let word: u32 = (1 << 29) | (14 << 24) | 31;
+        assert_eq!(parse_data_format(word), Some(IqFormat::Cf32));
+    }
+
+    #[test]
+    fn test_parse_data_format_ci8() {
+        let word: u32 = (1 << 29) | (0 << 24) | 7;
+        assert_eq!(parse_data_format(word), Some(IqFormat::Ci8));
+    }
+
+    #[test]
+    fn test_parse_data_format_real_rejected() {
+        // real_cpx=0 (real, not complex) should be rejected
+        let word: u32 = (0 << 29) | (0 << 24) | 15;
+        assert_eq!(parse_data_format(word), None);
+    }
+
+    #[test]
+    fn test_convert_ci8_into() {
+        let payload = [0x7Fu8, 0x80, 0x00, 0xFF]; // 127, -128, 0, -1
+        let mut dst = [0i16; 4];
+        let n = convert_ci8_into(&payload, &mut dst);
+        assert_eq!(n, 4);
+        assert_eq!(dst[0], 127 << 8);   // 32512
+        assert_eq!(dst[1], -128 << 8);  // -32768
+        assert_eq!(dst[2], 0);
+        assert_eq!(dst[3], -1 << 8);    // -256
+    }
+
+    #[test]
+    fn test_convert_ci16_be_into() {
+        // Two i16 values: 0x1234 and 0xFEDC (big-endian)
+        let payload = [0x12, 0x34, 0xFE, 0xDC];
+        let mut dst = [0i16; 2];
+        let n = convert_ci16_be_into(&payload, &mut dst);
+        assert_eq!(n, 2);
+        assert_eq!(dst[0], 0x1234);
+        assert_eq!(dst[1], -292i16); // 0xFEDC as i16
+    }
+
+    #[test]
+    fn test_convert_cf32_be_into() {
+        // float32 1.0 in big-endian: 0x3F800000
+        let payload = [0x3F, 0x80, 0x00, 0x00];
+        let mut dst = [0i16; 1];
+        let n = convert_cf32_be_into(&payload, &mut dst);
+        assert_eq!(n, 1);
+        assert_eq!(dst[0], 32767); // 1.0 * 32767
+    }
+
+    #[test]
+    fn test_read_be64_signed_positive() {
+        // 40 MHz in fixed-point: 40_000_000 << 20
+        let val: i64 = 40_000_000i64 << 20;
+        let bytes = (val as u64).to_be_bytes();
+        let mut data = vec![0u8; 8];
+        data.copy_from_slice(&bytes);
+        let result = read_be64_signed(&data, 0);
+        assert_eq!(result, val);
+    }
+
+    #[test]
+    fn test_parse_context_with_preceding_fields() {
+        // Context with bandwidth (2 words) + IF ref freq (2 words) + RF ref freq (2 words)
+        // CIF0 bits: bandwidth(29) + IF_ref(28) + RF_ref(27)
+        let cif0: u32 = (1 << 29) | (1 << 28) | CIF_RF_REF_FREQ;
+        let pkt_size_w: u32 = 3 + 2 + 2 + 2; // hdr+sid+cif0 + bw + if_freq + rf_freq
+        let w0: u32 = (0x4 << 28) | pkt_size_w;
+
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&w0.to_be_bytes());         // header
+        pkt.extend_from_slice(&0u32.to_be_bytes());        // stream_id
+        pkt.extend_from_slice(&cif0.to_be_bytes());        // CIF0
+        pkt.extend_from_slice(&0u64.to_be_bytes());        // bandwidth (skip)
+        pkt.extend_from_slice(&0u64.to_be_bytes());        // IF ref freq (skip)
+        let freq_fixed: i64 = 2_402_000_000i64 << 20;
+        pkt.extend_from_slice(&(freq_fixed as u64).to_be_bytes()); // RF ref freq
+
+        let ctx = parse_context(&pkt).unwrap();
+        let freq = ctx.center_freq.unwrap();
+        assert!((freq - 2_402_000_000.0).abs() < 1.0);
+        assert!(ctx.sample_rate.is_none()); // not in CIF0
+    }
+}

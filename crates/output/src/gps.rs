@@ -77,7 +77,7 @@ impl GpsClient {
 
                                 if let (Some(lat), Some(lon)) = (lat, lon) {
                                     if lat.is_finite() && lon.is_finite() {
-                                        let mut fix = cached_bg.lock().unwrap();
+                                        let mut fix = cached_bg.lock().unwrap_or_else(|e| e.into_inner());
                                         fix.latitude = lat;
                                         fix.longitude = lon;
                                         fix.altitude = alt.filter(|a| a.is_finite()).unwrap_or(0.0);
@@ -86,7 +86,7 @@ impl GpsClient {
                                 }
                             } else {
                                 // No fix
-                                let mut fix = cached_bg.lock().unwrap();
+                                let mut fix = cached_bg.lock().unwrap_or_else(|e| e.into_inner());
                                 fix.valid = false;
                             }
                         }
@@ -103,6 +103,6 @@ impl GpsClient {
 
     /// Get the current GPS fix (cached, thread-safe).
     pub fn get_fix(&self) -> GpsFix {
-        self.cached.lock().unwrap().clone()
+        self.cached.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }

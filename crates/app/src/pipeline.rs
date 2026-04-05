@@ -134,6 +134,7 @@ pub fn run_file(
     let mut total_crc: u64 = 0;
     let mut valid_crc: u64 = 0;
     let mut total_bursts: u64 = 0;
+    let mut pcap_errors: u64 = 0;
     let stats_start = Instant::now();
     let mut last_stats = Instant::now();
 
@@ -234,7 +235,10 @@ pub fn run_file(
                         ) {
                             total_bt += 1;
                             if let Some(ref mut writer) = pcap_writer {
-                                let _ = writer.write_bt(&bt_pkt, None);
+                                if let Err(e) = writer.write_bt(&bt_pkt, None) {
+                                    if pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                                    pcap_errors += 1;
+                                }
                             }
                         } else {
                             let burst_len = fsk_result.demod.len();
@@ -326,7 +330,10 @@ pub fn run_file(
 
                                 total_ble += 1;
                                 if let Some(ref mut writer) = pcap_writer {
-                                    let _ = writer.write_ble(&p, None);
+                                    if let Err(e) = writer.write_ble(&p, None) {
+                                        if pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                                        pcap_errors += 1;
+                                    }
                                 }
                             }
                         }
@@ -456,7 +463,10 @@ fn process_burst(
             stats.total_ble += 1;
             stats.total_ble_coded += 1;
             if let Some(ref mut writer) = pcap_writer {
-                let _ = writer.write_ble(&p, gps_fix);
+                if let Err(e) = writer.write_ble(&p, gps_fix) {
+                    if stats.pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                    stats.pcap_errors += 1;
+                }
             }
             #[cfg(feature = "zmq")]
             if let Some(ref pub_socket) = zmq_pub {
@@ -515,7 +525,10 @@ fn process_burst(
                     stats.total_ble += 1;
                     stats.total_ble_coded += 1;
                     if let Some(ref mut writer) = pcap_writer {
-                        let _ = writer.write_ble(&p, gps_fix);
+                        if let Err(e) = writer.write_ble(&p, gps_fix) {
+                    if stats.pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                    stats.pcap_errors += 1;
+                }
                     }
                     #[cfg(feature = "zmq")]
                     if let Some(ref pub_socket) = zmq_pub {
@@ -543,7 +556,10 @@ fn process_burst(
     ) {
         stats.total_bt += 1;
         if let Some(ref mut writer) = pcap_writer {
-            let _ = writer.write_bt(&bt_pkt, gps_fix);
+            if let Err(e) = writer.write_bt(&bt_pkt, gps_fix) {
+                if stats.pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                stats.pcap_errors += 1;
+            }
         }
         #[cfg(feature = "zmq")]
         if let Some(ref pub_socket) = zmq_pub {
@@ -665,7 +681,10 @@ fn process_burst(
 
         stats.total_ble += 1;
         if let Some(ref mut writer) = pcap_writer {
-            let _ = writer.write_ble(&p, gps_fix);
+            if let Err(e) = writer.write_ble(&p, gps_fix) {
+                if stats.pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                stats.pcap_errors += 1;
+            }
         }
         #[cfg(feature = "zmq")]
         if let Some(ref pub_socket) = zmq_pub {
@@ -696,6 +715,7 @@ struct PipelineStats {
     burst_1k_5k: u64,
     burst_5k_50k: u64,
     burst_50k_plus: u64,
+    pcap_errors: u64,
 }
 
 impl PipelineStats {
@@ -717,6 +737,7 @@ impl PipelineStats {
             burst_1k_5k: 0,
             burst_5k_50k: 0,
             burst_50k_plus: 0,
+            pcap_errors: 0,
         }
     }
 
@@ -1426,7 +1447,7 @@ pub fn run_live(
                 ),
             ));
             {
-                let mut s = hb_state.lock().unwrap();
+                let mut s = hb_state.lock().unwrap_or_else(|e| e.into_inner());
                 s.gain = gain;
                 s.squelch = squelch_db;
             }
