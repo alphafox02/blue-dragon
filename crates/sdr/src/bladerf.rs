@@ -14,7 +14,9 @@ type BladerfStream = c_void;
 
 // bladeRF constants
 const BLADERF_MODULE_RX: c_int = 0;
+const BLADERF_MODULE_TX: c_int = 1;
 const BLADERF_CHANNEL_RX_0: c_int = 0;
+const BLADERF_CHANNEL_TX_0: c_int = 1;
 const BLADERF_GAIN_MGC: c_int = 1;
 const BLADERF_FORMAT_SC8_Q7: c_int = 4;
 const BLADERF_FORMAT_SC16_Q11: c_int = 1;
@@ -65,6 +67,13 @@ extern "C" {
     fn bladerf_sync_rx(
         dev: *mut BladerfDevice,
         samples: *mut c_void,
+        num_samples: c_uint,
+        metadata: *mut c_void,
+        timeout_ms: c_uint,
+    ) -> c_int;
+    fn bladerf_sync_tx(
+        dev: *mut BladerfDevice,
+        samples: *const c_void,
         num_samples: c_uint,
         metadata: *mut c_void,
         timeout_ms: c_uint,
@@ -501,6 +510,149 @@ impl Drop for BladerfHandle {
     fn drop(&mut self) {
         unsafe {
             bladerf_enable_module(self.dev, BLADERF_MODULE_RX, false);
+            bladerf_close(self.dev);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bladeRF TX handle (separate device open for full-duplex TX)
+// ---------------------------------------------------------------------------
+
+/// bladeRF transmit handle. Opens a separate device instance for TX,
+/// enabling full-duplex operation (RX + TX simultaneously on bladeRF 2.0).
+pub struct BladerfTxHandle {
+    dev: *mut BladerfDevice,
+    tx_buf: Vec<i16>,
+    sample_rate: u32,
+    center_freq: u64,
+}
+
+unsafe impl Send for BladerfTxHandle {}
+
+impl BladerfTxHandle {
+    /// Open a bladeRF for TX on a specific instance.
+    pub fn open(
+        instance: u32,
+        sample_rate: u32,
+        center_freq: u64,
+        gain: i32,
+    ) -> Result<Self, String> {
+        let identifier = CString::new(format!("*:instance={}", instance))
+            .map_err(|e| format!("CString error: {}", e))?;
+
+        unsafe {
+            let mut dev: *mut BladerfDevice = ptr::null_mut();
+            let r = bladerf_open(&mut dev, identifier.as_ptr());
+            if r != 0 {
+                return Err(format!("bladerf_open (TX) failed: {}", r));
+            }
+
+            // Configure TX channel
+            bladerf_set_frequency(dev, BLADERF_CHANNEL_TX_0, center_freq);
+
+            let mut actual_rate: c_uint = 0;
+            bladerf_set_sample_rate(dev, BLADERF_CHANNEL_TX_0, sample_rate, &mut actual_rate);
+
+            let bw = sample_rate.min(56_000_000);
+            bladerf_set_bandwidth(dev, BLADERF_CHANNEL_TX_0, bw, ptr::null_mut());
+            bladerf_set_gain(dev, BLADERF_CHANNEL_TX_0, gain);
+
+            // Configure sync TX interface
+            let buf_size: c_uint = 4096;
+            let r = bladerf_sync_config(
+                dev,
+                BLADERF_MODULE_TX,
+                BLADERF_FORMAT_SC16_Q11,
+                4,        // num_buffers
+                buf_size, // buffer_size
+                2,        // num_transfers
+                1000,     // timeout_ms
+            );
+            if r != 0 {
+                bladerf_close(dev);
+                return Err(format!("bladerf_sync_config (TX) failed: {}", r));
+            }
+
+            let r = bladerf_enable_module(dev, BLADERF_MODULE_TX, true);
+            if r != 0 {
+                bladerf_close(dev);
+                return Err(format!("bladerf_enable_module (TX) failed: {}", r));
+            }
+
+            eprintln!(
+                "bladeRF TX: instance={}, {} MHz, {} MS/s, gain={} dB",
+                instance, center_freq / 1_000_000, actual_rate / 1_000_000, gain
+            );
+
+            Ok(Self {
+                dev,
+                tx_buf: vec![0i16; buf_size as usize * 2],
+                sample_rate: actual_rate,
+                center_freq,
+            })
+        }
+    }
+}
+
+impl crate::SdrTxSource for BladerfTxHandle {
+    fn transmit(&mut self, buf: &[i16]) -> Result<usize, String> {
+        let num_samples = buf.len() / 2;
+        let r = unsafe {
+            bladerf_sync_tx(
+                self.dev,
+                buf.as_ptr() as *const c_void,
+                num_samples as c_uint,
+                ptr::null_mut(),
+                1000,
+            )
+        };
+        if r != 0 {
+            return Err(format!("bladerf_sync_tx failed: {}", r));
+        }
+        Ok(num_samples)
+    }
+
+    fn set_tx_frequency(&mut self, freq_hz: u64) -> Result<(), String> {
+        let r = unsafe { bladerf_set_frequency(self.dev, BLADERF_CHANNEL_TX_0, freq_hz) };
+        if r != 0 {
+            return Err(format!("bladerf_set_frequency (TX) failed: {}", r));
+        }
+        self.center_freq = freq_hz;
+        Ok(())
+    }
+
+    fn set_tx_gain(&mut self, gain: f64) -> Result<(), String> {
+        let r = unsafe { bladerf_set_gain(self.dev, BLADERF_CHANNEL_TX_0, gain as c_int) };
+        if r != 0 {
+            return Err(format!("bladerf_set_gain (TX) failed: {}", r));
+        }
+        Ok(())
+    }
+
+    fn set_tx_sample_rate(&mut self, rate: u32) -> Result<(), String> {
+        let mut actual: c_uint = 0;
+        let r = unsafe {
+            bladerf_set_sample_rate(self.dev, BLADERF_CHANNEL_TX_0, rate, &mut actual)
+        };
+        if r != 0 {
+            return Err(format!("bladerf_set_sample_rate (TX) failed: {}", r));
+        }
+        self.sample_rate = actual;
+        Ok(())
+    }
+
+    fn stop_tx(&mut self) {
+        unsafe {
+            bladerf_enable_module(self.dev, BLADERF_MODULE_TX, false);
+        }
+    }
+}
+
+impl Drop for BladerfTxHandle {
+    fn drop(&mut self) {
+        unsafe {
+            bladerf_enable_module(self.dev, BLADERF_MODULE_TX, false);
             bladerf_close(self.dev);
         }
     }
