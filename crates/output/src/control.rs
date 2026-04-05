@@ -9,6 +9,18 @@ use serde_json::json;
 
 use crate::zmq_pub::parse_curve_keyfile;
 
+/// Decode a hex string into bytes. Returns None on invalid hex.
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    let hex = hex.trim();
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
+}
+
 /// Commands dispatched from the C2 control thread to the pipeline.
 #[derive(Debug)]
 pub enum ControlCommand {
@@ -29,6 +41,13 @@ pub enum ControlCommand {
     },
     QueryGatt {
         mac: String,
+        req_id: Option<String>,
+    },
+    WriteGatt {
+        mac: String,
+        char_uuid: String,
+        service_uuid: Option<String>,
+        data: Vec<u8>,
         req_id: Option<String>,
     },
 }
@@ -309,6 +328,53 @@ impl ControlClient {
                 };
                 if self.cmd_tx.try_send(command).is_ok() {
                     self.send_response(req_id, "ok", &format!("GATT query queued for {}", mac));
+                } else {
+                    self.send_response(req_id, "error", "command queue full");
+                }
+            }
+            "write_gatt" => {
+                let mac = match root.get("mac").and_then(|m| m.as_str()) {
+                    Some(m) => m.to_string(),
+                    None => {
+                        self.send_response(req_id, "error", "missing mac");
+                        return;
+                    }
+                };
+                let char_uuid = match root.get("char_uuid").and_then(|c| c.as_str()) {
+                    Some(c) => c.to_string(),
+                    None => {
+                        self.send_response(req_id, "error", "missing char_uuid");
+                        return;
+                    }
+                };
+                let data_hex = match root.get("data").and_then(|d| d.as_str()) {
+                    Some(d) => d,
+                    None => {
+                        self.send_response(req_id, "error", "missing data (hex string)");
+                        return;
+                    }
+                };
+                let data = match hex_decode(data_hex) {
+                    Some(d) => d,
+                    None => {
+                        self.send_response(req_id, "error", "invalid hex in data field");
+                        return;
+                    }
+                };
+                let service_uuid = root
+                    .get("service_uuid")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+
+                let command = ControlCommand::WriteGatt {
+                    mac: mac.clone(),
+                    char_uuid,
+                    service_uuid,
+                    data,
+                    req_id: req_id.map(|s| s.to_string()),
+                };
+                if self.cmd_tx.try_send(command).is_ok() {
+                    self.send_response(req_id, "ok", &format!("GATT write queued for {}", mac));
                 } else {
                     self.send_response(req_id, "error", "command queue full");
                 }
