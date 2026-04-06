@@ -221,6 +221,32 @@ impl WhadHandle {
         Ok(())
     }
 
+    /// Start peripheral mode: advertise with the given advertisement data.
+    /// Uses PeripheralMode command (supported by ButteRFly, unlike AdvMode).
+    pub fn start_peripheral(&mut self, adv_data: &[u8], scan_rsp: &[u8]) -> Result<(), String> {
+        let msg = Message {
+            msg: Some(WhadMsg::Ble(ble::Message {
+                msg: Some(ble::message::Msg::PeriphMode(ble::PeripheralModeCmd {
+                    scan_data: adv_data.to_vec(),
+                    scanrsp_data: scan_rsp.to_vec(),
+                })),
+            })),
+        };
+        self.send_message(&msg)?;
+        self.expect_success()?;
+
+        let start = Message {
+            msg: Some(WhadMsg::Ble(ble::Message {
+                msg: Some(ble::message::Msg::Start(ble::StartCmd {})),
+            })),
+        };
+        self.send_message(&start)?;
+        self.expect_success()?;
+
+        eprintln!("WHAD: peripheral mode started ({} bytes adv data)", adv_data.len());
+        Ok(())
+    }
+
     /// Send a raw BLE PDU on a specific channel.
     pub fn send_raw_pdu(
         &mut self,
