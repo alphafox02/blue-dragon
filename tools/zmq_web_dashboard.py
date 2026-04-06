@@ -2281,6 +2281,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/c2/get_status":
             state.send_c2_command(sensor_id, "get_status")
             self._serve_json({"ok": True})
+        elif path == "/api/c2/spoof_adv":
+            params = {
+                "name": body.get("name", "BlueDragon"),
+                "connectable": body.get("connectable", False),
+                "duration": body.get("duration", 30),
+            }
+            if body.get("service_uuids"):
+                params["service_uuids"] = body["service_uuids"]
+            state.send_c2_command(sensor_id, "spoof_adv", params)
+            self._serve_json({"ok": True, "message": f"spoof_adv sent to {sensor_id}"})
+        elif path == "/api/c2/l2cap_flood":
+            mac = body.get("mac")
+            if not mac:
+                self._serve_json({"ok": False, "error": "mac required"})
+                return
+            params = {
+                "mac": mac,
+                "count": body.get("count", 10),
+                "hold_secs": body.get("hold_secs", 30),
+                "psm": body.get("psm", 0),
+            }
+            state.send_c2_command(sensor_id, "l2cap_flood", params)
+            self._serve_json({"ok": True, "message": f"l2cap_flood sent to {sensor_id}"})
         else:
             self.send_error(404)
 
