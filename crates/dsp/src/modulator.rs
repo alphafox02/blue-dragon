@@ -33,11 +33,25 @@ impl GfskModulator {
     /// Create a new GFSK modulator.
     /// `sps`: samples per symbol (typically 2 or 4)
     pub fn new(sps: usize) -> Self {
-        let bt = 0.5; // BLE specification: BT=0.5
-        let h = 0.5;  // BLE specification: h=0.5
-        let filter_span = 3; // 3 symbol periods
+        let h = 0.5; // BLE specification: h=0.5
 
-        let gauss_filter = gaussian_filter(bt, sps, filter_span);
+        // Use empirically proven Gaussian filter coefficients from
+        // JiaoXianjun/BTLE (Apache-2.0), verified to produce valid BLE
+        // packets decodable by real hardware.
+        let gauss_filter = if sps == 4 {
+            // 4-symbol span, 16 taps at SPS=4 (from BTLE btle_tx.c)
+            vec![
+                7.561773e-09, 1.197935e-06, 8.050684e-05, 2.326833e-03,
+                2.959908e-02, 1.727474e-01, 4.999195e-01, 8.249246e-01,
+                9.408018e-01, 8.249246e-01, 4.999195e-01, 1.727474e-01,
+                2.959908e-02, 2.326833e-03, 8.050684e-05, 1.197935e-06,
+            ]
+        } else {
+            // Compute for other SPS values
+            let bt = 0.5;
+            let filter_span = 4;
+            gaussian_filter(bt, sps, filter_span)
+        };
 
         Self {
             sps,

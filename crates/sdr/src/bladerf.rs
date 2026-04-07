@@ -49,6 +49,12 @@ extern "C" {
     ) -> c_int;
     fn bladerf_set_gain(dev: *mut BladerfDevice, ch: c_int, gain: c_int) -> c_int;
     fn bladerf_set_gain_mode(dev: *mut BladerfDevice, ch: c_int, mode: c_int) -> c_int;
+    fn bladerf_set_gain_stage(
+        dev: *mut BladerfDevice,
+        ch: c_int,
+        stage: *const c_char,
+        gain: c_int,
+    ) -> c_int;
     fn bladerf_set_sample_rate(
         dev: *mut BladerfDevice,
         ch: c_int,
@@ -557,6 +563,11 @@ impl BladerfTxHandle {
             let bw = sample_rate.min(56_000_000);
             bladerf_set_bandwidth(dev, BLADERF_CHANNEL_TX_0, bw, ptr::null_mut());
             bladerf_set_gain(dev, BLADERF_CHANNEL_TX_0, gain);
+
+            // Fix bladeRF 2.0 DSA (Digital Step Attenuator) -- defaults to -90 dB
+            // which effectively kills the TX output. Set to 0 dB for full power.
+            let dsa_stage = std::ffi::CString::new("dsa").unwrap();
+            bladerf_set_gain_stage(dev, BLADERF_CHANNEL_TX_0, dsa_stage.as_ptr(), 0);
 
             // Configure sync TX interface
             let buf_size: c_uint = 4096;
