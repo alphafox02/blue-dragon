@@ -1009,6 +1009,22 @@ fn spawn_parallel_pipeline(
                         &mut stats,
                     );
 
+                    if last_stats.elapsed().as_secs() >= 5 {
+                        // Always update heartbeat for C2 (even without --stats)
+                        #[cfg(feature = "zmq")]
+                        if let Some(ref hb) = hb_state {
+                            let elapsed = stats_start.elapsed().as_secs_f64();
+                            if let Ok(mut s) = hb.lock() {
+                                s.total_pkts = stats.total_ble + stats.total_bt;
+                                s.pkt_rate = (stats.total_ble + stats.total_bt) as f64 / elapsed;
+                                s.crc_pct = stats.crc_pct();
+                            }
+                        }
+
+                        if !print_stats {
+                            last_stats = Instant::now();
+                        }
+                    }
                     if print_stats && last_stats.elapsed().as_secs() >= 5 {
                         let elapsed = stats_start.elapsed().as_secs_f64();
                         let conns = conn_table.count();
@@ -1040,16 +1056,6 @@ fn spawn_parallel_pipeline(
                             stats.burst_5k_50k,
                             stats.burst_50k_plus,
                         );
-
-                        // Update heartbeat state for C2
-                        #[cfg(feature = "zmq")]
-                        if let Some(ref hb) = hb_state {
-                            if let Ok(mut s) = hb.lock() {
-                                s.total_pkts = stats.total_ble + stats.total_bt;
-                                s.pkt_rate = (stats.total_ble + stats.total_bt) as f64 / elapsed;
-                                s.crc_pct = stats.crc_pct();
-                            }
-                        }
 
                         last_stats = Instant::now();
                     }
