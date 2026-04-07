@@ -22,6 +22,16 @@ pub struct BleConnection {
     pub last_seen: u64,
     pub pkt_count: u32,
     pub active: bool,
+    /// Precomputed list of used data channels from channel_map
+    pub used_channels: Vec<u8>,
+    /// Last unmapped channel for CSA#1 hop prediction
+    pub last_unmapped_channel: u8,
+    /// Connection event counter (incremented each interval)
+    pub event_counter: u16,
+    /// Whether we've anchored to the hop sequence
+    pub hop_anchored: bool,
+    /// Predicted next data channel
+    pub predicted_channel: Option<u8>,
 }
 
 impl Default for BleConnection {
@@ -42,8 +52,74 @@ impl Default for BleConnection {
             last_seen: 0,
             pkt_count: 0,
             active: false,
+            used_channels: Vec::new(),
+            last_unmapped_channel: 0,
+            event_counter: 0,
+            hop_anchored: false,
+            predicted_channel: None,
         }
     }
+}
+
+/// Compute the list of used data channels from a 5-byte channel map bitmask.
+/// BLE data channels 0-36 are mapped: bit i of byte[i/8] indicates channel i.
+pub fn channels_from_map(ch_map: &[u8; 5]) -> Vec<u8> {
+    let mut used = Vec::with_capacity(37);
+    for ch in 0u8..37 {
+        let byte_idx = (ch / 8) as usize;
+        let bit_idx = ch % 8;
+        if ch_map[byte_idx] & (1 << bit_idx) != 0 {
+            used.push(ch);
+        }
+    }
+    used
+}
+
+/// BLE Channel Selection Algorithm #1 (CSA#1).
+/// BT Core Spec Vol 6 Part B Section 4.5.8.
+///
+/// Given the last unmapped channel and hop increment, compute the next
+/// data channel. Returns (data_channel, unmapped_channel).
+pub fn csa1_next_channel(
+    last_unmapped: u8,
+    hop_increment: u8,
+    used_channels: &[u8],
+) -> (u8, u8) {
+    let unmapped = (last_unmapped + hop_increment) % 37;
+
+    // Check if unmapped channel is in the used set
+    if used_channels.contains(&unmapped) {
+        (unmapped, unmapped)
+    } else {
+        // Remap: index into used channel list
+        let remap_idx = (unmapped as usize) % used_channels.len();
+        (used_channels[remap_idx], unmapped)
+    }
+}
+
+/// Predict the next N data channels for a connection.
+pub fn predict_channels(
+    conn: &BleConnection,
+    count: usize,
+) -> Vec<u8> {
+    if conn.used_channels.is_empty() || conn.hop_increment == 0 {
+        return Vec::new();
+    }
+
+    let mut predictions = Vec::with_capacity(count);
+    let mut last_unmapped = conn.last_unmapped_channel;
+
+    for _ in 0..count {
+        let (data_ch, unmapped) = csa1_next_channel(
+            last_unmapped,
+            conn.hop_increment,
+            &conn.used_channels,
+        );
+        predictions.push(data_ch);
+        last_unmapped = unmapped;
+    }
+
+    predictions
 }
 
 /// Connection table: tracks active BLE connections from CONNECT_IND PDUs
@@ -133,6 +209,7 @@ impl ConnectionTable {
         c.timeout = timeout;
         c.created = now;
         c.last_seen = now;
+        c.used_channels = channels_from_map(ch_map);
 
         true
     }
@@ -184,6 +261,60 @@ impl ConnectionTable {
         );
 
         Some(conn_aa)
+    }
+
+    /// Record an observed data channel for a connection and try to anchor
+    /// the hop sequence. If already anchored, advance the prediction.
+    /// Returns the next predicted channel if anchored.
+    pub fn observe_data_channel(&mut self, aa: u32, observed_channel: u8) -> Option<u8> {
+        let conn = self.lookup_mut(aa)?;
+        if conn.used_channels.is_empty() {
+            return None;
+        }
+
+        if !conn.hop_anchored {
+            // Try to anchor: find which unmapped value produces this data channel
+            // by trying all 37 possible last_unmapped values
+            for candidate in 0u8..37 {
+                let (data_ch, _) = csa1_next_channel(candidate, conn.hop_increment, &conn.used_channels);
+                if data_ch == observed_channel {
+                    let unmapped = (candidate + conn.hop_increment) % 37;
+                    conn.last_unmapped_channel = unmapped;
+                    conn.hop_anchored = true;
+                    // Predict next
+                    let (next_ch, next_unmapped) = csa1_next_channel(
+                        conn.last_unmapped_channel,
+                        conn.hop_increment,
+                        &conn.used_channels,
+                    );
+                    conn.last_unmapped_channel = next_unmapped;
+                    conn.predicted_channel = Some(next_ch);
+                    conn.event_counter = conn.event_counter.wrapping_add(1);
+                    return Some(next_ch);
+                }
+            }
+            None
+        } else {
+            // Already anchored: check if prediction matches
+            let matched = conn.predicted_channel == Some(observed_channel);
+            if !matched {
+                // Lost sync -- re-anchor
+                conn.hop_anchored = false;
+                conn.predicted_channel = None;
+                return self.observe_data_channel(aa, observed_channel);
+            }
+
+            // Advance to next hop
+            let (next_ch, next_unmapped) = csa1_next_channel(
+                conn.last_unmapped_channel,
+                conn.hop_increment,
+                &conn.used_channels,
+            );
+            conn.last_unmapped_channel = next_unmapped;
+            conn.predicted_channel = Some(next_ch);
+            conn.event_counter = conn.event_counter.wrapping_add(1);
+            Some(next_ch)
+        }
     }
 
     /// CRC init lookup function suitable for passing to ble_burst().
@@ -238,6 +369,71 @@ mod tests {
         );
         assert!(!added);
         assert_eq!(table.count(), 1);
+    }
+
+    #[test]
+    fn test_channels_from_map() {
+        // All 37 channels used
+        let full_map = [0xFF, 0xFF, 0xFF, 0xFF, 0x1F];
+        let used = channels_from_map(&full_map);
+        assert_eq!(used.len(), 37);
+        assert_eq!(used[0], 0);
+        assert_eq!(used[36], 36);
+    }
+
+    #[test]
+    fn test_channels_from_map_sparse() {
+        // Only channels 0, 1, 2 used (bits 0-2 of byte 0)
+        let map = [0x07, 0x00, 0x00, 0x00, 0x00];
+        let used = channels_from_map(&map);
+        assert_eq!(used, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_csa1_next_channel_used() {
+        // All channels used, hop=7, last_unmapped=0
+        let used: Vec<u8> = (0..37).collect();
+        let (data_ch, unmapped) = csa1_next_channel(0, 7, &used);
+        assert_eq!(unmapped, 7);
+        assert_eq!(data_ch, 7); // channel 7 is in the used set
+    }
+
+    #[test]
+    fn test_csa1_next_channel_remapped() {
+        // Only channels 0, 10, 20 used. hop=5, last_unmapped=0
+        // unmapped = (0 + 5) % 37 = 5. Channel 5 not in used set.
+        // remap_idx = 5 % 3 = 2. used[2] = 20.
+        let used = vec![0, 10, 20];
+        let (data_ch, unmapped) = csa1_next_channel(0, 5, &used);
+        assert_eq!(unmapped, 5);
+        assert_eq!(data_ch, 20);
+    }
+
+    #[test]
+    fn test_predict_channels() {
+        let mut conn = BleConnection::default();
+        conn.hop_increment = 7;
+        conn.channel_map = [0xFF, 0xFF, 0xFF, 0xFF, 0x1F]; // all 37
+        conn.used_channels = channels_from_map(&conn.channel_map);
+        conn.last_unmapped_channel = 0;
+
+        let predictions = predict_channels(&conn, 5);
+        assert_eq!(predictions.len(), 5);
+        // With all 37 channels: 7, 14, 21, 28, 35
+        assert_eq!(predictions, vec![7, 14, 21, 28, 35]);
+    }
+
+    #[test]
+    fn test_predict_channels_wraparound() {
+        let mut conn = BleConnection::default();
+        conn.hop_increment = 13;
+        conn.channel_map = [0xFF, 0xFF, 0xFF, 0xFF, 0x1F]; // all 37
+        conn.used_channels = channels_from_map(&conn.channel_map);
+        conn.last_unmapped_channel = 30;
+
+        let predictions = predict_channels(&conn, 4);
+        // 30+13=43%37=6, 6+13=19, 19+13=32, 32+13=45%37=8
+        assert_eq!(predictions, vec![6, 19, 32, 8]);
     }
 
     #[test]

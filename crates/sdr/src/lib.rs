@@ -21,6 +21,12 @@ pub mod aaronia;
 #[cfg(feature = "rfnm")]
 pub mod rfnm;
 
+#[cfg(feature = "whad")]
+pub mod whad;
+#[cfg(feature = "whad")]
+#[allow(clippy::all)]
+mod whad_proto;
+
 use crossbeam::channel::Sender;
 
 /// IQ sample format (shared across file, VITA 49, and other backends)
@@ -109,4 +115,23 @@ pub trait SdrSource: Send {
 
     /// Get the center frequency in Hz
     fn center_frequency(&self) -> u64;
+}
+
+/// Trait for SDR backends that support transmission.
+pub trait SdrTxSource: Send {
+    /// Transmit a buffer of interleaved i16 IQ samples.
+    /// Returns number of complex samples actually transmitted.
+    fn transmit(&mut self, buf: &[i16]) -> Result<usize, String>;
+
+    /// Set the TX center frequency in Hz.
+    fn set_tx_frequency(&mut self, freq_hz: u64) -> Result<(), String>;
+
+    /// Set the TX gain in dB.
+    fn set_tx_gain(&mut self, gain: f64) -> Result<(), String>;
+
+    /// Set the TX sample rate in Hz.
+    fn set_tx_sample_rate(&mut self, rate: u32) -> Result<(), String>;
+
+    /// Stop transmitting and release TX resources.
+    fn stop_tx(&mut self);
 }

@@ -2123,6 +2123,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_error(400)
         elif path == "/api/gatt/query":
             self._handle_gatt_query()
+        elif path == "/api/gatt/write":
+            self._handle_gatt_write()
         elif path.startswith("/api/c2/"):
             self._handle_c2(path)
         else:
@@ -2162,6 +2164,58 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         self._serve_json({"status": "ok",
                           "message": f"GATT query sent to {len(target_sensors)} sensor(s)"})
+
+    def _handle_gatt_write(self):
+        try:
+            body = self._read_post_body()
+            if body is None:
+                self.send_error(413)
+                return
+        except Exception:
+            self.send_error(400)
+            return
+
+        mac = body.get("mac", "").lower()
+        char_uuid = body.get("char_uuid", "")
+        data_hex = body.get("data", "")
+        service_uuid = body.get("service_uuid")  # optional
+
+        if not mac or not char_uuid or not data_hex:
+            self._serve_json({"ok": False, "error": "mac, char_uuid, and data (hex) required"})
+            return
+
+        # Validate hex data
+        try:
+            bytes.fromhex(data_hex.replace(" ", ""))
+        except ValueError:
+            self._serve_json({"ok": False, "error": "invalid hex in data field"})
+            return
+
+        with state.lock:
+            c2_sensors = set(state.c2_sensor_status.keys())
+            seen_by = set(state.device_sensor_rssi.get(mac, {}).keys())
+            target_sensors = list(c2_sensors & seen_by)
+
+        if not target_sensors:
+            if not c2_sensors:
+                self._serve_json({"ok": False, "error": "no sensors with C2 connected"})
+            else:
+                self._serve_json({"ok": False, "error": "no C2-connected sensor has seen this device"})
+            return
+
+        cmd_params = {
+            "mac": mac,
+            "char_uuid": char_uuid,
+            "data": data_hex.replace(" ", ""),
+        }
+        if service_uuid:
+            cmd_params["service_uuid"] = service_uuid
+
+        for sid in target_sensors:
+            state.send_c2_command(sid, "write_gatt", cmd_params)
+
+        self._serve_json({"status": "ok",
+                          "message": f"GATT write sent to {len(target_sensors)} sensor(s)"})
 
     def _handle_c2(self, path):
         try:
@@ -2227,6 +2281,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/c2/get_status":
             state.send_c2_command(sensor_id, "get_status")
             self._serve_json({"ok": True})
+        elif path == "/api/c2/spoof_adv":
+            params = {
+                "name": body.get("name", "BlueDragon"),
+                "connectable": body.get("connectable", False),
+                "duration": body.get("duration", 30),
+            }
+            if body.get("service_uuids"):
+                params["service_uuids"] = body["service_uuids"]
+            state.send_c2_command(sensor_id, "spoof_adv", params)
+            self._serve_json({"ok": True, "message": f"spoof_adv sent to {sensor_id}"})
+        elif path == "/api/c2/l2cap_flood":
+            mac = body.get("mac")
+            if not mac:
+                self._serve_json({"ok": False, "error": "mac required"})
+                return
+            params = {
+                "mac": mac,
+                "count": body.get("count", 10),
+                "hold_secs": body.get("hold_secs", 30),
+                "psm": body.get("psm", 0),
+            }
+            state.send_c2_command(sensor_id, "l2cap_flood", params)
+            self._serve_json({"ok": True, "message": f"l2cap_flood sent to {sensor_id}"})
         else:
             self.send_error(404)
 
@@ -2435,6 +2512,54 @@ def _sensor_gps(sensor_id):
     return None
 
 
+def _process_smp_message(frames):
+    """Process an smp: topic ZMQ message (BLE pairing security events)."""
+    # Expected frames: [b"smp:", sensor_id_bytes, json_payload]
+    # or: [b"smp:", json_payload] (no sensor_id)
+    try:
+        json_frame = frames[-1]  # last frame is always JSON
+        event = json.loads(json_frame)
+        event_type = event.get("event", "unknown")
+        aa = event.get("aa", "?")
+
+        if event_type == "weak_pairing":
+            print(f"  SMP WARNING [{aa}]: {event.get('reason', '?')}", file=sys.stderr)
+        elif event_type == "features_exchanged":
+            print(f"  SMP [{aa}]: {event.get('method', '?')} ({event.get('security', '?')})",
+                  file=sys.stderr)
+        elif event_type == "ltk_distributed":
+            print(f"  SMP [{aa}]: LTK captured: {event.get('ltk', '?')}", file=sys.stderr)
+        elif event_type == "irk_distributed":
+            irk_hex = event.get("irk", "")
+            print(f"  SMP [{aa}]: IRK captured: {irk_hex}", file=sys.stderr)
+            # Auto-add to IRK resolver if loaded
+            if irk_hex and _irk_list is not None:
+                try:
+                    key_bytes = bytes.fromhex(irk_hex)
+                    if len(key_bytes) == 16:
+                        label = f"smp-{aa}"
+                        _irk_list.append((label, key_bytes))
+                        print(f"  SMP: auto-added IRK for {aa} as '{label}'", file=sys.stderr)
+                except (ValueError, TypeError):
+                    pass
+        elif event_type == "identity_address":
+            print(f"  SMP [{aa}]: identity addr={event.get('addr', '?')} type={event.get('addr_type', '?')}",
+                  file=sys.stderr)
+        elif event_type == "pairing_failed":
+            print(f"  SMP [{aa}]: pairing failed (reason {event.get('reason', '?')})", file=sys.stderr)
+
+        # Store SMP events in global state for potential dashboard display
+        if hasattr(_process_smp_message, 'state') and _process_smp_message.state:
+            if not hasattr(_process_smp_message.state, 'smp_events'):
+                _process_smp_message.state.smp_events = []
+            _process_smp_message.state.smp_events.append(event)
+            # Keep last 100 events
+            if len(_process_smp_message.state.smp_events) > 100:
+                _process_smp_message.state.smp_events = _process_smp_message.state.smp_events[-100:]
+    except (json.JSONDecodeError, IndexError) as e:
+        print(f"  SMP: failed to parse message: {e}", file=sys.stderr)
+
+
 def _process_scan_message(frames):
     """Process a scan: topic ZMQ message and merge active-scan data into device state."""
     # Expected frames: [b"scan:", sensor_id_bytes, json_payload]
@@ -2621,6 +2746,10 @@ def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
 
         if frames and frames[0] == b"scan:":
             _process_scan_message(frames)
+            continue
+
+        if frames and frames[0] == b"smp:":
+            _process_smp_message(frames)
             continue
 
         _process_zmq_message(frames, pcap_file, use_gps)
@@ -3691,6 +3820,12 @@ function renderGattResult(g) {
       if (ch.flags && ch.flags.length) html += '<span class="gatt-char-flags">[' + ch.flags.join(', ') + ']</span>';
       if (ch.value_str) html += '<div class="gatt-char-val">"' + esc(ch.value_str) + '"</div>';
       else if (ch.value) html += '<div class="gatt-char-val">' + esc(ch.value) + '</div>';
+      if (ch.flags && (ch.flags.includes('write') || ch.flags.includes('write-without-response'))) {
+        const cm = g.mac.replace(/'/g,"\\'");
+        const cu = ch.uuid.replace(/'/g,"\\'");
+        const su = svc.uuid.replace(/'/g,"\\'");
+        html += '<button style="font-size:8px;padding:1px 4px;margin:1px 0;cursor:pointer;background:#543;color:#ccc;border:1px solid #765;border-radius:2px" onclick="writeGattPrompt(\'' + cm + '\',\'' + cu + '\',\'' + su + '\')">write</button>';
+      }
       html += '</div>';
     }
     html += '</div>';
@@ -3718,6 +3853,31 @@ function queryGatt(mac) {
   // Re-render immediately to show pending state
   const dev = devices.find(d => d.mac === mac);
   if (dev) renderDetail(dev);
+}
+
+function writeGattPrompt(mac, charUuid, svcUuid) {
+  const hex = prompt('Enter hex data to write to ' + charUuid + '\\n(e.g. 0102ff):');
+  if (hex === null || hex.trim() === '') return;
+  // Validate hex
+  const clean = hex.trim().replace(/\\s+/g, '');
+  if (!/^[0-9a-fA-F]*$/.test(clean) || clean.length % 2 !== 0) {
+    alert('Invalid hex data. Must be even number of hex characters.');
+    return;
+  }
+  writeGatt(mac, charUuid, svcUuid, clean);
+}
+
+function writeGatt(mac, charUuid, svcUuid, dataHex) {
+  const body = {mac: mac, char_uuid: charUuid, data: dataHex};
+  if (svcUuid) body.service_uuid = svcUuid;
+  fetch('/api/gatt/write', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: {'Content-Type': 'application/json'}
+  }).then(r => r.json()).then(r => {
+    if (r.error) alert('GATT write failed: ' + r.error);
+    else alert('GATT write sent (' + dataHex.length/2 + ' bytes)');
+  }).catch(e => alert('GATT write error: ' + e));
 }
 
 es.addEventListener('update', e => {

