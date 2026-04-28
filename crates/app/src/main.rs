@@ -40,7 +40,7 @@ struct Cli {
     #[arg(short = 'C', long, default_value = "40")]
     channels: usize,
 
-    /// All channels: sets -C 96 -c 2441 for full BLE band coverage
+    /// All channels: -c 2441 + -C 96 (or -C 92 on Aaronia) for full BLE band
     #[arg(short = 'a', long = "all-channels")]
     all_channels: bool,
 
@@ -121,6 +121,13 @@ struct Cli {
     list: bool,
 
     // -- Wireshark extcap args --
+
+    /// Aaronia decimation factor: 1=Full (default), 2=halfband (DC-notch),
+    /// 4, 8, ... 512. Higher values double the device clock for the same
+    /// effective rate, giving sharper antialiasing and a hardware DC notch
+    /// at the price of more USB throughput before decimation.
+    #[arg(long, default_value = "1")]
+    aaronia_decim: u32,
 
     /// Wireshark extcap: list interfaces
     #[arg(long)]
@@ -382,11 +389,44 @@ fn main() {
         return;
     }
 
-    let (center_freq, channels) = if cli.all_channels {
-        (2441u32, 96usize)
+    let is_aaronia = cli.interface.as_deref().map_or(false, |i| i.starts_with("aaronia"));
+    let (center_freq, mut channels) = if cli.all_channels {
+        // Aaronia 92.16 MHz clock covers the full 78 MHz BLE band (2402-2480
+        // MHz); -C 92 maps onto it cleanly while -C 96 has no clock within
+        // the 3% tolerance gate. Other backends keep the historical -C 96.
+        if is_aaronia {
+            (2441u32, 92usize)
+        } else {
+            (2441u32, 96usize)
+        }
     } else {
         (cli.center_freq, cli.channels)
     };
+    // Aaronia receiver clocks at integer-MHz granularity: 46, 61, 77, 92,
+    // 122, 184, 245. With Full decimation the user's -C N picks the matching
+    // clock; with --aaronia-decim D > 1 the device runs at clock = -C * D
+    // (halfband / quarterband paths) so the effective bandwidth -C is
+    // achieved after digital decimation. Either way, channels snap to
+    // whatever the chosen clock+decim actually delivers.
+    if is_aaronia {
+        const AARONIA_MHZ: &[usize] = &[46, 61, 77, 92, 122, 184, 245];
+        let decim = cli.aaronia_decim as usize;
+        if decim < 1 || !decim.is_power_of_two() {
+            eprintln!("error: --aaronia-decim must be a power of two (1, 2, 4, ..., 512)");
+            std::process::exit(1);
+        }
+        let target_clock = channels.saturating_mul(decim);
+        let chosen_clock = AARONIA_MHZ.iter().find(|&&v| v >= target_clock).copied()
+            .unwrap_or(*AARONIA_MHZ.last().unwrap());
+        let effective = chosen_clock / decim;
+        if effective != channels {
+            eprintln!(
+                "Aaronia: -C {} with --aaronia-decim {} → clock {} MHz, effective -C {}",
+                channels, decim, chosen_clock, effective,
+            );
+            channels = effective;
+        }
+    }
 
     if cli.verbose {
         log::info!("blue-dragon starting");
@@ -502,6 +542,7 @@ fn main() {
             hci_enabled: cli.hci,
             active_scan: cli.active_scan,
             coded_scan: cli.coded_scan,
+            aaronia_decim: cli.aaronia_decim,
             running,
         }) {
             eprintln!("error: {}", e);

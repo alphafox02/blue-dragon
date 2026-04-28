@@ -25,7 +25,7 @@ path = "src/main.rs"
 bd-protocol = { path = "../protocol" }
 bd-dsp = { path = "../dsp" }
 bd-output = { path = "../output" }
-bd-sdr = { path = "../sdr" }
+bd-sdr = { path = "../sdr", default-features = false }
 bd-gpu = { path = "../gpu", optional = true }
 bd-hci = { path = "../hci", optional = true }
 crossbeam.workspace = true

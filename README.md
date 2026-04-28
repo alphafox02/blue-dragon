@@ -32,7 +32,7 @@ dashboard for real-time monitoring.
 | HackRF backend | Untested | Compiles, needs hardware validation |
 | bladeRF backend | Tested | 88.7% CRC OTA at -g 30 |
 | SoapySDR backend | Tested | |
-| Spectran V6 | Tested | 92 MHz BW, ~38% CRC OTA (tuning ongoing) |
+| Spectran V6 | Tested | 245 MHz BW, ~91% CRC OTA (`-C 245 --aaronia-decim 2`) |
 | RFNM (Lime) | Tested | Full BLE band (122.88 Msps), 71-78% CRC OTA |
 | HCI GATT probing | Untested | Compiles, needs end-to-end test with --hci |
 | HCI active scanning | Tested | --active-scan enriches device data |
@@ -46,7 +46,7 @@ dashboard for real-time monitoring.
 | HackRF One | `-i hackrf-SERIAL` | 4-20 MHz | 8-bit | 20 MHz max sample rate |
 | bladeRF 2.0 | `-i bladerf0` | 4-56 MHz (normal), up to 122 MHz (oversample) | 12-bit (normal) / 8-bit (oversample) | AD9361 (oversample overclocks beyond AD spec) |
 | SoapySDR | `-i soapy-N` | Varies | Varies | Generic SDR support |
-| Spectran V6 | `-i aaronia` | 92-245 MHz | f32 | Use `-C 92`, `-C 122`, or `-C 245` (device-dependent) |
+| Spectran V6 | `-i aaronia` | 46-245 MHz | f32 | Supported `-C` values: 46, 61, 77, 92, 122, 184, 245 (device-dependent). Other values snap up to the nearest supported clock automatically. |
 | RFNM (Lime) | `-i rfnm` or `-i rfnm-SERIAL` | 122 MHz | 12-bit | 122.88 Msps base clock, all 40 BLE channels |
 
 To list available SDR devices:
@@ -64,7 +64,7 @@ too low buries the signal in the noise floor (low CRC rate).**
 | USRP B210 | 60 | 40-50 | 60 | UHD auto-AGC not used |
 | bladeRF 2.0 | 60 | **25-35** | 50-60 | Clips at 60 OTA -- use 30 |
 | HackRF | 40 LNA / 20 VGA | TBD | TBD | Separate `--hackrf-lna` / `--hackrf-vga` |
-| Spectran V6 | 20 | 10-20 | N/A | `-g N` sets reflevel to -N dBm; auto-scaled f32→i16 |
+| Spectran V6 | 60 | 30-60 | 20-30 | `-g N` → reflevel -N dBm, clamped [-36, 10]; preamp=Auto, auto-scaled f32→i16 |
 | RFNM (Lime) | 30 | 20-30 | 30 | Lime gain range -24 to 30 dB |
 | SoapySDR | 60 | Device-dependent | Device-dependent | Depends on underlying hardware |
 
@@ -183,20 +183,87 @@ so the binary finds the library at runtime without `LD_LIBRARY_PATH`.
 
     cargo build --release --features "aaronia,zmq"
 
-The Spectran V6 backend uses `spectranv6/raw` mode with `outputformat=iq` to
-get wideband IQ samples. Not all clock rates are supported on all devices;
-the backend auto-detects which clocks work and errors with guidance if the
-requested `-C` value is incompatible:
+The Spectran V6 backend uses `spectranv6/raw` mode with `outputformat=iq`
+to get wideband IQ samples. Quick start (recommended for full BLE band):
 
-    blue-dragon -l -i aaronia -C 92 --check-crc --stats
+    blue-dragon -l -i aaronia -C 92 --aaronia-decim 2 --check-crc --stats
 
-Typical supported `-C` values: **92, 122, 184, 245** (device-dependent).
-Lower values like 46 or 61 may not be available on all models/firmware.
+Measured CRC pass rate at this setting: **~90% OTA** in a typical office
+RF environment. The `--aaronia-decim 2` halfband path uses the device's
+internal DC notch and consistently outperforms the Full-decimation mode.
 
-The `-g` flag sets the reference level: `-g 20` = reflevel -20 dBm (most
-sensitive, default), `-g 10` = -10 dBm, `-g 0` = 0 dBm (most headroom).
+Other shortcuts:
+
+    blue-dragon -l -i aaronia -C 92 --check-crc --stats             # Full decim, ~85-87% OTA
+    blue-dragon -l -i aaronia -a --check-crc --stats                # all 40 BLE channels
+
+#### `-C` (channels / sample rate)
+
+Aaronia receiver clocks are at integer-MHz granularity: **46, 61, 77, 92,
+122, 184, 245**. Pass `-C N` where `N` is one of these values, or any
+other value -- non-matching values snap up to the next supported clock
+with a warning, so `-C 40` (the CLI default) becomes `-C 46`. Older
+firmware or non-ECO models may not support 46/61/77 MHz; the backend
+falls back to the next-higher clock automatically and tells you on stderr.
+
+`-a` / `--all-channels` resolves to `-C 92` on Aaronia (the 92.16 MHz
+clock comfortably covers the full 78 MHz BLE band, 2402-2480 MHz). Other
+backends keep the historical `-C 96`.
+
+The device's actual sample rate is read from `packet.stepFrequency`
+(per the vendor docs) -- the 92 MHz clock is really 92.16 MHz, and the
+per-channel resampler corrects the 0.17% timing offset transparently.
+
+#### `--aaronia-decim` (halfband / quarterband / ...)
+
+`--aaronia-decim D` sets the device decimation factor (`1` = Full default,
+`2` = halfband, `4`, `8`, ... up to `512`). Decimation > 1 runs the ADC
+at `D ×` the effective rate and applies a digital halfband filter,
+giving sharper antialiasing **and a hardware DC notch** that suppresses
+LO leakage / IQ-imbalance DC artifacts at the cost of more USB bandwidth
+before decimation. The DC notch in particular tends to clean up demod
+quality near band-center.
+
+`-C` and `--aaronia-decim` combine: `-C N` is the *effective* bandwidth
+in MHz; the device clock is auto-chosen as the smallest supported clock
+≥ `N × D`, and `-C` snaps to whatever effective bandwidth that clock
+actually produces after decimation.
+
+Examples:
+
+    -C 46  --aaronia-decim 2    # clock 92 MHz / 2 = 46.08 MS/s + DC notch
+    -C 92  --aaronia-decim 2    # clock 184 MHz / 2 = 92.16 MS/s, full BLE band
+    -C 122 --aaronia-decim 2    # clock 245 MHz / 2 = 122.88 MS/s
+    -C 184 --aaronia-decim 2    # 245 / 2 = 122 effective; -C snaps down to 122
+    -C 92  --aaronia-decim 4    # clock 245 / 4 = 61 effective; -C snaps to 61
+
+#### `-g` (gain → reference level)
+
+`-g N` maps to reference level `-N dBm`, clamped to `[-36, 10]`. Default
+`-g 60` → **reflevel -36 dBm** (most sensitive). Examples: `-g 20` →
+-20 dBm, `-g 10` → -10 dBm, `-g 0` → 0 dBm (most headroom for strong
+nearby transmitters).
+
+The preamp is set to `"Auto"` by default, letting the device pick the
+right amplifier path (Disabled / Amp / Preamp / Both) for the configured
+reflevel. The RX filter is `"Auto Extended"` for full BLE-band coverage.
+
 The backend auto-scales the f32 samples to i16 using RMS measured over
 20 packets at startup (25th percentile to filter WiFi burst outliers).
+The chosen scale is logged on stderr at open time:
+`Aaronia auto-scale: rms=... scale=...`.
+
+#### Live diagnostics
+
+Every 5 s during streaming, the SDR thread logs warn-flag deltas if any
+of the device's data-quality bits fire:
+
+    Aaronia warn flags (5s deltas): overflow=N dropped=N inaccurate=N resampled=N time_disc=N
+
+Silent zeros means clean capture. Non-zero `dropped` indicates USB
+backpressure; non-zero `inaccurate` is a clock or calibration issue;
+non-zero `resampled` means the API is internally resampling and the
+device rate may differ from the requested clock.
 
 ### RFNM
 
