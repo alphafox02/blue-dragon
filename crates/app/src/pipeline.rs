@@ -820,6 +820,117 @@ struct ChannelAssignment {
     fft_bin: usize,
 }
 
+/// Per-channel adaptive gain. Tracks rolling chunk-RMS and snaps the per-bin
+/// scale so each channel's noise floor sits near `TARGET_NOISE_RMS`. This
+/// equalizes the AGC operating point across all 40 BLE channels even when
+/// WiFi raises some bins by 30+ dB -- without per-bin equalization, the
+/// shared squelch threshold is biased by the WiFi-noisy channels and the
+/// AGC takes longer to converge on burst start (corrupting early symbols).
+struct ChannelGain {
+    chunk_sum_sq: f32,
+    chunk_count: u32,
+    /// Rolling buffer of chunk RMSes; oldest entry overwritten each cycle.
+    history: [f32; CHANNEL_GAIN_HISTORY],
+    history_idx: usize,
+    history_filled: bool,
+    chunks_since_update: u32,
+    scale: f32,
+    /// Upper clamp on the per-bin scale. Different in Full vs halfband modes.
+    max_scale: f32,
+    /// Latest p25 estimate (0.0 until first window completes).
+    last_p25: f32,
+    /// Target the bin scales toward. Set externally each resync to the
+    /// median p25 across the worker's channels, so the gain block tracks
+    /// the actual noise environment instead of a fixed reference.
+    target_p25: f32,
+}
+
+const CHANNEL_GAIN_CHUNK: u32 = 256;          // ~256 µs per chunk at 1 Msps/ch
+const CHANNEL_GAIN_HISTORY: usize = 64;       // 64 chunks ≈ 16 ms total window
+const CHANNEL_GAIN_UPDATE_CHUNKS: u32 = 64;   // recompute scale every full window
+const CHANNEL_GAIN_TARGET: f32 = 0.01;        // post-scale RMS target (per channel)
+const CHANNEL_GAIN_INIT: f32 = 1.0;           // pass-through until we have data
+// Clamp range for the per-channel adaptive gain. The block is enabled
+// only in decim>1 (halfband+) modes, where some bins receive WiFi-loud
+// energy and others are filter-rejected; attenuate-only equalization
+// pulls the loud bins down to the cross-channel median so the AGC sees
+// a uniform operating point. Amplification (max>1) was tried for
+// decim=1 mode but was unstable across RF environments, so the gain
+// block is disabled there entirely.
+const CHANNEL_GAIN_MIN: f32 = 0.1;            // attenuate by up to 20 dB
+const CHANNEL_GAIN_MAX_DECIM: f32 = 1.0;      // never amplify
+
+impl ChannelGain {
+    fn new(max_scale: f32) -> Self {
+        Self {
+            chunk_sum_sq: 0.0,
+            chunk_count: 0,
+            history: [0.0; CHANNEL_GAIN_HISTORY],
+            history_idx: 0,
+            history_filled: false,
+            chunks_since_update: 0,
+            scale: CHANNEL_GAIN_INIT,
+            max_scale,
+            last_p25: 0.0,
+            // Bootstrap to a fixed reference until the worker has enough
+            // channels with p25 data to compute a median.
+            target_p25: CHANNEL_GAIN_TARGET,
+        }
+    }
+
+    fn last_p25(&self) -> f32 { self.last_p25 }
+
+    /// Set the cross-channel reference. Worker calls this every ~tens-of-ms
+    /// with the median p25 across its assigned channels. The new scale is
+    /// applied on the next sample.
+    fn set_target_p25(&mut self, target: f32) {
+        self.target_p25 = target;
+        self.recompute_scale();
+    }
+
+    fn recompute_scale(&mut self) {
+        if self.last_p25 > 1e-9 {
+            self.scale = (self.target_p25 / self.last_p25)
+                .clamp(CHANNEL_GAIN_MIN, self.max_scale);
+        }
+    }
+
+    /// Apply current scale to `sample` and update the rolling RMS estimator.
+    /// The scale only changes once per full window (~16 ms) to avoid step
+    /// changes mid-burst.
+    fn process(&mut self, sample: num_complex::Complex32) -> num_complex::Complex32 {
+        let mag_sq = sample.norm_sqr();
+        self.chunk_sum_sq += mag_sq;
+        self.chunk_count += 1;
+
+        if self.chunk_count >= CHANNEL_GAIN_CHUNK {
+            let chunk_rms = (self.chunk_sum_sq / self.chunk_count as f32).sqrt();
+            self.history[self.history_idx] = chunk_rms;
+            self.history_idx += 1;
+            if self.history_idx >= CHANNEL_GAIN_HISTORY {
+                self.history_idx = 0;
+                self.history_filled = true;
+            }
+            self.chunk_sum_sq = 0.0;
+            self.chunk_count = 0;
+            self.chunks_since_update += 1;
+
+            if self.chunks_since_update >= CHANNEL_GAIN_UPDATE_CHUNKS && self.history_filled {
+                // 25th percentile of chunk RMSes ≈ noise floor when bursts
+                // are <75% duty cycle (always true for BLE; usually true for
+                // WiFi channels too because WiFi has gaps between frames).
+                let mut sorted = self.history;
+                sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                self.last_p25 = sorted[CHANNEL_GAIN_HISTORY / 4];
+                self.recompute_scale();
+                self.chunks_since_update = 0;
+            }
+        }
+
+        sample * self.scale
+    }
+}
+
 /// Spawn parallel burst-catching worker threads + a decode thread.
 ///
 /// Returns:
@@ -832,6 +943,8 @@ struct ChannelAssignment {
 fn spawn_parallel_pipeline(
     num_channels: usize,
     fft_scale: f32,
+    channel_gain_max: f32,
+    channel_gain_enabled: bool,
     live_ch: [i32; 40],
     first_live: usize,
     last_live: usize,
@@ -897,6 +1010,9 @@ fn spawn_parallel_pipeline(
             .iter()
             .map(|a| burst_catchers[a.ch_idx].take().unwrap())
             .collect();
+        let mut gains: Vec<ChannelGain> = (0..channels.len())
+            .map(|_| ChannelGain::new(channel_gain_max))
+            .collect();
 
         let burst_tx = burst_tx.clone();
         let num_ch = num_channels;
@@ -907,6 +1023,12 @@ fn spawn_parallel_pipeline(
             .name(format!("burst-{}", worker_id))
             .spawn(move || {
                 let mut current_squelch = i32::MIN;
+                let mut steps_since_resync: usize = 0;
+                // Resync the per-channel gain target every ~64 ms at 1 Msps/ch.
+                // Long enough that p25 estimates have all updated at least
+                // once (each updates every ~16 ms), short enough to track a
+                // changing RF environment.
+                const RESYNC_STEPS: usize = 65536;
                 for msg in batch_rx.iter() {
                     // Check for squelch update
                     let sq = sq_pending.load(Ordering::Relaxed);
@@ -920,13 +1042,19 @@ fn spawn_parallel_pipeline(
 
                     for (i, assign) in channels.iter().enumerate() {
                         let catcher = &mut catchers[i];
+                        let gain = &mut gains[i];
                         for t in 0..msg.batch_steps {
                             let base = t * num_ch * 2;
                             let idx = base + assign.fft_bin * 2;
-                            let sample = num_complex::Complex32::new(
+                            let raw = num_complex::Complex32::new(
                                 msg.data[idx] * scale,
                                 msg.data[idx + 1] * scale,
                             );
+                            let sample = if channel_gain_enabled {
+                                gain.process(raw)
+                            } else {
+                                raw
+                            };
                             if let Some(burst) = catcher.execute(sample, &msg.ts) {
                                 let _ = burst_tx.send(burst);
                             }
@@ -934,6 +1062,30 @@ fn spawn_parallel_pipeline(
                         // Emit scan bursts for advertising channels
                         if let Some(scan_burst) = catcher.take_scan_burst() {
                             let _ = burst_tx.send(scan_burst);
+                        }
+                    }
+
+                    // Cross-channel resync: each bin scales toward
+                    // max(fixed reference, median of worker's channels). Only
+                    // runs when the gain block is enabled (decim>1 mode).
+                    if !channel_gain_enabled {
+                        continue;
+                    }
+                    steps_since_resync += msg.batch_steps;
+                    if steps_since_resync >= RESYNC_STEPS {
+                        steps_since_resync = 0;
+                        let mut p25s: Vec<f32> = gains.iter()
+                            .map(|g| g.last_p25())
+                            .filter(|&p| p > 1e-9)
+                            .collect();
+                        if p25s.len() >= 2 {
+                            p25s.sort_unstable_by(|a, b| a.partial_cmp(b)
+                                .unwrap_or(std::cmp::Ordering::Equal));
+                            let median = p25s[p25s.len() / 2];
+                            let target = median.max(CHANNEL_GAIN_TARGET);
+                            for g in gains.iter_mut() {
+                                g.set_target_p25(target);
+                            }
                         }
                     }
                 }
@@ -1278,13 +1430,28 @@ impl SdrHandle {
         }
     }
 
+    /// Aaronia-specific: cumulative counts of all warn-flag bits the device
+    /// has set (overflow, dropped, inaccurate, resampled, time_disc). Returns
+    /// None for other backends.
+    fn aaronia_flag_counts(&self) -> Option<(u64, u64, u64, u64, u64)> {
+        match self {
+            #[cfg(feature = "aaronia")]
+            SdrHandle::Aaronia(h) => Some(h.flag_counts()),
+            _ => None,
+        }
+    }
+
     /// Actual sample rate in Hz. Most SDRs match the requested rate exactly.
     /// RFNM may differ (e.g., 122.88 Msps when 122 Msps was requested).
+    /// Aaronia: read from packet.stepFrequency at open time per vendor docs.
     fn actual_sample_rate(&self, requested: u32) -> u64 {
+        #[allow(unreachable_patterns)]
         match self {
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.actual_sample_rate(),
             SdrHandle::Vita49(h) => h.sample_rate() as u64,
+            #[cfg(feature = "aaronia")]
+            SdrHandle::Aaronia(h) => h.actual_sample_rate() as u64,
             _ => requested as u64,
         }
     }
@@ -1324,6 +1491,7 @@ fn open_sdr_handle(
     hackrf_lna: u32,
     hackrf_vga: u32,
     antenna: Option<&str>,
+    aaronia_decim: u32,
 ) -> Result<SdrHandle, String> {
     let sdr_type = detect_sdr_type(iface);
     match sdr_type {
@@ -1360,7 +1528,7 @@ fn open_sdr_handle(
         #[cfg(feature = "aaronia")]
         SdrType::Aaronia => {
             let h = bd_sdr::aaronia::AaroniaHandle::open(
-                iface, sample_rate, center_freq_hz, gain, antenna,
+                iface, sample_rate, center_freq_hz, gain, antenna, aaronia_decim,
             )?;
             Ok(SdrHandle::Aaronia(h))
         }
@@ -1400,6 +1568,9 @@ pub struct LiveConfig<'a> {
     pub hci_enabled: bool,
     pub active_scan: bool,
     pub coded_scan: bool,
+    /// Aaronia-only: decimation factor (1=Full, 2=halfband DC notch, ...).
+    /// Ignored by other backends.
+    pub aaronia_decim: u32,
     pub running: Arc<AtomicBool>,
 }
 
@@ -1410,10 +1581,23 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         hackrf_lna, hackrf_vga, antenna, pcap_path, check_crc,
         print_stats, use_gpu, zmq_endpoint, zmq_curve_keyfile,
         sensor_id, gpsd_enabled, hci_enabled, active_scan, coded_scan,
+        aaronia_decim,
         running,
     } = cfg;
     let sample_rate = num_channels as u32 * 1_000_000;
     let center_freq_hz = center_freq_mhz as u64 * 1_000_000;
+
+    // Per-channel adaptive gain is enabled for halfband (decim>1) mode
+    // where it consistently improves CRC by ~7-8 points (attenuate-only
+    // equalizes WiFi-loud bins down toward median). It is disabled for
+    // Full (decim=1) mode where it is unstable across RF environments --
+    // sometimes +8 points, sometimes -15. Stable baseline beats variance.
+    let channel_gain_enabled = aaronia_decim > 1;
+    let channel_gain_max = if channel_gain_enabled {
+        CHANNEL_GAIN_MAX_DECIM
+    } else {
+        1.0 // unused when disabled, but keep type happy
+    };
 
     let (_channel_freqs, live_ch, first_live, last_live) =
         build_channel_map(center_freq_mhz, num_channels)?;
@@ -1460,7 +1644,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         .collect();
 
     // Open SDR early so we can query the actual sample rate for resample ratio.
-    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna)?;
+    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna, aaronia_decim)?;
 
     // Compute resample ratio: if actual per-channel rate differs from target
     // (sps * 1 MHz), resample demod output to correct timing drift.
@@ -1856,6 +2040,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     if use_gpu {
         return run_live_gpu_loop(
             sdr, &running, num_channels, semi_len, &prototype, fft_scale,
+            channel_gain_max, channel_gain_enabled,
             live_ch, first_live, last_live, burst_catchers,
             fsk, aa_correlator, aa_correlator_2m, syndrome_map, conn_table,
             pcap_writer, check_crc, print_stats,
@@ -1887,6 +2072,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     let (batch_txs, worker_handles, decode_handle) = spawn_parallel_pipeline(
         num_channels,
         1.0, // CPU path pre-scales by fft_scale, workers use 1.0
+        channel_gain_max,
+        channel_gain_enabled,
         live_ch,
         first_live,
         last_live,
@@ -1926,6 +2113,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
             let mut recv_buf = vec![0i16; sdr_buf_size];
             let mut send_buf = vec![0i16; target_elems + sdr_buf_size];
             let mut send_pos: usize = 0;
+            let mut last_flag_log = Instant::now();
+            let mut prev_flags: (u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0);
 
             while sdr_running.load(Ordering::Relaxed) {
                 // Check for runtime gain change from C2
@@ -1940,6 +2129,26 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                     continue;
                 }
                 sdr_overflow.store(sdr.overflow_count(), Ordering::Relaxed);
+
+                if last_flag_log.elapsed().as_secs() >= 5 {
+                    if let Some(cur) = sdr.aaronia_flag_counts() {
+                        let d = (
+                            cur.0 - prev_flags.0,
+                            cur.1 - prev_flags.1,
+                            cur.2 - prev_flags.2,
+                            cur.3 - prev_flags.3,
+                            cur.4 - prev_flags.4,
+                        );
+                        if d.0 + d.1 + d.2 + d.3 + d.4 > 0 {
+                            log::warn!(
+                                "Aaronia warn flags (5s deltas): overflow={} dropped={} inaccurate={} resampled={} time_disc={}",
+                                d.0, d.1, d.2, d.3, d.4,
+                            );
+                        }
+                        prev_flags = cur;
+                    }
+                    last_flag_log = Instant::now();
+                }
                 let n = num_rx * 2;
                 send_buf[send_pos..send_pos + n].copy_from_slice(&recv_buf[..n]);
                 send_pos += n;
@@ -2038,6 +2247,8 @@ fn run_live_gpu_loop(
     semi_len: usize,
     prototype: &[f32],
     fft_scale: f32,
+    channel_gain_max: f32,
+    channel_gain_enabled: bool,
     live_ch: [i32; 40],
     first_live: usize,
     last_live: usize,
@@ -2081,6 +2292,8 @@ fn run_live_gpu_loop(
     let (batch_txs, worker_handles, decode_handle) = spawn_parallel_pipeline(
         num_channels,
         fft_scale, // GPU output is raw, workers apply fft_scale
+        channel_gain_max,
+        channel_gain_enabled,
         live_ch,
         first_live,
         last_live,

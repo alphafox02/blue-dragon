@@ -69,9 +69,12 @@ struct AarPacket {
     interleave: i64,
 }
 
-// Packet flags
+// Packet flags (from aaroniartsaapi.h)
 const PACKET_WARN_OVERFLOW: u64 = 0x0000_0000_0000_0100;
 const PACKET_WARN_DROPPED: u64 = 0x0000_0000_0000_0200;
+const PACKET_WARN_INACCURATE: u64 = 0x0000_0000_0000_0400;
+const PACKET_WARN_RESAMPLED: u64 = 0x0000_0000_0000_0800;
+const PACKET_TIME_DISCONTINUITY: u64 = 0x0000_0000_0001_0000;
 
 /// Default path to Aaronia RTSA Suite installation (contains paths.xml).
 const AARONIA_INSTALL_DIR: &str = "/opt/aaronia-rtsa-suite/Aaronia-RTSA-Suite-PRO";
@@ -304,6 +307,20 @@ fn select_clock_candidates(sample_rate_hz: u32) -> Vec<(&'static str, &'static s
     candidates
 }
 
+/// Forced-decimation candidate selection. Used when the caller requested a
+/// specific decimation factor (e.g. `--aaronia-decim 2` for the halfband DC
+/// notch). Picks the smallest clock such that `clock / decim >= sample_rate`,
+/// so the effective rate covers the requested bandwidth. Falls back to the
+/// largest clock if no clock is high enough.
+fn select_clock_for_decim(sample_rate_hz: u32, decim: u32) -> Option<(&'static str, &'static str, u32)> {
+    let decim_name = DECIMATIONS.iter().find(|(d, _)| *d == decim).map(|(_, n)| *n)?;
+    let target_clock = sample_rate_hz.saturating_mul(decim);
+    let pick = CLOCKS.iter().find(|(c, _)| *c >= target_clock).copied()
+        .or_else(|| CLOCKS.last().copied())?;
+    let (clock_hz, clock_name) = pick;
+    Some((clock_name, decim_name, clock_hz / decim))
+}
+
 /// Try to set receiverclock and decimation on the device, falling back to
 /// higher clocks if the preferred one is rejected.  Only accepts clocks
 /// where the actual rate is within 3% of the requested rate (otherwise the
@@ -315,8 +332,18 @@ unsafe fn set_clock_with_fallback(
     d: &mut AarDevice,
     root: &mut AarConfig,
     sample_rate_hz: u32,
+    forced_decim: u32,
 ) -> Result<(&'static str, &'static str, u32), String> {
-    let candidates = select_clock_candidates(sample_rate_hz);
+    // When the caller forces a decimation factor (>1), pick the clock that
+    // makes the effective rate match. This is the path the halfband DC notch
+    // takes -- e.g. forced_decim=2 with sample_rate=92e6 → 184MHz clock.
+    let candidates: Vec<_> = if forced_decim > 1 {
+        select_clock_for_decim(sample_rate_hz, forced_decim)
+            .into_iter()
+            .collect()
+    } else {
+        select_clock_candidates(sample_rate_hz)
+    };
 
     // Only try candidates where actual rate is within 3% of requested.
     // A larger mismatch causes PFB bin/BLE channel misalignment.
@@ -516,16 +543,17 @@ impl SdrSource for AaroniaSource {
             let mut config = AarConfig { d: ptr::null_mut() };
             AARTSAAPI_ConfigRoot(&mut d, &mut root);
 
-            // Set receiver clock with fallback
+            // Set receiver clock with fallback (Full decimation; AaroniaSource
+            // is the older crossbeam-channel path and doesn't expose decim).
             let (clock_name, decim_name, actual_rate) =
-                set_clock_with_fallback(&mut d, &mut root, self.sample_rate)?;
+                set_clock_with_fallback(&mut d, &mut root, self.sample_rate, 1)?;
             self.actual_sample_rate = actual_rate;
 
             // Other string configs
             let str_configs: &[(&str, &str)] = &[
                 ("device/receiverchannel", "Rx1"),
                 ("device/outputformat", "iq"),
-                ("calibration/preamp", "Amp"),
+                ("calibration/preamp", "Auto"),
                 ("calibration/rffilter", "Auto Extended"),
                 ("device/gaincontrol", "manual"),
             ];
@@ -543,10 +571,10 @@ impl SdrSource for AaroniaSource {
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, self.center_freq as f64);
 
-            // Reference level -- [-20, 10] dBm with preamp "Auto".
-            // Map -g N to reflevel = -N dBm (higher gain = lower reflevel = more sensitive).
-            // Default -g 60 clamps to -20 dBm (most sensitive, same as before).
-            let reflevel = (-self.gain).clamp(-20.0, 10.0);
+            // Reference level -- clamped to [-36, 10] dBm. Map -g N to reflevel
+            // = -N dBm (higher gain = lower reflevel = more sensitive). Default
+            // -g 60 maps to -36 dBm; -g 20 yields the historical -20 dBm point.
+            let reflevel = (-self.gain).clamp(-36.0, 10.0);
             let key = to_wchar("main/reflevel");
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, reflevel);
@@ -705,23 +733,33 @@ pub struct AaroniaHandle {
     max_samps: usize,
     pub running: Arc<AtomicBool>,
     overflow_count: u64,
+    dropped_count: u64,
+    inaccurate_count: u64,
+    resampled_count: u64,
+    time_disc_count: u64,
     initialized: bool,
     /// f32-to-i8 scale factor, auto-computed from noise floor RMS.
     scale: f32,
+    /// Actual sample rate read from packet.stepFrequency at open(),
+    /// the authoritative rate per the vendor docs.
+    actual_sample_rate: u32,
 }
 
 unsafe impl Send for AaroniaHandle {}
 
 impl AaroniaHandle {
     /// Open a Spectran V6 in raw mode and start streaming.
-    /// `gain` maps to reflevel as -gain dBm, clamped to [-20, 10].
-    /// -g 20 = reflevel -20 dBm (most sensitive, default), -g 0 = 0 dBm.
+    /// `gain` maps to reflevel as -gain dBm, clamped to [-36, 10].
+    /// -g 60 = reflevel -36 dBm (default), -g 20 = -20 dBm, -g 0 = 0 dBm.
+    /// `decim` is the decimation factor (1=Full, 2=halfband DC-notch, 4, 8, ...).
+    /// When >1, the clock is picked so that `clock / decim ≈ sample_rate`.
     pub fn open(
         iface: &str,
         sample_rate: u32,
         center_freq: u64,
         gain: f64,
         _antenna: Option<&str>,
+        decim: u32,
     ) -> Result<Self, String> {
         let serial = if iface == "aaronia" {
             String::new()
@@ -796,14 +834,16 @@ impl AaroniaHandle {
             let mut config = AarConfig { d: ptr::null_mut() };
             AARTSAAPI_ConfigRoot(&mut d, &mut root);
 
-            // Set receiver clock with fallback
+            // Set receiver clock with fallback. `decim` > 1 selects a higher
+            // clock and digital decimation (halfband / quarterband / ...);
+            // decim=1 keeps the natural clock at Full decimation.
             let (clock_name, decim_name, actual_rate) =
-                set_clock_with_fallback(&mut d, &mut root, sample_rate)?;
+                set_clock_with_fallback(&mut d, &mut root, sample_rate, decim)?;
 
             let configs: &[(&str, &str)] = &[
                 ("device/receiverchannel", "Rx1"),
                 ("device/outputformat", "iq"),
-                ("calibration/preamp", "Amp"),
+                ("calibration/preamp", "Auto"),
                 ("calibration/rffilter", "Auto Extended"),
                 ("device/gaincontrol", "manual"),
             ];
@@ -825,8 +865,9 @@ impl AaroniaHandle {
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, center_freq as f64);
 
-            // Map -g N to reflevel = -N dBm (higher gain = lower reflevel = more sensitive).
-            let reflevel = (-gain).clamp(-20.0, 10.0);
+            // Map -g N to reflevel = -N dBm. Clamp [-36, 10]: default -g 60
+            // → -36 dBm; -g 20 → -20 dBm (historical operating point).
+            let reflevel = (-gain).clamp(-36.0, 10.0);
             let key = to_wchar("main/reflevel");
             AARTSAAPI_ConfigFind(&mut d, &mut root, &mut config, key.as_ptr());
             AARTSAAPI_ConfigSetFloat(&mut d, &mut config, reflevel);
@@ -904,6 +945,25 @@ impl AaroniaHandle {
             }
 
             let max_samps = first_pkt.num as usize;
+            // Vendor docs (Readme.md): packet.stepFrequency is the
+            // authoritative actual sample rate. Trust it over the
+            // clock-table inference -- if the API resampled internally
+            // (e.g. usbcompression), this is what we're really getting.
+            let reported_rate = first_pkt.step_frequency;
+            let device_rate = if reported_rate.is_finite() && reported_rate > 0.0 {
+                reported_rate as u32
+            } else {
+                actual_rate
+            };
+            if (reported_rate - actual_rate as f64).abs() / actual_rate as f64 > 0.001 {
+                log::warn!(
+                    "Aaronia: clock-table predicted {} Hz, device reports {:.0} Hz \
+                     ({}% off) -- using reported rate",
+                    actual_rate,
+                    reported_rate,
+                    (reported_rate / actual_rate as f64 - 1.0) * 100.0,
+                );
+            }
             AARTSAAPI_ConsumePackets(&mut d, 0, 1);
 
             // Wait ~500ms for receiver to settle past startup transient,
@@ -970,10 +1030,10 @@ impl AaroniaHandle {
             }
 
             log::info!(
-                "Aaronia Spectran V6 open (clock={}, decim={}, rate={} MS/s, center={} MHz, reflevel={} dBm, pkt_size={}, scale={:.0})",
+                "Aaronia Spectran V6 open (clock={}, decim={}, rate={} Hz, center={} MHz, reflevel={} dBm, pkt_size={}, scale={:.0})",
                 clock_name,
                 decim_name,
-                actual_rate / 1_000_000,
+                device_rate,
                 center_freq / 1_000_000,
                 reflevel,
                 max_samps,
@@ -986,8 +1046,13 @@ impl AaroniaHandle {
                 max_samps,
                 running: Arc::new(AtomicBool::new(true)),
                 overflow_count: 0,
+                dropped_count: 0,
+                inaccurate_count: 0,
+                resampled_count: 0,
+                time_disc_count: 0,
                 initialized: true,
                 scale,
+                actual_sample_rate: device_rate,
             })
         }
     }
@@ -1013,9 +1078,7 @@ impl AaroniaHandle {
                 break;
             }
 
-            if pkt.flags & PACKET_WARN_OVERFLOW != 0 {
-                self.overflow_count += 1;
-            }
+            self.bucket_flags(pkt.flags);
 
             let num_samples = (pkt.num as usize).min(max_complex);
             if num_samples > 0 && !pkt.fp32.is_null() {
@@ -1058,9 +1121,7 @@ impl AaroniaHandle {
                 break;
             }
 
-            if pkt.flags & PACKET_WARN_OVERFLOW != 0 {
-                self.overflow_count += 1;
-            }
+            self.bucket_flags(pkt.flags);
 
             let num_samples = (pkt.num as usize).min(max_complex);
             if num_samples > 0 && !pkt.fp32.is_null() {
@@ -1092,7 +1153,7 @@ impl AaroniaHandle {
             AARTSAAPI_ConfigRoot(d_ptr, &mut root);
             let key = to_wchar("main/reflevel");
             AARTSAAPI_ConfigFind(d_ptr, &mut root, &mut config, key.as_ptr());
-            let reflevel = (-gain).clamp(-20.0, 10.0);
+            let reflevel = (-gain).clamp(-36.0, 10.0);
             AARTSAAPI_ConfigSetFloat(d_ptr, &mut config, reflevel);
         }
     }
@@ -1103,6 +1164,42 @@ impl AaroniaHandle {
 
     pub fn overflow_count(&self) -> u64 {
         self.overflow_count
+    }
+
+    /// Actual sample rate as reported by the device in `packet.stepFrequency`
+    /// at open time. Authoritative per the vendor docs.
+    pub fn actual_sample_rate(&self) -> u32 {
+        self.actual_sample_rate
+    }
+
+    /// Cumulative counts of each warn flag the device has set on packets.
+    /// Order: (overflow, dropped, inaccurate, resampled, time_discontinuity).
+    pub fn flag_counts(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.overflow_count,
+            self.dropped_count,
+            self.inaccurate_count,
+            self.resampled_count,
+            self.time_disc_count,
+        )
+    }
+
+    fn bucket_flags(&mut self, flags: u64) {
+        if flags & PACKET_WARN_OVERFLOW != 0 {
+            self.overflow_count += 1;
+        }
+        if flags & PACKET_WARN_DROPPED != 0 {
+            self.dropped_count += 1;
+        }
+        if flags & PACKET_WARN_INACCURATE != 0 {
+            self.inaccurate_count += 1;
+        }
+        if flags & PACKET_WARN_RESAMPLED != 0 {
+            self.resampled_count += 1;
+        }
+        if flags & PACKET_TIME_DISCONTINUITY != 0 {
+            self.time_disc_count += 1;
+        }
     }
 }
 
