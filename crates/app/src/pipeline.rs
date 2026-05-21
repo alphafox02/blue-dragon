@@ -1317,6 +1317,7 @@ enum SdrType {
     SoapySdr,
     Aaronia,
     Rfnm,
+    Sidekiq,
 }
 
 impl std::fmt::Display for SdrType {
@@ -1329,6 +1330,7 @@ impl std::fmt::Display for SdrType {
             SdrType::SoapySdr => write!(f, "soapysdr"),
             SdrType::Aaronia => write!(f, "aaronia"),
             SdrType::Rfnm => write!(f, "rfnm"),
+            SdrType::Sidekiq => write!(f, "sidekiq"),
         }
     }
 }
@@ -1349,6 +1351,8 @@ fn detect_sdr_type(iface: &str) -> SdrType {
         SdrType::Aaronia
     } else if iface.starts_with("rfnm") {
         SdrType::Rfnm
+    } else if iface.starts_with("sidekiq") {
+        SdrType::Sidekiq
     } else {
         SdrType::Usrp // default
     }
@@ -1368,6 +1372,8 @@ enum SdrHandle {
     Aaronia(bd_sdr::aaronia::AaroniaHandle),
     #[cfg(feature = "rfnm")]
     Rfnm(bd_sdr::rfnm::RfnmHandle),
+    #[cfg(feature = "sidekiq")]
+    Sidekiq(bd_sdr::sidekiq::SidekiqHandle),
     Vita49(bd_sdr::vita49::Vita49Handle),
 }
 
@@ -1390,6 +1396,8 @@ impl SdrHandle {
             SdrHandle::Aaronia(h) => h.recv_into_i16(buf),
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.recv_into_i16(buf),
+            #[cfg(feature = "sidekiq")]
+            SdrHandle::Sidekiq(h) => h.recv_into_i16(buf),
             SdrHandle::Vita49(h) => h.recv_into_i16(buf),
         }
     }
@@ -1408,6 +1416,8 @@ impl SdrHandle {
             SdrHandle::Aaronia(h) => h.max_samps(),
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.max_samps(),
+            #[cfg(feature = "sidekiq")]
+            SdrHandle::Sidekiq(h) => h.max_samps(),
             SdrHandle::Vita49(h) => h.max_samps(),
         }
     }
@@ -1426,6 +1436,8 @@ impl SdrHandle {
             SdrHandle::Aaronia(h) => h.overflow_count(),
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.overflow_count(),
+            #[cfg(feature = "sidekiq")]
+            SdrHandle::Sidekiq(h) => h.overflow_count(),
             SdrHandle::Vita49(h) => h.overflow_count(),
         }
     }
@@ -1476,6 +1488,8 @@ impl SdrHandle {
             SdrHandle::Aaronia(h) => h.set_gain(gain),
             #[cfg(feature = "rfnm")]
             SdrHandle::Rfnm(h) => h.set_gain(gain),
+            #[cfg(feature = "sidekiq")]
+            SdrHandle::Sidekiq(h) => h.set_gain(gain),
             SdrHandle::Vita49(h) => h.set_gain(gain),
         }
     }
@@ -1492,6 +1506,8 @@ fn open_sdr_handle(
     hackrf_vga: u32,
     antenna: Option<&str>,
     aaronia_decim: u32,
+    sidekiq_agc: bool,
+    sidekiq_dc_corr: bool,
 ) -> Result<SdrHandle, String> {
     let sdr_type = detect_sdr_type(iface);
     match sdr_type {
@@ -1539,6 +1555,18 @@ fn open_sdr_handle(
             )?;
             Ok(SdrHandle::Rfnm(h))
         }
+        #[cfg(feature = "sidekiq")]
+        SdrType::Sidekiq => {
+            let extras = bd_sdr::sidekiq::SidekiqExtras {
+                agc: sidekiq_agc,
+                dc_offset_corr: sidekiq_dc_corr,
+                boost_priority: true,
+            };
+            let h = bd_sdr::sidekiq::SidekiqHandle::open_with_extras(
+                iface, sample_rate, center_freq_hz, gain, antenna, extras,
+            )?;
+            Ok(SdrHandle::Sidekiq(h))
+        }
         #[allow(unreachable_patterns)]
         _ => Err(format!(
             "unsupported SDR type '{}' (interface: '{}'). Compile with the appropriate feature flag.",
@@ -1556,6 +1584,10 @@ pub struct LiveConfig<'a> {
     pub squelch_db: f32,
     pub hackrf_lna: u32,
     pub hackrf_vga: u32,
+    /// Sidekiq: use AD9361 AGC instead of the manual gain-index path.
+    pub sidekiq_agc: bool,
+    /// Sidekiq: enable FPGA DC offset correction.
+    pub sidekiq_dc_corr: bool,
     pub antenna: Option<&'a str>,
     pub pcap_path: Option<&'a Path>,
     pub check_crc: bool,
@@ -1582,6 +1614,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         print_stats, use_gpu, zmq_endpoint, zmq_curve_keyfile,
         sensor_id, gpsd_enabled, hci_enabled, active_scan, coded_scan,
         aaronia_decim,
+        sidekiq_agc,
+        sidekiq_dc_corr,
         running,
     } = cfg;
     let sample_rate = num_channels as u32 * 1_000_000;
@@ -1644,7 +1678,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         .collect();
 
     // Open SDR early so we can query the actual sample rate for resample ratio.
-    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna, aaronia_decim)?;
+    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna, aaronia_decim, sidekiq_agc, sidekiq_dc_corr)?;
 
     // Compute resample ratio: if actual per-channel rate differs from target
     // (sps * 1 MHz), resample demod output to correct timing drift.

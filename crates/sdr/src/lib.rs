@@ -21,6 +21,9 @@ pub mod aaronia;
 #[cfg(feature = "rfnm")]
 pub mod rfnm;
 
+#[cfg(feature = "sidekiq")]
+pub mod sidekiq;
+
 #[cfg(feature = "whad")]
 pub mod whad;
 #[cfg(feature = "whad")]

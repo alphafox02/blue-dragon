@@ -68,6 +68,16 @@ struct Cli {
     #[arg(long, default_value = "20")]
     hackrf_vga: u32,
 
+    /// Sidekiq: enable AD9361 AGC instead of the -g gain index.
+    /// Default is manual gain (use -g as a gain index, 0..N).
+    #[arg(long)]
+    sidekiq_agc: bool,
+
+    /// Sidekiq: disable FPGA DC offset correction (on by default).
+    /// Use for A/B comparison; normal operation should leave it on.
+    #[arg(long)]
+    sidekiq_no_dc: bool,
+
     /// SDR antenna/RX port (e.g. RX2, TX/RX for USRP; RX1, RX2 for bladeRF)
     #[arg(long)]
     antenna: Option<String>,
@@ -215,6 +225,17 @@ fn print_extcap_interfaces() {
                 println!(
                     "interface {{value=rfnm-{}}}{{display=Blue Dragon RFNM {}}}",
                     dev.serial, dev.board_name
+                );
+            }
+        }
+    }
+    #[cfg(feature = "sidekiq")]
+    {
+        if let Ok(devices) = bd_sdr::sidekiq::list_devices() {
+            for dev in &devices {
+                println!(
+                    "interface {{value=sidekiq-{}}}{{display=Blue Dragon Sidekiq {}}}",
+                    dev.serial, dev.serial
                 );
             }
         }
@@ -383,6 +404,18 @@ fn main() {
                 Err(e) => eprintln!("error listing RFNM devices: {}", e),
             }
         }
+        #[cfg(feature = "sidekiq")]
+        {
+            match bd_sdr::sidekiq::list_devices() {
+                Ok(devices) => {
+                    for dev in &devices {
+                        eprintln!("  sidekiq-{} (card={})", dev.serial, dev.card);
+                        found += 1;
+                    }
+                }
+                Err(e) => eprintln!("error listing Sidekiq devices: {}", e),
+            }
+        }
         if found == 0 {
             eprintln!("  (no SDR devices found)");
         }
@@ -530,6 +563,8 @@ fn main() {
             squelch_db: cli.squelch,
             hackrf_lna: cli.hackrf_lna,
             hackrf_vga: cli.hackrf_vga,
+            sidekiq_agc: cli.sidekiq_agc,
+            sidekiq_dc_corr: !cli.sidekiq_no_dc,
             antenna: cli.antenna.as_deref(),
             pcap_path: cli.write.as_deref(),
             check_crc: cli.check_crc,
