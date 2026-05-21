@@ -48,6 +48,7 @@ dashboard for real-time monitoring.
 | SoapySDR | `-i soapy-N` | Varies | Varies | Generic SDR support |
 | Spectran V6 | `-i aaronia` | 46-245 MHz | f32 | Supported `-C` values: 46, 61, 77, 92, 122, 184, 245 (device-dependent). Other values snap up to the nearest supported clock automatically. |
 | RFNM (Lime) | `-i rfnm` or `-i rfnm-SERIAL` | 122 MHz | 12-bit | 122.88 Msps base clock, all 40 BLE channels |
+| Epiq Sidekiq family | `-i sidekiq-SERIAL` | varies by model | varies by model | Multiple variants (m.2-2280, Stretch, Z3u, Z4, X40, ...) with different RFICs / clock generators / port layouts. Opt-in `--features sidekiq`; requires libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`). |
 
 To list available SDR devices:
 
@@ -66,6 +67,7 @@ too low buries the signal in the noise floor (low CRC rate).**
 | HackRF | 40 LNA / 20 VGA | TBD | TBD | Separate `--hackrf-lna` / `--hackrf-vga` |
 | Spectran V6 | 60 | 30-60 | 20-30 | `-g N` → reflevel -N dBm, clamped [-36, 10]; preamp=Auto, auto-scaled f32→i16 |
 | RFNM (Lime) | 30 | 20-30 | 30 | Lime gain range -24 to 30 dB |
+| Epiq Sidekiq | varies | varies | TBD | `-g` is the device's RX gain *index* (range varies per model and is read from the SDK at open time), not dB. `--sidekiq-agc` switches to the SDK's auto-gain where supported. |
 | SoapySDR | 60 | Device-dependent | Device-dependent | Depends on underlying hardware |
 
 **Symptoms of gain too high:** BLE count = 0, all bursts fail decode (ADC saturation
