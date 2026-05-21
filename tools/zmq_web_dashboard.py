@@ -3151,6 +3151,7 @@ function togglePrivacy() {
 }
 
 function mask(m) { return m ? 'xx:xx:xx:xx:xx:xx' : ''; }
+function maskName(n) { return n ? '[hidden]' : ''; }
 
 function fmtT(ts) {
   const d = new Date(ts * 1000);
@@ -3343,7 +3344,7 @@ function renderDevices() {
       `<td class="${macCls}">${mc}</td>`+
       `<td class="${addrCls(mt)}">${mt}</td>`+
       `<td>${esc(mfrLabel(d))}</td>`+
-      `<td class="blu">${esc(d.name)}</td>`+
+      `<td class="blu">${priv ? maskName(d.name) : esc(d.name)}</td>`+
       `<td class="dim">${esc(svcLabel(d))}</td>`+
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
       `<td class="${d.phy!=='1M'?'org':'dim'}">${d.phy||'1M'}</td>`+
@@ -3738,7 +3739,7 @@ function renderDetail(d) {
   const connLabel = d.connectable ? '<span class="grn">yes</span>' : '<span class="dim">no</span>';
 
   let html = '<div class="detail-hdr">' + esc(mc) + ' ' + protoBadge(proto) + '</div>';
-  html += '<div class="detail-row"><span class="lbl">Name</span><span class="val blu">' + esc(d.name||'-') + '</span></div>';
+  html += '<div class="detail-row"><span class="lbl">Name</span><span class="val blu">' + (priv ? (d.name ? '[hidden]' : '-') : esc(d.name||'-')) + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">Manufacturer</span><span class="val">' + esc(mfrLabel(d)||'-') + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">Addr type</span><span class="val ' + addrCls(d.mac_type||'') + '">' + esc(d.mac_type||'-') + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">Connectable</span><span class="val">' + connLabel + '</span></div>';
@@ -3803,7 +3804,7 @@ function renderGattResult(g) {
   }
   let html = '';
   if (g.device_name) {
-    html += '<div class="detail-row"><span class="lbl">Device name</span><span class="val blu">' + esc(g.device_name) + '</span></div>';
+    html += '<div class="detail-row"><span class="lbl">Device name</span><span class="val blu">' + (priv ? '[hidden]' : esc(g.device_name)) + '</span></div>';
   }
   const svcs = g.services || [];
   if (!svcs.length) {
