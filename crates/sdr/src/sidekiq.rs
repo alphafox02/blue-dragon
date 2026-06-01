@@ -118,7 +118,20 @@ extern "C" {
         p_actual_bandwidth: *mut u32,
     ) -> c_int;
     fn skiq_write_rx_dc_offset_corr(card: u8, hdl: c_int, enable: bool) -> c_int;
+    fn skiq_read_rx_iq_resolution(card: u8, p_adc_res: *mut u8) -> c_int;
+    fn skiq_read_rx_LO_freq_range(card: u8, p_max: *mut u64, p_min: *mut u64) -> c_int;
+    fn skiq_read_part_info(
+        card: u8,
+        p_part_number: *mut c_char,
+        p_revision: *mut c_char,
+        p_variant: *mut c_char,
+    ) -> c_int;
 }
+
+// Buffer sizes for skiq_read_part_info (from sidekiq_types.h).
+const SKIQ_PART_NUM_STRLEN: usize = 7;
+const SKIQ_REVISION_STRLEN: usize = 3;
+const SKIQ_VARIANT_STRLEN: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Process-wide SDK lifetime guard. libsidekiq is a singleton; calling
@@ -324,6 +337,12 @@ pub struct SidekiqHandle {
     /// consecutive blocks). Distinct from overflow_count, this signals USB /
     /// queue starvation, not RF saturation.
     drop_count: u64,
+    /// Left-shift applied to each 16-bit sample to fill the i16 numeric
+    /// range. Derived from the device-reported IQ resolution:
+    ///   - 12-bit ADC (AD9361/9364, Stretch/M.2/Z2/Z3u/Z4): shift = 4
+    ///   - 14-bit ADC: shift = 2
+    ///   - 16-bit ADC (ADRV9004/9009, Nv100/Nvm2/X2/X4/X40): shift = 0
+    iq_shift: u32,
     /// Last seen rf_timestamp + expected next-block rf_timestamp, for gap
     /// detection. None until the first block is received.
     last_ts_next: Option<u64>,
@@ -337,8 +356,9 @@ unsafe impl Send for SidekiqHandle {}
 /// reproduces the conservative behaviour.
 #[derive(Debug, Clone, Default)]
 pub struct SidekiqExtras {
-    /// Switch the AD9361 to its built-in AGC. When false (default) we use a
-    /// manual gain index from the `gain` argument.
+    /// Switch the RFIC's built-in AGC on. When false (default) we use a
+    /// manual gain index from the `gain` argument; the actual index range
+    /// is read from the device at open and clamped accordingly.
     pub agc: bool,
     /// Enable FPGA DC offset correction (very near-DC 1-pole high-pass). Most
     /// AD9361-based SKUs support this. No-op + warning if the SKU does not.
@@ -405,6 +425,64 @@ impl SidekiqHandle {
             return Err(format!("skiq_enable_cards(FULL) failed: {}", r));
         }
 
+        // ---- Query device-reported metadata so we adapt per-product instead
+        // of hardcoding limits. The Sidekiq family spans multiple RFICs:
+        // AD9361/9364 (12-bit), ADRV9004 (16-bit), ADRV9009 (16-bit), etc.,
+        // each with its own sample-rate range, LO range, and gain index range.
+        let mut part_num = [0i8; SKIQ_PART_NUM_STRLEN];
+        let mut part_rev = [0i8; SKIQ_REVISION_STRLEN];
+        let mut part_var = [0i8; SKIQ_VARIANT_STRLEN];
+        let part_str = if unsafe {
+            skiq_read_part_info(
+                card,
+                part_num.as_mut_ptr() as *mut c_char,
+                part_rev.as_mut_ptr() as *mut c_char,
+                part_var.as_mut_ptr() as *mut c_char,
+            )
+        } == 0
+        {
+            let n = unsafe { std::ffi::CStr::from_ptr(part_num.as_ptr() as *const c_char) }
+                .to_string_lossy()
+                .into_owned();
+            let r = unsafe { std::ffi::CStr::from_ptr(part_rev.as_ptr() as *const c_char) }
+                .to_string_lossy()
+                .into_owned();
+            let v = unsafe { std::ffi::CStr::from_ptr(part_var.as_ptr() as *const c_char) }
+                .to_string_lossy()
+                .into_owned();
+            format!("{} rev {} variant {}", n, r, v)
+        } else {
+            "unknown".to_string()
+        };
+
+        // Validate LO is in the device's tunable range.
+        let mut lo_max: u64 = 0;
+        let mut lo_min: u64 = 0;
+        if unsafe { skiq_read_rx_LO_freq_range(card, &mut lo_max, &mut lo_min) } == 0
+            && lo_max >= lo_min
+            && (center_freq < lo_min || center_freq > lo_max)
+        {
+            unsafe { skiq_disable_cards(&card, 1) };
+            sdk_release();
+            return Err(format!(
+                "sidekiq: requested LO {} Hz is outside this device's RX tuning range \
+                 ({} Hz .. {} Hz). Pick a different -c.",
+                center_freq, lo_min, lo_max
+            ));
+        }
+
+        // ADC resolution → determines the i16 scaling shift in recv_into_i16.
+        // Falls back to 12-bit (shift 4) if the SDK does not implement this
+        // call on a given device, which matches the legacy behaviour.
+        let mut adc_bits: u8 = 12;
+        let _ = unsafe { skiq_read_rx_iq_resolution(card, &mut adc_bits) };
+        let iq_shift = (16u32).saturating_sub(adc_bits as u32);
+
+        log::info!(
+            "sidekiq device metadata: part={}, RX ADC bits={}, LO range {}..{} Hz",
+            part_str, adc_bits, lo_min, lo_max
+        );
+
         // Helper to roll back partial setup on any subsequent failure.
         let teardown = |card: u8, streaming: bool| {
             if streaming {
@@ -435,13 +513,11 @@ impl SidekiqHandle {
             "?"
         };
 
-        // Sample rate + bandwidth. The AD9361 RFIC's analog channel filter is
-        // configurable up to ~56 MHz; for the AD9361 sample rate ceiling of
-        // 61.44 Msps we cap requested BW at 56 MHz to stay within the
-        // documented analog filter range. The SDK may further round to the
-        // nearest supported filter setting; the readback below logs the
-        // actual values the device negotiated.
-        let bandwidth = sample_rate.min(56_000_000);
+        // Sample rate + bandwidth. We request bandwidth == sample_rate and
+        // let the SDK round to the nearest supported analog channel filter
+        // for this hardware; the readback below logs the actual values the
+        // device negotiated.
+        let bandwidth = sample_rate;
         let r = unsafe {
             skiq_write_rx_sample_rate_and_bandwidth(card, hdl, sample_rate, bandwidth)
         };
@@ -593,6 +669,7 @@ impl SidekiqHandle {
             streaming: true,
             overflow_count: 0,
             drop_count: 0,
+            iq_shift,
             last_ts_next: None,
             running: Arc::new(AtomicBool::new(true)),
         })
@@ -689,11 +766,12 @@ impl SidekiqHandle {
 
                 let data_ptr = blk_u8.add(SKIQ_RX_HEADER_SIZE_IN_BYTES as usize) as *const i16;
                 let out_base = filled * 2;
+                let sh = self.iq_shift;
                 for i in 0..want {
                     let q = ptr::read_unaligned(data_ptr.add(2 * i));
                     let iv = ptr::read_unaligned(data_ptr.add(2 * i + 1));
-                    buf[out_base + 2 * i] = iv.wrapping_shl(4);
-                    buf[out_base + 2 * i + 1] = q.wrapping_shl(4);
+                    buf[out_base + 2 * i] = iv.wrapping_shl(sh);
+                    buf[out_base + 2 * i + 1] = q.wrapping_shl(sh);
                 }
             }
             filled += want;
