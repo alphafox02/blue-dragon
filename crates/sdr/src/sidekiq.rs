@@ -795,10 +795,19 @@ impl SidekiqHandle {
         self.max_samps
     }
 
+    /// RFIC overload (input saturation) count — the "overload" bit in the
+    /// receive-block header. Separate from sample drops; useful to tell apart
+    /// "lower the gain" (overload firing) vs "we lost samples" (drops firing).
     pub fn overflow_count(&self) -> u64 {
-        // Surface both RFIC overload and sample-drop events so either kind of
-        // condition shows up in the --stats overflow counter.
-        self.overflow_count.saturating_add(self.drop_count)
+        self.overflow_count
+    }
+
+    /// Detected sample-drop count from rf_timestamp gaps between consecutive
+    /// receive blocks. Non-zero indicates the chain (FPGA DMA queue, PCIe,
+    /// recv loop, or downstream pipeline) is not keeping up, distinct from
+    /// RFIC saturation.
+    pub fn drop_count(&self) -> u64 {
+        self.drop_count
     }
 }
 

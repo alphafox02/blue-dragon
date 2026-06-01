@@ -67,7 +67,7 @@ too low buries the signal in the noise floor (low CRC rate).**
 | HackRF | 40 LNA / 20 VGA | TBD | TBD | Separate `--hackrf-lna` / `--hackrf-vga` |
 | Spectran V6 | 60 | 30-60 | 20-30 | `-g N` → reflevel -N dBm, clamped [-36, 10]; preamp=Auto, auto-scaled f32→i16 |
 | RFNM (Lime) | 30 | 20-30 | 30 | Lime gain range -24 to 30 dB |
-| Epiq Sidekiq | varies | varies | TBD | `-g` is the device's RX gain *index* (range varies per model and is read from the SDK at open time), not dB. `--sidekiq-agc` switches to the SDK's auto-gain where supported. |
+| Epiq Sidekiq | varies | **35** | TBD | `-g` is the device's RX gain *index* (range varies per model, read from the SDK at open time). On AD9361-based cards (Stretch / m.2-2280, m.2-3042, mPCIe) each step ≈ 1 dB; index 35 measured best on a populated office BLE band in our testing. `--sidekiq-agc` switches to the SDK's auto-gain. `--sidekiq-no-dc` disables FPGA DC offset correction (on by default). |
 | SoapySDR | 60 | Device-dependent | Device-dependent | Depends on underlying hardware |
 
 **Symptoms of gain too high:** BLE count = 0, all bursts fail decode (ADC saturation
@@ -299,6 +299,38 @@ Features are opt-in. Build only what you need:
 | `hci` | Active GATT probing + LE scanning via HCI | libdbus-1-dev (for BlueZ D-Bus) |
 | `aaronia` | Spectran V6 support | RTSA Suite Pro |
 | `rfnm` | RFNM (Lime daughtercard) support | librfnm, spdlog |
+| `sidekiq` | Epiq Sidekiq family support | libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`) |
+
+#### Sidekiq DMA buffer tuning (high-rate capture only)
+
+PCIe-attached Sidekiq cards stream IQ samples through a fixed-size DMA
+ring buffer in kernel memory. The default `RingBufferPacketCount=2048`
+gives 8 MB of buffer (~33 ms at 61 Msps), which is enough at low rates
+on a quiet host but can overflow at the AD9361's 61 Msps ceiling when
+the host has any latency jitter (VMs, browsers, builds, etc.). Symptom
+is a non-zero **drops** counter rising in the periodic Sidekiq log line.
+
+To raise the buffer:
+
+```
+sudo rmmod dmadriver
+sudo insmod /home/$USER/sidekiq_image_current/driver/$(uname -r)/dmadriver.ko \
+    RingBufferPacketCount=8192   # 32 MB, ~130 ms at 61 Msps
+cat /sys/module/dmadriver/parameters/RingBufferPacketCount   # verify
+```
+
+To persist across reboots, drop a config file into the SDK's driver
+config directory (the load script picks it up via `modprobe --config`):
+
+```
+echo 'options dmadriver RingBufferPacketCount=8192' \
+    | sudo tee $HOME/sidekiq_image_current/driver/driver_config/dmadriver.conf
+```
+
+Recommendation by card type:
+- High-rate AD9361 cards (Stretch / m.2-2280, m.2-3042, mPCIe): 8192
+- 16-bit / wider cards (Nv100, Nvm2, X4, X40): 8192 or higher
+- Low-rate or embedded targets (Z2/Z3u): default is fine, do not raise
 
 ## BLE 5 PHY Support
 

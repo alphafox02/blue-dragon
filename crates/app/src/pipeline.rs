@@ -1453,6 +1453,16 @@ impl SdrHandle {
         }
     }
 
+    /// Sidekiq-specific: count of rf_timestamp gaps between blocks. Distinct
+    /// from overflow_count (RFIC overload). None on other backends.
+    fn sidekiq_drop_count(&self) -> Option<u64> {
+        match self {
+            #[cfg(feature = "sidekiq")]
+            SdrHandle::Sidekiq(h) => Some(h.drop_count()),
+            _ => None,
+        }
+    }
+
     /// Actual sample rate in Hz. Most SDRs match the requested rate exactly.
     /// RFNM may differ (e.g., 122.88 Msps when 122 Msps was requested).
     /// Aaronia: read from packet.stepFrequency at open time per vendor docs.
@@ -2133,7 +2143,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     // SDR recv thread: continuously drains hardware, sends i16 buffers to PFB thread.
     // Accumulates multiple recv calls to ~4080 complex samples before sending,
     // compensating for smaller max_samps with SC16 wire format.
-    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(32);
+    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(128);
     let sdr_overflow = overflow_count.clone();
     let sdr_running = running.clone();
     let sdr_buf_size = max_samps * 2; // i16 elements per recv
@@ -2149,6 +2159,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
             let mut send_pos: usize = 0;
             let mut last_flag_log = Instant::now();
             let mut prev_flags: (u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0);
+            let mut prev_sidekiq_drops: u64 = 0;
 
             while sdr_running.load(Ordering::Relaxed) {
                 // Check for runtime gain change from C2
@@ -2180,6 +2191,16 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                             );
                         }
                         prev_flags = cur;
+                    }
+                    if let Some(cur) = sdr.sidekiq_drop_count() {
+                        let d = cur.saturating_sub(prev_sidekiq_drops);
+                        if d > 0 || cur > 0 {
+                            log::warn!(
+                                "Sidekiq (5s deltas): drops={} (cumulative drops={}, RFIC overload={})",
+                                d, cur, sdr.overflow_count()
+                            );
+                        }
+                        prev_sidekiq_drops = cur;
                     }
                     last_flag_log = Instant::now();
                 }
@@ -2352,7 +2373,7 @@ fn run_live_gpu_loop(
 
     // SDR recv thread: continuously drains hardware, prevents overflow during GPU submit.
     // Accumulates multiple recv calls to ~4080 complex samples before sending.
-    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(32);
+    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(128);
     let sdr_overflow = overflow_count.clone();
     let sdr_running = running.clone();
     let sdr_buf_size = max_samps * 2;
