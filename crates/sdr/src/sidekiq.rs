@@ -126,7 +126,16 @@ extern "C" {
         p_revision: *mut c_char,
         p_variant: *mut c_char,
     ) -> c_int;
+    fn skiq_is_gpsdo_supported(card: u8, p_supported: *mut c_int) -> c_int;
+    fn skiq_gpsdo_enable(card: u8) -> c_int;
+    fn skiq_gpsdo_is_enabled(card: u8, p_is_enabled: *mut bool) -> c_int;
+    fn skiq_gpsdo_is_locked(card: u8, p_is_locked: *mut bool) -> c_int;
+    fn skiq_gpsdo_read_freq_accuracy(card: u8, p_ppm: *mut f64) -> c_int;
 }
+
+// skiq_gpsdo_support_t enum values (sidekiq_types.h).
+const SKIQ_GPSDO_SUPPORT_UNKNOWN: c_int = 0;
+const SKIQ_GPSDO_SUPPORT_IS_SUPPORTED: c_int = 1;
 
 // Buffer sizes for skiq_read_part_info (from sidekiq_types.h).
 const SKIQ_PART_NUM_STRLEN: usize = 7;
@@ -366,6 +375,15 @@ pub struct SidekiqExtras {
     /// Best-effort: lower the process nice value so recv stays responsive
     /// when the host is loaded. Silently no-ops without CAP_SYS_NICE.
     pub boost_priority: bool,
+    /// Enable the card's FPGA-based GPSDO at open. Only effective on cards
+    /// that have an integrated GPS receiver (e.g. Stretch / m.2-2280) with
+    /// a GPS antenna physically connected and with sky view. If the GPSDO
+    /// fails to acquire lock, the card silently falls back to the onboard
+    /// TCVCXO; this flag is therefore safe to leave on even without a GPS
+    /// signal, but for a passive sniffer it is off by default since the
+    /// TCVCXO baseline (Stretch: ~0.1 ppm) is already within BLE GFSK
+    /// tolerance.
+    pub gpsdo: bool,
 }
 
 impl SidekiqHandle {
@@ -389,6 +407,7 @@ impl SidekiqHandle {
                 agc: false,
                 dc_offset_corr: true,
                 boost_priority: true,
+                gpsdo: false,
             },
         )
     }
@@ -482,6 +501,40 @@ impl SidekiqHandle {
             "sidekiq device metadata: part={}, RX ADC bits={}, LO range {}..{} Hz",
             part_str, adc_bits, lo_min, lo_max
         );
+
+        // GPSDO status + optional enable. The Stretch / m.2-2280 ships with
+        // an integrated GPS receiver and FPGA-based GPSDO; other Sidekiqs
+        // do not. If extras.gpsdo is set AND the card supports GPSDO, we
+        // enable it and report whether it has lock. The card falls back to
+        // the onboard TCVCXO if GPS is not locked, so enabling is safe even
+        // without a GPS signal.
+        let mut gpsdo_sup: c_int = SKIQ_GPSDO_SUPPORT_UNKNOWN;
+        if unsafe { skiq_is_gpsdo_supported(card, &mut gpsdo_sup) } == 0 {
+            if gpsdo_sup == SKIQ_GPSDO_SUPPORT_IS_SUPPORTED {
+                if extras.gpsdo {
+                    let rc = unsafe { skiq_gpsdo_enable(card) };
+                    if rc != 0 {
+                        log::warn!("sidekiq: skiq_gpsdo_enable failed rc={}, continuing on TCVCXO", rc);
+                    }
+                }
+                let mut enabled = false;
+                let mut locked = false;
+                let mut ppm = 0.0_f64;
+                let _ = unsafe { skiq_gpsdo_is_enabled(card, &mut enabled) };
+                let _ = unsafe { skiq_gpsdo_is_locked(card, &mut locked) };
+                let _ = unsafe { skiq_gpsdo_read_freq_accuracy(card, &mut ppm) };
+                log::info!(
+                    "sidekiq GPSDO: supported=yes, enabled={}, locked={}, freq_accuracy={:.4} ppm \
+                     (TCVCXO baseline ~0.1 ppm on Stretch)",
+                    enabled, locked, ppm
+                );
+            } else {
+                log::info!(
+                    "sidekiq GPSDO: not available on this card / FPGA (status code {})",
+                    gpsdo_sup
+                );
+            }
+        }
 
         // Helper to roll back partial setup on any subsequent failure.
         let teardown = |card: u8, streaming: bool| {

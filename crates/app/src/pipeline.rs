@@ -1518,6 +1518,7 @@ fn open_sdr_handle(
     aaronia_decim: u32,
     sidekiq_agc: bool,
     sidekiq_dc_corr: bool,
+    sidekiq_gpsdo: bool,
 ) -> Result<SdrHandle, String> {
     let sdr_type = detect_sdr_type(iface);
     match sdr_type {
@@ -1571,6 +1572,7 @@ fn open_sdr_handle(
                 agc: sidekiq_agc,
                 dc_offset_corr: sidekiq_dc_corr,
                 boost_priority: true,
+                gpsdo: sidekiq_gpsdo,
             };
             let h = bd_sdr::sidekiq::SidekiqHandle::open_with_extras(
                 iface, sample_rate, center_freq_hz, gain, antenna, extras,
@@ -1598,6 +1600,9 @@ pub struct LiveConfig<'a> {
     pub sidekiq_agc: bool,
     /// Sidekiq: enable FPGA DC offset correction.
     pub sidekiq_dc_corr: bool,
+    /// Sidekiq: enable FPGA-based GPSDO (requires integrated GPS receiver +
+    /// GPS antenna with lock).
+    pub sidekiq_gpsdo: bool,
     pub antenna: Option<&'a str>,
     pub pcap_path: Option<&'a Path>,
     pub check_crc: bool,
@@ -1626,6 +1631,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         aaronia_decim,
         sidekiq_agc,
         sidekiq_dc_corr,
+        sidekiq_gpsdo,
         running,
     } = cfg;
     let sample_rate = num_channels as u32 * 1_000_000;
@@ -1688,7 +1694,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         .collect();
 
     // Open SDR early so we can query the actual sample rate for resample ratio.
-    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna, aaronia_decim, sidekiq_agc, sidekiq_dc_corr)?;
+    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna, aaronia_decim, sidekiq_agc, sidekiq_dc_corr, sidekiq_gpsdo)?;
 
     // Compute resample ratio: if actual per-channel rate differs from target
     // (sps * 1 MHz), resample demod output to correct timing drift.

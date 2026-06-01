@@ -78,6 +78,13 @@ struct Cli {
     #[arg(long)]
     sidekiq_no_dc: bool,
 
+    /// Sidekiq: enable the card's FPGA-based GPSDO at open. Only meaningful
+    /// on cards with an integrated GPS receiver (e.g. Stretch / m.2-2280)
+    /// with a GPS antenna connected. Without lock, the card falls back to
+    /// its TCVCXO automatically.
+    #[arg(long)]
+    sidekiq_gpsdo: bool,
+
     /// SDR antenna/RX port (e.g. RX2, TX/RX for USRP; RX1, RX2 for bladeRF)
     #[arg(long)]
     antenna: Option<String>,
@@ -565,6 +572,7 @@ fn main() {
             hackrf_vga: cli.hackrf_vga,
             sidekiq_agc: cli.sidekiq_agc,
             sidekiq_dc_corr: !cli.sidekiq_no_dc,
+            sidekiq_gpsdo: cli.sidekiq_gpsdo,
             antenna: cli.antenna.as_deref(),
             pcap_path: cli.write.as_deref(),
             check_crc: cli.check_crc,
