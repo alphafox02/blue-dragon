@@ -67,7 +67,7 @@ too low buries the signal in the noise floor (low CRC rate).**
 | HackRF | 40 LNA / 20 VGA | TBD | TBD | Separate `--hackrf-lna` / `--hackrf-vga` |
 | Spectran V6 | 60 | 30-60 | 20-30 | `-g N` → reflevel -N dBm, clamped [-36, 10]; preamp=Auto, auto-scaled f32→i16 |
 | RFNM (Lime) | 30 | 20-30 | 30 | Lime gain range -24 to 30 dB |
-| Epiq Sidekiq | varies | **35** | TBD | `-g` is the device's RX gain *index* (range varies per model, read from the SDK at open time). On AD9361-based cards (Stretch / m.2-2280, m.2-3042, mPCIe) each step ≈ 1 dB; index 35 measured best on a populated office BLE band in our testing. `--sidekiq-agc` switches to the SDK's auto-gain. `--sidekiq-no-dc` disables FPGA DC offset correction (on by default). |
+| Epiq Sidekiq | varies | **30-35** | TBD | `-g` is the device's RX gain *index* (range varies per model, read from the SDK at open time). On AD9361-based cards (Stretch / m.2-2280, m.2-3042, mPCIe) each step ≈ 1 dB; indices 30-35 measured highest CRC on a populated office BLE band in our testing. `--sidekiq-agc` switches to the SDK's auto-gain, `--sidekiq-no-dc` disables FPGA DC offset correction (on by default), `--sidekiq-gpsdo` enables FPGA GPSDO on cards with an integrated GPS receiver. **Recommended production config: build with `--features sidekiq,zmq,gps,gpu` and run `-C 60 -g 30`** for 85%+ CRC at 60 MHz of in-band BLE capture with the Intel/AMD integrated GPU PFB. Avoid prime-number `-C` values (e.g. 53, 59, 61) with the GPU PFB; CPU path handles them fine. |
 | SoapySDR | 60 | Device-dependent | Device-dependent | Depends on underlying hardware |
 
 **Symptoms of gain too high:** BLE count = 0, all bursts fail decode (ADC saturation
