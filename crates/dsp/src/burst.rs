@@ -13,6 +13,16 @@ const BURST_RSSI_OFFSET: usize = 80;
 /// capturing for this many samples before ending the burst.  Matches the
 /// C code's timeout of 100 samples.
 const SQUELCH_TIMEOUT: u32 = 100;
+const CHANNEL_SAMPLE_PERIOD_NS: u64 = 500; // 2 Msps channelizer output
+
+fn timestamp_with_sample_offset(start: &Timespec, sample_offset: usize) -> Timespec {
+    let offset_ns = sample_offset as u64 * CHANNEL_SAMPLE_PERIOD_NS;
+    let total_ns = start.tv_nsec + offset_ns;
+    Timespec {
+        tv_sec: start.tv_sec + total_ns / 1_000_000_000,
+        tv_nsec: total_ns % 1_000_000_000,
+    }
+}
 
 /// Scan window size for advertising channel continuous capture.
 /// Must fit at least one coded S=8 burst (~6560 samples for DRI-sized PDU)
@@ -85,6 +95,16 @@ impl BurstCatcher {
     /// Process one IQ sample. Returns Some(Burst) when a complete burst has been detected
     /// (signal rose above squelch, accumulated samples, then fell back below and timed out).
     pub fn execute(&mut self, sample: Complex32, now: &Timespec) -> Option<Burst> {
+        self.execute_at(sample, now, 0)
+    }
+
+    /// Process a sample at an offset from a channelized batch timestamp.
+    pub fn execute_at(
+        &mut self,
+        sample: Complex32,
+        batch_start: &Timespec,
+        sample_offset: usize,
+    ) -> Option<Burst> {
         let (output, state) = self.agc.execute(sample);
 
         // Scan mode: accumulate every AGC-processed sample regardless of squelch
@@ -92,7 +112,7 @@ impl BurstCatcher {
             sbuf.push(output);
             self.scan_new += 1;
             if self.scan_new == 1 {
-                self.scan_ts = now.clone();
+                self.scan_ts = timestamp_with_sample_offset(batch_start, sample_offset);
             }
         }
 
@@ -101,7 +121,7 @@ impl BurstCatcher {
                 // Start of a new burst
                 self.burst_buf = Vec::with_capacity(BURST_START_SIZE);
                 self.burst_rssi = -127.0;
-                self.timestamp = now.clone();
+                self.timestamp = timestamp_with_sample_offset(batch_start, sample_offset);
                 self.capturing = true;
                 None
             }
@@ -175,5 +195,21 @@ impl BurstCatcher {
     /// Set squelch threshold
     pub fn set_squelch(&mut self, threshold_db: f32) {
         self.agc.set_squelch_threshold(threshold_db);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_offset_timestamp_crosses_second_boundary() {
+        let start = Timespec {
+            tv_sec: 10,
+            tv_nsec: 999_999_000,
+        };
+        let result = timestamp_with_sample_offset(&start, 4);
+        assert_eq!(result.tv_sec, 11);
+        assert_eq!(result.tv_nsec, 1_000);
     }
 }

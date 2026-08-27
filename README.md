@@ -5,9 +5,9 @@ Wideband BLE and Classic Bluetooth passive sniffer written in Rust.
 Most BLE sniffers capture one channel at a time. Blue Dragon uses a
 polyphase filterbank channelizer to capture **up to 40 BLE channels
 simultaneously** from a single SDR, decoding BLE 5 LE 1M, LE 2M, and
-LE Coded PHYs plus Classic Bluetooth BR in the same passband. This
-means no channel hopping and no missed packets -- every advertisement
-and connection event across the captured bandwidth is seen.
+LE Coded PHYs plus Classic Bluetooth BR/EDR detection in the same
+passband. Wideband capture avoids receiver-side channel hopping, subject to
+the SDR bandwidth, squelch, signal quality, and decoder limits.
 
 Output is Wireshark-compatible PCAP with optional ZMQ streaming for
 multi-sensor deployments, GPS tagging for drive surveys, and a web
@@ -21,7 +21,9 @@ dashboard for real-time monitoring.
 | BLE LE 1M decoding | Tested | 95-96% CRC pass rate |
 | BLE LE 2M decoding | Tested | |
 | BLE LE Coded decoding | Tested | Low volume confirmed in drive tests |
-| Classic BT BR detection | Tested | LAP extraction, UAP recovery |
+| Classic BT BR detection | Tested | LAP extraction and CRC-valid BR payloads confirmed OTA |
+| Classic BT UAP recovery | Tested | Autonomous OTA recovery confirmed from two clock-consistent, CRC-valid payloads |
+| Classic BT EDR decoding | Experimental | Sync, DQPSK/8DPSK, matched filter, and CRC paths are unit-tested; CRC-valid OTA EDR not yet confirmed |
 | PCAP output (PPI) | Tested | Mixed BLE+BT per-packet DLT |
 | GPS tagging (gpsd) | Tested | 100% packet tagging in drive tests |
 | ZMQ streaming | Tested | PUB/SUB + C2 heartbeat |
@@ -352,6 +354,7 @@ recognizes all three PHY types natively.
 ```
 Input (pick one):
     -f, --file FILE         Read input from IQ file
+    --burst-file FILE       Replay a compact channelized burst capture
     -l, --live              Capture live from SDR
 
 SDR settings:
@@ -366,7 +369,10 @@ SDR settings:
 
 Output:
     -w, --write FILE        Output PCAP to file or FIFO
-    --check-crc             Enable BLE CRC-24 validation
+    --write-bursts FILE     Record channelized IQ bursts for replay
+    --burst-limit-mb N      Stop burst recording at N MiB (default: 512; 0=unlimited)
+    --check-crc             Enable BLE CRC-24 validation (Classic payload CRC is always required)
+    --classic-address ADDR  Trust a known Classic BD_ADDR (repeatable)
     --stats                 Print performance statistics
     -v, --verbose           Verbose output
 
@@ -450,6 +456,26 @@ threshold.
 Read from a previously recorded IQ file:
 
     blue-dragon -f recording.ci16 -c 2441 -C 20 -w output.pcap --check-crc --stats
+
+Record a bounded regression capture with a bladeRF, then replay it later:
+
+    blue-dragon -l -i bladerf0 -a -g 30 --write-bursts lab.bdb --burst-limit-mb 512 --check-crc
+    blue-dragon --burst-file lab.bdb -w replay.pcap --check-crc --stats
+
+Supply a Classic address known from an independent source when validating
+header and payload decoding:
+
+    blue-dragon --burst-file lab.bdb --classic-address 10:20:30:40:50:60 -w replay.pcap
+
+`--classic-address` supplies trusted LAP/UAP ground truth. It does not claim
+that the address was recovered from RF, and it does not bypass payload CRC
+validation.
+
+Compact burst files contain only the 2 Msps channelized windows selected by
+the squelch or coded scanner, with timestamps, frequency, RSSI, and noise
+metadata. IQ is scaled per record and stored as interleaved signed 16-bit
+samples. This makes them practical regression artifacts while retaining both
+successful decodes and rejected bursts needed to check false positives.
 
 ### Channel Count Guidelines
 
@@ -618,7 +644,7 @@ Protocol Decoder
     |-- BLE LE Coded: 80-symbol preamble, FEC (Viterbi), pattern demap
     |-- BLE Extended Advertising: Common Extended Header, AuxPtr
     |-- BLE connection following (CONNECT_IND tracking)
-    |-- Classic BT: Barker code, FEC syndrome decode
+    |-- Classic BT BR/EDR: Barker code, FEC/HEC, DPSK sync, payload CRC
     v
 Output
     |-- PCAP file (DLT 256 with PPI wrapping, PHY flags)
@@ -637,7 +663,7 @@ WHAD ButteRFly advertiser through 30 dB attenuator:
 |--------|--------|
 | BLE CRC validation rate | 92-95% |
 | Packet rate (active environment) | 30-60 pkt/s |
-| Classic BT UAP recovery | Converges in ~12 packets |
+| Classic BT UAP recovery | Autonomous CRC/clock recovery confirmed OTA |
 | Memory usage | ~40 MB RSS |
 
 ### GPU vs CPU Performance

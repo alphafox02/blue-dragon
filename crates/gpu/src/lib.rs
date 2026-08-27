@@ -111,7 +111,7 @@ impl GpuChannelizer {
     /// Fill this with `batch_size * M` int16 IQ samples (M/2 complex samples per step,
     /// 2 int16 values per complex sample, M int16 values per step). The pre-roll region
     /// is already filled from the previous batch.
-    pub fn raw_buffer(&self) -> &mut [i16] {
+    pub fn raw_buffer(&mut self) -> &mut [i16] {
         unsafe {
             let ptr = ffi::gpu_pfb_get_buffer();
             slice::from_raw_parts_mut(ptr, self.buffer_len)
@@ -176,10 +176,7 @@ pub fn iter_gpu_result(
         let base = t * num_channels * 2;
         for ch in 0..num_channels {
             let idx = base + ch * 2;
-            let sample = Complex32::new(
-                result[idx] * fft_scale,
-                result[idx + 1] * fft_scale,
-            );
+            let sample = Complex32::new(result[idx] * fft_scale, result[idx + 1] * fft_scale);
             f(t, ch, sample);
         }
     }

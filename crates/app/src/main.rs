@@ -1,5 +1,6 @@
 // Copyright 2025-2026 CEMAXECUTER LLC
 
+mod burst_file;
 mod pipeline;
 
 use clap::Parser;
@@ -18,6 +19,10 @@ struct Cli {
     /// IQ file input (for offline processing)
     #[arg(short = 'f', long)]
     file: Option<PathBuf>,
+
+    /// Replay a compact channelized burst capture
+    #[arg(long, value_name = "FILE")]
+    burst_file: Option<PathBuf>,
 
     /// SDR interface (e.g., usrp-B210-SERIAL)
     #[arg(short = 'i', long, alias = "extcap-interface")]
@@ -48,9 +53,21 @@ struct Cli {
     #[arg(short = 'w', long, alias = "fifo")]
     write: Option<PathBuf>,
 
+    /// Record channelized IQ bursts for deterministic replay
+    #[arg(long, value_name = "FILE")]
+    write_bursts: Option<PathBuf>,
+
+    /// Maximum compact burst capture size in MiB (0 disables the limit)
+    #[arg(long, default_value_t = 512)]
+    burst_limit_mb: u64,
+
     /// Enable CRC checking
     #[arg(long)]
     check_crc: bool,
+
+    /// Known Classic Bluetooth address used as trusted LAP/UAP ground truth
+    #[arg(long, value_name = "BD_ADDR")]
+    classic_address: Vec<String>,
 
     /// SDR gain in dB
     #[arg(short = 'g', long, default_value = "60")]
@@ -240,6 +257,20 @@ fn print_extcap_interfaces() {
             }
         }
     }
+}
+
+fn parse_classic_address(value: &str) -> Result<(u32, u8), String> {
+    let bytes: Vec<u8> = value
+        .split(':')
+        .map(|part| u8::from_str_radix(part, 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("invalid Classic address: {}", value))?;
+    if bytes.len() != 6 {
+        return Err(format!("invalid Classic address: {}", value));
+    }
+    let uap = bytes[2];
+    let lap = ((bytes[3] as u32) << 16) | ((bytes[4] as u32) << 8) | bytes[5] as u32;
+    Ok((lap, uap))
 }
 
 fn print_extcap_dlts() {
@@ -467,7 +498,29 @@ fn main() {
         log::info!("channels: {}", channels);
     }
 
-    if let Some(ref file) = cli.file {
+    let classic_uaps: Vec<(u32, u8)> = cli
+        .classic_address
+        .iter()
+        .map(|address| {
+            parse_classic_address(address).unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            })
+        })
+        .collect();
+
+    if let Some(ref burst_file) = cli.burst_file {
+        if let Err(e) = pipeline::run_burst_file(
+            burst_file,
+            cli.write.as_deref(),
+            cli.check_crc,
+            cli.stats,
+            &classic_uaps,
+        ) {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    } else if let Some(ref file) = cli.file {
         let format = match cli.format.as_str() {
             "ci8" => bd_sdr::file::SampleFormat::Ci8,
             "ci16" => bd_sdr::file::SampleFormat::Ci16,
@@ -518,9 +571,12 @@ fn main() {
             center_freq,
             file_channels,
             cli.write.as_deref(),
+            cli.write_bursts.as_deref(),
+            cli.burst_limit_mb.saturating_mul(1024 * 1024),
             cli.check_crc,
             cli.squelch,
             cli.stats,
+            &classic_uaps,
         ) {
             eprintln!("error: {}", e);
             std::process::exit(1);
@@ -567,6 +623,8 @@ fn main() {
             sidekiq_dc_corr: !cli.sidekiq_no_dc,
             antenna: cli.antenna.as_deref(),
             pcap_path: cli.write.as_deref(),
+            burst_path: cli.write_bursts.as_deref(),
+            burst_limit_bytes: cli.burst_limit_mb.saturating_mul(1024 * 1024),
             check_crc: cli.check_crc,
             print_stats: cli.stats,
             use_gpu,
@@ -577,6 +635,7 @@ fn main() {
             hci_enabled: cli.hci,
             active_scan: cli.active_scan,
             coded_scan: cli.coded_scan,
+            classic_uaps: &classic_uaps,
             aaronia_decim: cli.aaronia_decim,
             running,
         }) {
@@ -584,7 +643,31 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        eprintln!("no input specified. Use -f <file> for file input or -l for live SDR.");
+        eprintln!("no input specified. Use -f <file>, --burst-file <file>, or -l for live SDR.");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_classic_address;
+
+    #[test]
+    fn classic_address_maps_uap_and_lap() {
+        assert_eq!(
+            parse_classic_address("10:20:30:40:50:60"),
+            Ok((0x405060, 0x30))
+        );
+        assert_eq!(
+            parse_classic_address("a0:b1:c2:d3:e4:f5"),
+            Ok((0xD3E4F5, 0xC2))
+        );
+    }
+
+    #[test]
+    fn classic_address_rejects_malformed_values() {
+        for value in ["10:20:30:40:50", "10:20:GG:40:50:60", "405060"] {
+            assert!(parse_classic_address(value).is_err());
+        }
     }
 }

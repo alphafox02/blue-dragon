@@ -41,10 +41,22 @@ impl GfskModulator {
         let gauss_filter = if sps == 4 {
             // 4-symbol span, 16 taps at SPS=4 (from BTLE btle_tx.c)
             vec![
-                7.561773e-09, 1.197935e-06, 8.050684e-05, 2.326833e-03,
-                2.959908e-02, 1.727474e-01, 4.999195e-01, 8.249246e-01,
-                9.408018e-01, 8.249246e-01, 4.999195e-01, 1.727474e-01,
-                2.959908e-02, 2.326833e-03, 8.050684e-05, 1.197935e-06,
+                7.561773e-09,
+                1.197935e-06,
+                8.050684e-05,
+                2.326833e-03,
+                2.959908e-02,
+                1.727474e-01,
+                4.999195e-01,
+                8.249246e-01,
+                9.408018e-01,
+                8.249246e-01,
+                4.999195e-01,
+                1.727474e-01,
+                2.959908e-02,
+                2.326833e-03,
+                8.050684e-05,
+                1.197935e-06,
             ]
         } else {
             // Compute for other SPS values
@@ -70,7 +82,10 @@ impl GfskModulator {
         }
 
         // Convert bits to NRZ: 0 -> -1.0, 1 -> +1.0
-        let nrz: Vec<f64> = bits.iter().map(|&b| if b != 0 { 1.0 } else { -1.0 }).collect();
+        let nrz: Vec<f64> = bits
+            .iter()
+            .map(|&b| if b != 0 { 1.0 } else { -1.0 })
+            .collect();
 
         // Upsample to SPS rate (zero-insert + filter)
         let upsampled = self.upsample_and_filter(&nrz);
@@ -84,8 +99,12 @@ impl GfskModulator {
         for &freq in &upsampled {
             phase += freq * phase_inc;
             // Wrap phase to [-pi, pi] for numerical stability
-            if phase > PI { phase -= 2.0 * PI; }
-            if phase < -PI { phase += 2.0 * PI; }
+            if phase > PI {
+                phase -= 2.0 * PI;
+            }
+            if phase < -PI {
+                phase += 2.0 * PI;
+            }
             iq.push(phase.cos() as f32);
             iq.push(phase.sin() as f32);
         }
@@ -236,7 +255,7 @@ mod tests {
     fn test_gaussian_filter() {
         let filter = gaussian_filter(0.5, 4, 3);
         assert_eq!(filter.len(), 13); // 3*4 + 1
-        // Filter should be symmetric
+                                      // Filter should be symmetric
         let mid = filter.len() / 2;
         for i in 0..mid {
             assert!((filter[i] - filter[filter.len() - 1 - i]).abs() < 1e-10);
@@ -272,10 +291,7 @@ mod tests {
         let bits = vec![1, 0, 1, 0, 1, 0, 1, 0];
         let iq = mod_.modulate_i16(&bits);
         assert_eq!(iq.len(), 32);
-        // Values should be in i16 range
-        for &v in &iq {
-            assert!(v >= -32768 && v <= 32767);
-        }
+        assert!(iq.iter().any(|&sample| sample != 0));
     }
 
     #[test]

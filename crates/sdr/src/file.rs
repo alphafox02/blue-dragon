@@ -1,10 +1,10 @@
 // Copyright 2025-2026 CEMAXECUTER LLC
 
+use crate::{SampleBuf, SdrSource};
+use crossbeam::channel::Sender;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
-use crossbeam::channel::Sender;
-use crate::{SampleBuf, SdrSource};
 
 /// IQ sample format for file input (alias for shared IqFormat)
 pub type SampleFormat = crate::IqFormat;
@@ -42,7 +42,10 @@ impl FileSource {
     }
 
     /// Read a block of samples from the file, converting to int16 IQ pairs.
-    fn read_block_ci8(reader: &mut BufReader<File>, num_samples: usize) -> io::Result<Option<Vec<i16>>> {
+    fn read_block_ci8(
+        reader: &mut BufReader<File>,
+        num_samples: usize,
+    ) -> io::Result<Option<Vec<i16>>> {
         let bytes_needed = num_samples * 2; // 2 bytes per complex sample (I, Q)
         let mut buf = vec![0u8; bytes_needed];
         let n = reader.read(&mut buf)?;
@@ -59,7 +62,10 @@ impl FileSource {
         Ok(Some(out))
     }
 
-    fn read_block_ci16(reader: &mut BufReader<File>, num_samples: usize) -> io::Result<Option<Vec<i16>>> {
+    fn read_block_ci16(
+        reader: &mut BufReader<File>,
+        num_samples: usize,
+    ) -> io::Result<Option<Vec<i16>>> {
         let bytes_needed = num_samples * 4; // 4 bytes per complex sample
         let mut buf = vec![0u8; bytes_needed];
         let n = reader.read(&mut buf)?;
@@ -78,7 +84,10 @@ impl FileSource {
         Ok(Some(out))
     }
 
-    fn read_block_cf32(reader: &mut BufReader<File>, num_samples: usize) -> io::Result<Option<Vec<i16>>> {
+    fn read_block_cf32(
+        reader: &mut BufReader<File>,
+        num_samples: usize,
+    ) -> io::Result<Option<Vec<i16>>> {
         let bytes_needed = num_samples * 8; // 8 bytes per complex sample
         let mut buf = vec![0u8; bytes_needed];
         let n = reader.read(&mut buf)?;
@@ -90,7 +99,8 @@ impl FileSource {
         for i in 0..actual_samples {
             let base = i * 8;
             let i_f = f32::from_le_bytes([buf[base], buf[base + 1], buf[base + 2], buf[base + 3]]);
-            let q_f = f32::from_le_bytes([buf[base + 4], buf[base + 5], buf[base + 6], buf[base + 7]]);
+            let q_f =
+                f32::from_le_bytes([buf[base + 4], buf[base + 5], buf[base + 6], buf[base + 7]]);
             // Convert float [-1, 1] to int16
             out.push((i_f * 32767.0).clamp(-32768.0, 32767.0) as i16);
             out.push((q_f * 32767.0).clamp(-32768.0, 32767.0) as i16);
@@ -114,7 +124,7 @@ impl SdrSource for FileSource {
             self.center_freq / 1_000_000
         );
 
-        while self.running {
+        loop {
             let result = match self.format {
                 SampleFormat::Ci8 => Self::read_block_ci8(&mut reader, self.block_size),
                 SampleFormat::Ci16 => Self::read_block_ci16(&mut reader, self.block_size),
