@@ -8,6 +8,7 @@ Cargo.lock
 # Capture files
 *.pcap
 *.pcapng
+*.bdb
 
 # IQ recordings
 *.ci8
@@ -25,3 +26,4 @@ __pycache__/
 
 # Environment / credentials
 .env
+.claude/
