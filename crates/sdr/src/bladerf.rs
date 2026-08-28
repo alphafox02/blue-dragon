@@ -18,6 +18,11 @@ const BLADERF_MODULE_TX: c_int = 1;
 const BLADERF_CHANNEL_RX_0: c_int = 0;
 const BLADERF_CHANNEL_TX_0: c_int = 1;
 const BLADERF_GAIN_MGC: c_int = 1;
+// On the bladeRF 2.0 Micro this maps to the AD9361 slow-attack hardware AGC,
+// which adapts front-end gain per-signal. Selected when the requested gain is
+// negative (e.g. -g -1) so wideband captures don't overload on a strong nearby
+// transmitter or go deaf on a weak one, without hand-tuning a fixed gain.
+const BLADERF_GAIN_DEFAULT: c_int = 0;
 const BLADERF_FORMAT_SC8_Q7: c_int = 4;
 const BLADERF_FORMAT_SC16_Q11: c_int = 1;
 
@@ -198,8 +203,12 @@ impl SdrSource for BladerfSource {
                 BLADERF_FORMAT_SC16_Q11
             };
             bladerf_set_frequency(dev, BLADERF_CHANNEL_RX_0, self.center_freq);
-            bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_MGC);
-            bladerf_set_gain(dev, BLADERF_CHANNEL_RX_0, self.gain);
+            if self.gain < 0 {
+                bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_DEFAULT);
+            } else {
+                bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_MGC);
+                bladerf_set_gain(dev, BLADERF_CHANNEL_RX_0, self.gain);
+            }
 
             let buf_size = (self.sample_rate / 1_000_000 / 2 * 4096).max(8192);
             let r = bladerf_sync_config(dev, BLADERF_MODULE_RX, format, 16, buf_size, 8, 3500);
@@ -360,8 +369,12 @@ impl BladerfHandle {
                 BLADERF_FORMAT_SC16_Q11
             };
             bladerf_set_frequency(dev, rx_channel, center_freq);
-            bladerf_set_gain_mode(dev, rx_channel, BLADERF_GAIN_MGC);
-            bladerf_set_gain(dev, rx_channel, gain);
+            if gain < 0 {
+                bladerf_set_gain_mode(dev, rx_channel, BLADERF_GAIN_DEFAULT);
+            } else {
+                bladerf_set_gain_mode(dev, rx_channel, BLADERF_GAIN_MGC);
+                bladerf_set_gain(dev, rx_channel, gain);
+            }
 
             // Buffer size: match C tool (channels/2 * 4096, minimum 8192)
             let buf_size = (sample_rate / 1_000_000 / 2 * 4096).max(8192);
