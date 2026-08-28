@@ -1502,6 +1502,18 @@ fn decode_edr_payload_bits(raw: &[u8], uap: u8, clk6: u8) -> Option<Vec<u8>> {
     None
 }
 
+/// Decode only the two-byte EDR payload header for diagnostics. No identity or
+/// payload is accepted from this result; the full EDR CRC remains authoritative.
+pub fn edr_payload_header(raw: &[u8], clk6: u8) -> Option<PayloadHeader> {
+    let whitening = whitening_slice(clk6, 18, raw.len());
+    let data: Vec<u8> = raw
+        .iter()
+        .zip(whitening)
+        .map(|(&bit, mask)| bit ^ mask)
+        .collect();
+    parse_payload_header(&data, true)
+}
+
 /// Attach a synchronization-validated EDR bitstream to a packet. The bits must
 /// begin at the two-byte EDR payload header and remain whitened as transmitted.
 pub fn enrich_edr_payload(pkt: &mut ClassicBtPacket, raw_bits: &[u8]) -> bool {

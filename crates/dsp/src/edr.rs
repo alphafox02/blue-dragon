@@ -244,14 +244,33 @@ pub fn demod_payload_variants(
     sps: usize,
     bits_per_symbol: usize,
 ) -> Vec<Vec<u8>> {
+    demod_payload_variants_with_diagnostic(samples, sync_reference, sps, bits_per_symbol).0
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SyncDiagnostic {
+    pub score: f32,
+    pub offset: isize,
+    pub conjugated: bool,
+}
+
+/// Demodulate bounded timing/orientation variants and report the best fixed
+/// sync score, including when it is too poor to admit any payload variant.
+pub fn demod_payload_variants_with_diagnostic(
+    samples: &[Complex32],
+    sync_reference: usize,
+    sps: usize,
+    bits_per_symbol: usize,
+) -> (Vec<Vec<u8>>, Option<SyncDiagnostic>) {
     if sps == 0 || !matches!(bits_per_symbol, 2 | 3) {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     const MAX_SYNC_SCORE: f32 = 0.35;
     const MAX_SYNC_PEAKS: usize = 4;
     let search_radius = 8 * sps;
     let mut variants = Vec::new();
+    let mut diagnostic: Option<SyncDiagnostic> = None;
 
     // A channelizer or IQ source can reverse spectral orientation. GFSK can
     // still correlate after a bit inversion, while differential PSK changes
@@ -303,6 +322,13 @@ pub fn demod_payload_variants(
                 })
                 .sum::<f32>()
                 / SYNC_DPHI.len() as f32;
+            if diagnostic.is_none_or(|best| score < best.score) {
+                diagnostic = Some(SyncDiagnostic {
+                    score,
+                    offset: start as isize - sync_reference as isize,
+                    conjugated: conjugate,
+                });
+            }
             if score <= MAX_SYNC_SCORE {
                 peaks.push((score, start, residual));
             }
@@ -325,7 +351,7 @@ pub fn demod_payload_variants(
             }
         }
     }
-    variants
+    (variants, diagnostic)
 }
 
 #[cfg(test)]

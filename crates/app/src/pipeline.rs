@@ -280,7 +280,9 @@ pub fn run_file(
                             bt_pkt.timestamp =
                                 bt_sync_timestamp(&burst_ts, &fsk_result, bt_pkt.sync_offset);
                             let mut announce = btbb::enrich(&mut bt_pkt, &mut bt_tracker);
-                            if try_enrich_edr(&burst, &fsk_result, &mut bt_pkt, &mut bt_tracker) {
+                            if try_enrich_edr(&burst, &fsk_result, &mut bt_pkt, &mut bt_tracker)
+                                .enriched
+                            {
                                 announce |= bt_tracker.mark_announced(bt_pkt.lap);
                             }
                             if announce {
@@ -533,13 +535,17 @@ pub fn run_burst_file(
 
     if print_stats {
         eprintln!(
-            "replay done: BLE: {} BT: {} bursts: {} CRC: {:.1}% ({}/{})",
+            "replay done: BLE: {} BT: {} bursts: {} CRC: {:.1}% ({}/{}) EDR: try={} sync={} crc={} best={:.3}",
             stats.total_ble,
             stats.total_bt,
             stats.total_bursts,
             stats.crc_pct(),
             stats.valid_crc,
             stats.total_crc,
+            stats.edr_attempts,
+            stats.edr_syncs,
+            stats.edr_crc_matches,
+            stats.edr_best_sync_score.unwrap_or(f32::NAN),
         );
     }
     Ok(())
@@ -628,21 +634,39 @@ fn bt_sync_timestamp(
     }
 }
 
+#[derive(Default)]
+struct EdrAttempt {
+    candidate: bool,
+    synchronized: bool,
+    crc_match: bool,
+    enriched: bool,
+    best_sync_score: Option<f32>,
+}
+
 fn try_enrich_edr(
     burst: &bd_dsp::burst::Burst,
     fsk_result: &FskResult,
     pkt: &mut bd_protocol::btbb::ClassicBtPacket,
     tracker: &mut btbb::PiconetTracker,
-) -> bool {
+) -> EdrAttempt {
     let mut candidates = btbb::edr_header_candidates(&pkt.raw_header);
+    if pkt.uap_verified {
+        if let Some(uap) = pkt.uap {
+            candidates.retain(|(candidate_uap, _)| *candidate_uap == uap);
+        }
+    }
     if let (Some(uap), Some(header)) = (pkt.uap, pkt.header) {
         if btbb::edr_bits_per_symbol(header.pkt_type).is_some() {
             candidates.insert(0, (uap, header));
         }
     }
     if candidates.is_empty() {
-        return false;
+        return EdrAttempt::default();
     }
+    let mut attempt = EdrAttempt {
+        candidate: true,
+        ..EdrAttempt::default()
+    };
 
     const SPS: usize = 2;
     const ACCESS_TRAILER_BITS: usize = 68;
@@ -675,13 +699,77 @@ fn try_enrich_edr(
             }
             corrected
         });
-        for demod_iq in [&matched_iq, &iq] {
-            let payload_variants = bd_dsp::edr::demod_payload_variants(
-                demod_iq,
-                sync_reference_sample,
-                SPS,
-                bits_per_symbol,
-            );
+        for (filter_name, demod_iq) in [("rrc", &matched_iq), ("raw", &iq)] {
+            let (payload_variants, diagnostic) =
+                bd_dsp::edr::demod_payload_variants_with_diagnostic(
+                    demod_iq,
+                    sync_reference_sample,
+                    SPS,
+                    bits_per_symbol,
+                );
+            if let Some(diagnostic) = diagnostic {
+                if attempt
+                    .best_sync_score
+                    .is_none_or(|score| diagnostic.score < score)
+                {
+                    attempt.best_sync_score = Some(diagnostic.score);
+                }
+            }
+            attempt.synchronized |= !payload_variants.is_empty();
+            if !payload_variants.is_empty() {
+                if let Some(diagnostic) = diagnostic {
+                    let header_summary = crc_candidates
+                        .iter()
+                        .map(|(uap, header)| {
+                            format!(
+                                "{:02X}/clk{:02}/{}",
+                                uap,
+                                header.clk6,
+                                btbb::pkt_type_name(header.pkt_type)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let payload_summary = payload_variants
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(variant, bits)| {
+                            crc_candidates.iter().filter_map(move |(_, header)| {
+                                if btbb::edr_bits_per_symbol(header.pkt_type)
+                                    != Some(bits_per_symbol)
+                                {
+                                    return None;
+                                }
+                                btbb::edr_payload_header(bits, header.clk6).map(|payload| {
+                                    format!(
+                                        "v{}({})/clk{}:{}/{}/{}",
+                                        variant,
+                                        bits.len(),
+                                        header.clk6,
+                                        payload.llid,
+                                        payload.flow,
+                                        payload.length
+                                    )
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    log::debug!(
+                        "EDR sync LAP={:06X} freq={} bps={} filter={} score={:.4} offset={} conjugated={} variants={} headers=[{}] payloads=[{}]",
+                        pkt.lap,
+                        pkt.freq,
+                        bits_per_symbol,
+                        filter_name,
+                        diagnostic.score,
+                        diagnostic.offset,
+                        diagnostic.conjugated,
+                        payload_variants.len(),
+                        header_summary,
+                        payload_summary,
+                    );
+                }
+            }
             for raw_payload in payload_variants {
                 for &(uap, header) in crc_candidates.iter() {
                     if btbb::edr_bits_per_symbol(header.pkt_type) != Some(bits_per_symbol) {
@@ -703,14 +791,14 @@ fn try_enrich_edr(
     }
 
     let [(candidate, uap, header)] = matches.as_slice() else {
-        return false;
+        return attempt;
     };
+    attempt.crc_match = true;
     if tracker.confirm_uap_at(pkt.lap, *uap, header.clk6, &pkt.timestamp) {
         *pkt = candidate.clone();
-        true
-    } else {
-        false
+        attempt.enriched = true;
     }
+    attempt
 }
 
 /// Process a burst: FSK demod -> BLE/BT detect -> PCAP write + ZMQ publish.
@@ -859,7 +947,9 @@ fn process_burst(
         bt_pkt.timestamp = bt_sync_timestamp(&burst_ts, &fsk_result, bt_pkt.sync_offset);
         // Recover UAP (and full BD_ADDR from FHS) across packets/channels.
         let mut announce = btbb::enrich(&mut bt_pkt, bt_tracker);
-        if try_enrich_edr(burst, &fsk_result, &mut bt_pkt, bt_tracker) {
+        let edr_attempt = try_enrich_edr(burst, &fsk_result, &mut bt_pkt, bt_tracker);
+        stats.record_edr(&edr_attempt);
+        if edr_attempt.enriched {
             announce |= bt_tracker.mark_announced(bt_pkt.lap);
         }
         if announce {
@@ -1058,6 +1148,10 @@ struct PipelineStats {
     total_crc: u64,
     valid_crc: u64,
     total_bursts: u64,
+    edr_attempts: u64,
+    edr_syncs: u64,
+    edr_crc_matches: u64,
+    edr_best_sync_score: Option<f32>,
     /// Debug: bursts that reached the coded decoder (all prior decoders returned None)
     coded_attempts: u64,
     /// Debug: FSK demod failures >= 1500 samples
@@ -1085,6 +1179,10 @@ impl PipelineStats {
             total_crc: 0,
             valid_crc: 0,
             total_bursts: 0,
+            edr_attempts: 0,
+            edr_syncs: 0,
+            edr_crc_matches: 0,
+            edr_best_sync_score: None,
             coded_attempts: 0,
             fsk_reject_long: 0,
             coded_fsk_ok: 0,
@@ -1103,6 +1201,17 @@ impl PipelineStats {
             (self.valid_crc as f64 / self.total_crc as f64) * 100.0
         } else {
             0.0
+        }
+    }
+
+    fn record_edr(&mut self, attempt: &EdrAttempt) {
+        self.edr_attempts += u64::from(attempt.candidate);
+        self.edr_syncs += u64::from(attempt.synchronized);
+        self.edr_crc_matches += u64::from(attempt.crc_match);
+        if let Some(score) = attempt.best_sync_score {
+            if self.edr_best_sync_score.is_none_or(|best| score < best) {
+                self.edr_best_sync_score = Some(score);
+            }
         }
     }
 }
@@ -1499,7 +1608,7 @@ fn spawn_parallel_pipeline(
                             String::new()
                         };
                         eprint!(
-                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{}\n",
+                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{}\n",
                             elapsed,
                             stats.total_ble,
                             phy_str,
@@ -1510,6 +1619,10 @@ fn spawn_parallel_pipeline(
                             stats.total_crc,
                             conns,
                             overflows,
+                            stats.edr_attempts,
+                            stats.edr_syncs,
+                            stats.edr_crc_matches,
+                            stats.edr_best_sync_score.unwrap_or(f32::NAN),
                             stats.coded_attempts,
                             stats.coded_fsk_ok,
                             stats.fsk_reject_long,
@@ -1534,7 +1647,7 @@ fn spawn_parallel_pipeline(
                         String::new()
                     };
                     eprintln!(
-                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {}",
+                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} EDR: try={} sync={} crc={} best={:.3}",
                         elapsed,
                         stats.total_ble,
                         phy_str,
@@ -1544,6 +1657,10 @@ fn spawn_parallel_pipeline(
                         stats.valid_crc,
                         stats.total_crc,
                         overflows,
+                        stats.edr_attempts,
+                        stats.edr_syncs,
+                        stats.edr_crc_matches,
+                        stats.edr_best_sync_score.unwrap_or(f32::NAN),
                     );
                 }
             })
