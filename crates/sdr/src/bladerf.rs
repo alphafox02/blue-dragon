@@ -10,7 +10,6 @@ use std::sync::Arc;
 use crate::{SampleBuf, SdrSource};
 
 type BladerfDevice = c_void;
-type BladerfStream = c_void;
 
 // bladeRF constants
 const BLADERF_MODULE_RX: c_int = 0;
