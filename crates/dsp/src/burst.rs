@@ -3,6 +3,7 @@
 use num_complex::Complex32;
 use crate::agc::{Agc, SquelchState};
 use bd_protocol::Timespec;
+use std::collections::VecDeque;
 
 const BURST_START_SIZE: usize = 2048;
 /// LE Coded S=8 with 251-byte payload = ~67K samples at SPS=2.
@@ -13,6 +14,19 @@ const BURST_RSSI_OFFSET: usize = 80;
 /// capturing for this many samples before ending the burst.  Matches the
 /// C code's timeout of 100 samples.
 const SQUELCH_TIMEOUT: u32 = 100;
+// EDR continuation. An EDR packet keeps the GFSK access code and header, then
+// switches to DQPSK/8DPSK, whose lower, non-constant envelope drops under the
+// squelch and ends the burst partway through the payload. When the fixed EDR
+// sync is present we extend the capture, bounded by the longest EDR packet, so
+// the full payload reaches the demod and CRC. Classic (non-scan) channels only.
+const MIN_EDR_BURST: usize = 400;         // must have captured past the sync
+const MAX_EDR_HOLD: usize = 6400;         // ~5-slot 3-DHx at 2 Msps, hard bound
+// The burst ends at the first envelope drop, so a cut EDR packet is short. Only
+// bursts in this range are continuation candidates; longer BR and coded bursts
+// are already complete and are left alone.
+const EDR_TRUNC_MAX: usize = 1500;
+const EDR_SYNC_MAX_SCORE: f32 = 0.15;     // strict; downstream CRC is authority
+const EDR_PRE_ROLL: usize = 512;          // 256 us at 2 Msps
 const CHANNEL_SAMPLE_PERIOD_NS: u64 = 500; // 2 Msps channelizer output
 
 fn timestamp_with_sample_offset(start: &Timespec, sample_offset: usize) -> Timespec {
@@ -21,6 +35,16 @@ fn timestamp_with_sample_offset(start: &Timespec, sample_offset: usize) -> Times
     Timespec {
         tv_sec: start.tv_sec + total_ns / 1_000_000_000,
         tv_nsec: total_ns % 1_000_000_000,
+    }
+}
+
+fn timestamp_before(end: &Timespec, sample_count: usize) -> Timespec {
+    let end_ns = end.tv_sec as u128 * 1_000_000_000 + end.tv_nsec as u128;
+    let offset_ns = sample_count.saturating_sub(1) as u128 * CHANNEL_SAMPLE_PERIOD_NS as u128;
+    let start_ns = end_ns.saturating_sub(offset_ns);
+    Timespec {
+        tv_sec: (start_ns / 1_000_000_000) as u64,
+        tv_nsec: (start_ns % 1_000_000_000) as u64,
     }
 }
 
@@ -47,9 +71,48 @@ pub struct Burst {
     /// True if this is a scan burst (continuous capture, not squelch-triggered).
     /// Scan bursts should only be processed for coded PHY decode.
     pub scan: bool,
+    /// True when the EDR gate selected this burst for a wideband IQ decode.
+    pub edr_extended: bool,
+    /// Number of leading pre-roll samples. Normal demodulation skips these;
+    /// the EDR fallback uses them to recover a weak access code and header.
+    pub edr_lead_samples: usize,
 }
 
 /// Per-channel burst catcher: feeds samples through AGC and detects burst boundaries
+/// First-pass test before the more expensive sync correlation: EDR's DQPSK and
+/// 8DPSK payloads have a non-constant envelope, while GFSK (both BR and BLE) is
+/// constant-envelope after AGC. Comparing the envelope's coefficient of
+/// variation lets constant-envelope bursts skip the sync search entirely. Only
+/// runs at a Classic-channel timeout.
+fn dpsk_envelope_signature(buf: &[Complex32]) -> bool {
+    let n = buf.len();
+    // Measure only the payload region: past the GFSK header (~270 samples in) and
+    // before the squelch-drop tail (last ~120). The tail always varies as the
+    // signal falls off, so including it would defeat the test. Across this window
+    // GFSK stays flat while DPSK does not.
+    let lo = 270usize;
+    let hi = n.saturating_sub(120);
+    if hi <= lo + 64 {
+        return false;
+    }
+    let win = &buf[lo..hi];
+    let mut sum = 0.0f32;
+    let mut sumsq = 0.0f32;
+    for s in win {
+        let a = s.norm();
+        sum += a;
+        sumsq += a * a;
+    }
+    let inv = 1.0 / win.len() as f32;
+    let mean = sum * inv;
+    if mean < 1e-6 {
+        return false;
+    }
+    let var = (sumsq * inv - mean * mean).max(0.0);
+    // GFSK sits around 0.05-0.12; DQPSK/8DPSK runs well above it.
+    var.sqrt() / mean > 0.25
+}
+
 pub struct BurstCatcher {
     freq: u32,
     agc: Agc,
@@ -63,6 +126,16 @@ pub struct BurstCatcher {
     scan_buf: Option<Vec<Complex32>>,
     scan_new: usize,
     scan_ts: Timespec,
+    /// Samples remaining to capture for an in-progress EDR continuation.
+    edr_hold_remaining: usize,
+    /// Continuation is opt-in with the wideband EDR path. BD_NO_EDR_CONT can
+    /// still disable it independently for A/B testing.
+    edr_enabled: bool,
+    /// Recent samples retained while idle. EDR payload energy can cross
+    /// squelch after its weaker GFSK access code and header have already passed.
+    edr_pre_roll: VecDeque<Complex32>,
+    edr_lead_in: Vec<Complex32>,
+    edr_lead_samples: usize,
 }
 
 impl BurstCatcher {
@@ -79,6 +152,12 @@ impl BurstCatcher {
             scan_buf: None,
             scan_new: 0,
             scan_ts: Timespec::default(),
+            edr_hold_remaining: 0,
+            edr_enabled: std::env::var_os("BD_EDR_WIDEBAND").is_some()
+                && std::env::var_os("BD_NO_EDR_CONT").is_none(),
+            edr_pre_roll: VecDeque::with_capacity(EDR_PRE_ROLL),
+            edr_lead_in: Vec::new(),
+            edr_lead_samples: 0,
         }
     }
 
@@ -107,6 +186,13 @@ impl BurstCatcher {
     ) -> Option<Burst> {
         let (output, state) = self.agc.execute(sample);
 
+        if self.edr_enabled && !self.capturing {
+            if self.edr_pre_roll.len() == EDR_PRE_ROLL {
+                self.edr_pre_roll.pop_front();
+            }
+            self.edr_pre_roll.push_back(output);
+        }
+
         // Scan mode: accumulate every AGC-processed sample regardless of squelch
         if let Some(ref mut sbuf) = self.scan_buf {
             sbuf.push(output);
@@ -116,12 +202,43 @@ impl BurstCatcher {
             }
         }
 
+        // Continuation in progress: keep the rest of the DPSK payload, ignoring
+        // the squelch state until the bounded sample count is reached.
+        if self.edr_hold_remaining > 0 {
+            if self.burst_buf.len() < MAX_BURST_SIZE {
+                self.burst_buf.push(output);
+            }
+            self.edr_hold_remaining -= 1;
+            if self.edr_hold_remaining == 0 {
+                self.capturing = false;
+                let burst = Burst {
+                    samples: std::mem::take(&mut self.burst_buf),
+                    freq: self.freq,
+                    num: self.burst_num,
+                    rssi_db: self.burst_rssi,
+                    noise_db: self.agc.rssi_db(),
+                    timestamp: self.timestamp.clone(),
+                    scan: false,
+                    edr_extended: true,
+                    edr_lead_samples: std::mem::take(&mut self.edr_lead_samples),
+                };
+                self.burst_num += 1;
+                return Some(burst);
+            }
+            return None;
+        }
+
         match state {
             SquelchState::Rise => {
                 // Start of a new burst
                 self.burst_buf = Vec::with_capacity(BURST_START_SIZE);
                 self.burst_rssi = -127.0;
-                self.timestamp = timestamp_with_sample_offset(batch_start, sample_offset);
+                let rise = timestamp_with_sample_offset(batch_start, sample_offset);
+                if self.edr_enabled {
+                    self.edr_lead_in.clear();
+                    self.edr_lead_in.extend(self.edr_pre_roll.drain(..));
+                }
+                self.timestamp = rise;
                 self.capturing = true;
                 None
             }
@@ -136,7 +253,69 @@ impl BurstCatcher {
             }
             SquelchState::Timeout => {
                 if self.capturing && !self.burst_buf.is_empty() {
+                    // If this Classic burst carries the fixed EDR sync it was
+                    // cut off partway through the payload. Extend the capture
+                    // instead of emitting the fragment. GFSK bursts and noise do
+                    // not match the sync, so BLE and BR are unaffected.
+                    if self.edr_enabled
+                        && self.scan_buf.is_none()
+                        && self.burst_buf.len() >= MIN_EDR_BURST
+                        && self.burst_buf.len() < EDR_TRUNC_MAX
+                        && dpsk_envelope_signature(&self.burst_buf)
+                        && crate::edr::detect_edr_sync(&self.burst_buf, 2, EDR_SYNC_MAX_SCORE)
+                            .is_some()
+                    {
+                        let lead = std::mem::take(&mut self.edr_lead_in);
+                        if !lead.is_empty() {
+                            self.edr_lead_samples = lead.len();
+                            self.timestamp = timestamp_before(&self.timestamp, lead.len());
+                            let burst = std::mem::take(&mut self.burst_buf);
+                            self.burst_buf = Vec::with_capacity(MAX_EDR_HOLD);
+                            self.burst_buf.extend(lead);
+                            self.burst_buf.extend(burst);
+                        }
+                        self.edr_hold_remaining = MAX_EDR_HOLD - self.burst_buf.len();
+                        return None;
+                    }
                     self.capturing = false;
+                    let edr_candidate = self.edr_enabled
+                        && self.scan_buf.is_none()
+                        && self.burst_buf.len() >= MIN_EDR_BURST
+                        && dpsk_envelope_signature(&self.burst_buf);
+                    if edr_candidate {
+                        let lead = std::mem::take(&mut self.edr_lead_in);
+                        let edr_lead_samples = lead.len();
+                        if std::env::var_os("BD_EDR_DEBUG").is_some() {
+                            eprintln!(
+                                "[edr-catcher] freq={} burst={} lead={}",
+                                self.freq,
+                                self.burst_buf.len(),
+                                edr_lead_samples
+                            );
+                        }
+                        if !lead.is_empty() {
+                            self.timestamp = timestamp_before(&self.timestamp, lead.len());
+                            let burst = std::mem::take(&mut self.burst_buf);
+                            self.burst_buf = Vec::with_capacity(lead.len() + burst.len());
+                            self.burst_buf.extend(lead);
+                            self.burst_buf.extend(burst);
+                        }
+                        let burst = Burst {
+                            samples: std::mem::take(&mut self.burst_buf),
+                            freq: self.freq,
+                            num: self.burst_num,
+                            rssi_db: self.burst_rssi,
+                            noise_db: self.agc.rssi_db(),
+                            timestamp: self.timestamp.clone(),
+                            scan: false,
+                            edr_extended: true,
+                            edr_lead_samples,
+                        };
+                        self.burst_num += 1;
+                        return Some(burst);
+                    } else {
+                        self.edr_lead_in.clear();
+                    }
                     let burst = Burst {
                         samples: std::mem::take(&mut self.burst_buf),
                         freq: self.freq,
@@ -145,6 +324,8 @@ impl BurstCatcher {
                         noise_db: self.agc.rssi_db(),
                         timestamp: self.timestamp.clone(),
                         scan: false,
+                        edr_extended: false,
+                        edr_lead_samples: 0,
                     };
                     self.burst_num += 1;
                     Some(burst)
@@ -178,6 +359,8 @@ impl BurstCatcher {
             noise_db: -127.0,
             timestamp: self.scan_ts.clone(),
             scan: true,
+            edr_extended: false,
+            edr_lead_samples: 0,
         };
         self.burst_num += 1;
 

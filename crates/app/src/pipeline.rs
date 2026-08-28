@@ -220,11 +220,29 @@ pub fn run_file(
     // Pre-allocated buffers (avoid per-step allocation)
     let mut fft_buf = vec![Complex32::new(0.0, 0.0); num_channels];
 
+    // Raw wideband ring buffer for phase-preserving EDR demod. An EDR packet's
+    // DPSK payload is ~1.4 MHz wide and the ~1 MHz PFB channel clips it, so we
+    // keep recent raw samples and re-extract the channel at full bandwidth when
+    // an EDR-typed packet is detected. Bounded to a few tens of milliseconds.
+    let edr_wideband_enabled = std::env::var_os("BD_EDR_WIDEBAND").is_some();
+    let raw_ring_cap: usize = (sample_rate as usize / 25).max(1 << 16); // ~40 ms
+    let mut raw_ring: Vec<Complex32> = Vec::with_capacity(raw_ring_cap + (1 << 16));
+    let mut raw_ring_start: u64 = 0; // raw complex index of raw_ring[0]
+
     // Main processing loop
     for buf in rx.iter() {
         // Type 2 PFB: each call takes M int16 values (M/2 complex samples)
         let step = num_channels; // M int16 values per PFB call
         let num_blocks = buf.data.len() / step;
+
+        // Append this block's raw complex samples to the wideband ring buffer
+        // (only when the opt-in wideband EDR path is active).
+        if edr_wideband_enabled {
+            raw_ring_start += trim_ring(&mut raw_ring, raw_ring_cap);
+            for i in 0..buf.num_samples {
+                raw_ring.push(Complex32::new(buf.data[2 * i] as f32, buf.data[2 * i + 1] as f32));
+            }
+        }
 
         for block in 0..num_blocks {
             let offset = block * step;
@@ -261,27 +279,105 @@ pub fn run_file(
                         continue;
                     }
 
-                    // FSK demodulate the burst
-                    if let Some(fsk_result) = fsk.demodulate(&burst.samples) {
+                    // Preserve the normal decoder's original input. Any EDR
+                    // lead-in is reserved for the missed-header fallback.
+                    let normal_samples =
+                        &burst.samples[burst.edr_lead_samples.min(burst.samples.len())..];
+                    if let Some(mut fsk_result) = fsk.demodulate(normal_samples) {
                         let freq = burst.freq;
                         let burst_ts = burst.timestamp.clone();
                         let rssi = burst.rssi_db as i32;
                         let noise = burst.noise_db as i32;
-
-                        // Try Classic BT first
-                        if let Some(mut bt_pkt) = btbb::detect(
+                        let raw_start = burst.timestamp.tv_sec as u64 * sample_rate as u64
+                            + (burst.timestamp.tv_nsec as u64 * sample_rate as u64)
+                                / 1_000_000_000;
+                        let raw_len = (sample_rate as usize / 1000) * 3;
+                        // Provide the raw wideband window for any burst (a cheap
+                        // slice). The narrow-channel EDR envelope test misses
+                        // packets whose 1 MHz bin clips the DPSK, so gating the
+                        // window on burst.edr_extended alone drops real EDR; the
+                        // EDR header candidates + payload CRC inside decide.
+                        let wideband = if edr_wideband_enabled {
+                            ring_window(&raw_ring, raw_ring_start, raw_start, raw_len)
+                        } else {
+                            None
+                        };
+                        let offset_hz =
+                            (burst.freq as f64 - center_freq_mhz as f64) * 1_000_000.0;
+                        let mut demod_offset = burst.edr_lead_samples;
+                        let mut classic = btbb::detect(
                             &fsk_result.bits,
                             freq,
                             rssi,
                             noise,
                             burst_ts.clone(),
                             &syndrome_map,
-                        ) {
+                        );
+                        if burst.edr_extended {
+                            if let Some((fallback_fsk, fallback_packet, fallback_offset)) =
+                                recover_edr_lead_header(
+                                    &mut fsk,
+                                    &burst,
+                                    rssi,
+                                    noise,
+                                    &syndrome_map,
+                                )
+                            {
+                                fsk_result = fallback_fsk;
+                                classic = Some(fallback_packet);
+                                demod_offset = fallback_offset;
+                            }
+                        }
+                        // Re-decode the header from clean raw IQ when there is no
+                        // header, or when the channelized header decoded as a
+                        // multi-slot Basic Rate type: a squelch-clipped EDR header
+                        // reads that way and yields no EDR candidate with the
+                        // verified UAP.
+                        let header_needs_raw = classic.as_ref().is_none_or(|packet| {
+                            !packet.has_header
+                                || packet.header.is_some_and(|h| {
+                                    btbb::edr_bits_per_symbol(h.pkt_type).is_none()
+                                        && matches!(h.pkt_type & 0x0f, 0x8 | 0x9 | 0xa | 0xb | 0xe | 0xf)
+                                })
+                        });
+                        if header_needs_raw {
+                            if let Some((fallback_fsk, fallback_packet, fallback_offset)) =
+                                wideband.and_then(|window| {
+                                    recover_edr_wideband_header(
+                                        window,
+                                        offset_hz,
+                                        sample_rate,
+                                        burst.freq,
+                                        rssi,
+                                        noise,
+                                        &syndrome_map,
+                                        burst.edr_lead_samples,
+                                    )
+                                })
+                            {
+                                fsk_result = fallback_fsk;
+                                classic = Some(fallback_packet);
+                                demod_offset = fallback_offset;
+                            }
+                        }
+
+                        // Try Classic BT first
+                        if let Some(mut bt_pkt) = classic {
+                            let demod_ts = channel_samples_after(&burst_ts, demod_offset);
                             bt_pkt.timestamp =
-                                bt_sync_timestamp(&burst_ts, &fsk_result, bt_pkt.sync_offset);
+                                bt_sync_timestamp(&demod_ts, &fsk_result, bt_pkt.sync_offset);
                             let mut announce = btbb::enrich(&mut bt_pkt, &mut bt_tracker);
-                            if try_enrich_edr(&burst, &fsk_result, &mut bt_pkt, &mut bt_tracker)
-                                .enriched
+                            if try_enrich_edr(
+                                &burst,
+                                &fsk_result,
+                                &mut bt_pkt,
+                                &mut bt_tracker,
+                                wideband,
+                                offset_hz,
+                                sample_rate,
+                                demod_offset,
+                            )
+                            .enriched
                             {
                                 announce |= bt_tracker.mark_announced(bt_pkt.lap);
                             }
@@ -517,6 +613,9 @@ pub fn run_burst_file(
     {
         process_burst(
             &burst,
+            None,
+            0,
+            1,
             &mut fsk,
             &aa_correlator,
             &aa_correlator_2m,
@@ -634,6 +733,115 @@ fn bt_sync_timestamp(
     }
 }
 
+fn recover_edr_lead_header(
+    fsk: &mut FskDemod,
+    burst: &bd_dsp::burst::Burst,
+    rssi: i32,
+    noise: i32,
+    syndrome_map: &SyndromeMap,
+) -> Option<(FskResult, btbb::ClassicBtPacket, usize)> {
+    if !burst.edr_extended || burst.edr_lead_samples < 16 {
+        return None;
+    }
+    for offset in (0..burst.edr_lead_samples).step_by(8) {
+        let Some(result) = fsk.demodulate(&burst.samples[offset..]) else {
+            continue;
+        };
+        let Some(packet) = btbb::detect(
+            &result.bits,
+            burst.freq,
+            rssi,
+            noise,
+            burst.timestamp.clone(),
+            syndrome_map,
+        ) else {
+            continue;
+        };
+        if packet.has_header {
+            if std::env::var_os("BD_EDR_DEBUG").is_some() {
+                eprintln!(
+                    "[edr-lead] freq={} offset={} LAP={:06X} access_errors={}",
+                    burst.freq, offset, packet.lap, packet.ac_errors
+                );
+            }
+            return Some((result, packet, offset));
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_edr_wideband_header(
+    wideband: &[Complex32],
+    offset_hz: f64,
+    raw_rate: u32,
+    freq: u32,
+    rssi: i32,
+    noise: i32,
+    syndrome_map: &SyndromeMap,
+    lead_samples: usize,
+) -> Option<(FskResult, btbb::ClassicBtPacket, usize)> {
+    let baseband_4m = bd_dsp::edr::extract_br_channel_4m(wideband, offset_hz, raw_rate);
+    if baseband_4m.len() < 512 {
+        return None;
+    }
+    if std::env::var_os("BD_EDR_DEBUG").is_some() {
+        let search_end_4m = lead_samples
+            .saturating_mul(2)
+            .min(baseband_4m.len().saturating_sub(264));
+        let mut probe = FskDemod::new(4);
+        for offset in (0..=search_end_4m).step_by(8) {
+            let Some(result) = probe.demodulate(&baseband_4m[offset..]) else {
+                continue;
+            };
+            if let Some(packet) = btbb::detect(
+                &result.bits,
+                freq,
+                rssi,
+                noise,
+                Timespec::default(),
+                syndrome_map,
+            ) {
+                if packet.has_header {
+                    eprintln!(
+                        "[edr-raw4-header] freq={} offset={} LAP={:06X} access_errors={}",
+                        freq, offset, packet.lap, packet.ac_errors
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    let baseband_2m = baseband_4m.iter().step_by(2).copied().collect::<Vec<_>>();
+    let search_end = lead_samples.min(baseband_2m.len().saturating_sub(136));
+    let mut fsk = FskDemod::new(2);
+    for offset in (0..=search_end).step_by(4) {
+        let Some(result) = fsk.demodulate(&baseband_2m[offset..]) else {
+            continue;
+        };
+        let Some(packet) = btbb::detect(
+            &result.bits,
+            freq,
+            rssi,
+            noise,
+            Timespec::default(),
+            syndrome_map,
+        ) else {
+            continue;
+        };
+        if packet.has_header {
+            if std::env::var_os("BD_EDR_DEBUG").is_some() {
+                eprintln!(
+                    "[edr-raw-header] freq={} offset={} LAP={:06X} access_errors={}",
+                    freq, offset, packet.lap, packet.ac_errors
+                );
+            }
+            return Some((result, packet, offset));
+        }
+    }
+    None
+}
+
 #[derive(Default)]
 struct EdrAttempt {
     candidate: bool,
@@ -643,12 +851,141 @@ struct EdrAttempt {
     best_sync_score: Option<f32>,
 }
 
+/// Drop the oldest samples once the ring exceeds its cap; returns how many were
+/// removed so the caller can advance the ring's base sample index.
+fn trim_ring(ring: &mut Vec<Complex32>, cap: usize) -> u64 {
+    if ring.len() > cap {
+        let drop = ring.len() - cap;
+        ring.drain(..drop);
+        drop as u64
+    } else {
+        0
+    }
+}
+
+/// Extract the raw wideband window covering a burst from the ring buffer, given
+/// the burst's start sample index and raw length. Returns `None` if the window
+/// is not fully resident (e.g. trimmed away).
+fn ring_window(
+    ring: &[Complex32],
+    ring_start: u64,
+    raw_start: u64,
+    raw_len: usize,
+) -> Option<&[Complex32]> {
+    let off = raw_start.checked_sub(ring_start)? as usize;
+    let end = off.checked_add(raw_len)?;
+    if end <= ring.len() {
+        Some(&ring[off..end])
+    } else if off < ring.len() {
+        Some(&ring[off..])
+    } else {
+        None
+    }
+}
+
+/// Decode EDR payloads from a raw wideband window around the packet. The fixed
+/// sync chooses the payload boundary before CRC validation; CRC is never used
+/// to search for symbol alignment.
+fn edr_wideband_variants(
+    window: &[Complex32],
+    offset_hz: f64,
+    raw_rate: u32,
+    channel_sync_reference: usize,
+) -> Vec<(usize, Vec<u8>, f32)> {
+    const SPS: usize = 4;
+    const MAX_SYNC_SCORE: f32 = 0.08;
+    let mut baseband = bd_dsp::edr::extract_edr_channel_4m(window, offset_hz, raw_rate);
+    if baseband.len() < 64 * SPS {
+        return Vec::new();
+    }
+    let _ = channel_sync_reference;
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let search = two_pi * (300_000.0 / 4_000_000.0);
+    let step = two_pi * (5_000.0 / 4_000_000.0);
+    // Estimate the CFO from the packet itself, not a header-derived reference
+    // (which is unreliable when the squelch clipped the access code).
+    let correction = bd_dsp::edr::refine_cfo(&baseband, SPS, search, step);
+    bd_dsp::edr::derotate(&mut baseband, correction);
+    let matched = bd_dsp::edr::rrc_matched_filter(&baseband, SPS, 0.4, 6);
+    // The fixed sync is a strong 10-symbol pattern (real locks score ~0.005),
+    // so scan the whole window with the strict threshold rather than trusting an
+    // approximate reference.
+    let Some(lock) = bd_dsp::edr::locate_edr_sync(
+        &matched,
+        matched.len() / 2,
+        matched.len() / 2,
+        SPS,
+        MAX_SYNC_SCORE,
+    ) else {
+        return Vec::new();
+    };
+
+    // The payload starts a fixed distance after the sync, but the exact symbol
+    // count (guard/reference) leaves it a symbol or two ambiguous; a mis-set
+    // start shifts the whitening phase and hides the CRC. Emit the demod for a
+    // few start offsets around the lock and let the CRC choose.
+    let mut out = Vec::new();
+    for &bps in &[2usize, 3usize] {
+        for delta in -3i32..=3 {
+            let mut shifted = lock;
+            let ref_sample = lock.reference_sample as i32 + delta * SPS as i32;
+            if ref_sample < 0 {
+                continue;
+            }
+            shifted.reference_sample = ref_sample as usize;
+            let bits = bd_dsp::edr::demod_dpsk_detrended_from_sync(&matched, shifted, SPS, bps);
+            if !bits.is_empty() && !out.iter().any(|(b, existing, _)| *b == bps && existing == &bits) {
+                out.push((bps, bits, lock.score));
+            }
+        }
+    }
+    if std::env::var_os("BD_EDR_DEBUG").is_some() {
+        eprintln!(
+            "[edr-wb] sync={} score={:.4} conjugated={} cfo={:.0}Hz bits={:?}",
+            lock.reference_sample,
+            lock.score,
+            lock.conjugated,
+            correction * 4_000_000.0 / two_pi,
+            out.iter().map(|(bps, bits, _)| (*bps, bits.len())).collect::<Vec<_>>()
+        );
+    }
+    out
+}
+
 fn try_enrich_edr(
     burst: &bd_dsp::burst::Burst,
     fsk_result: &FskResult,
     pkt: &mut bd_protocol::btbb::ClassicBtPacket,
     tracker: &mut btbb::PiconetTracker,
+    wideband: Option<&[Complex32]>,
+    offset_hz: f64,
+    raw_rate: u32,
+    channel_lead_samples: usize,
 ) -> EdrAttempt {
+    if !pkt.has_header {
+        return EdrAttempt::default();
+    }
+    // A 3-DHx EDR packet whose GFSK header decoded under the wrong clock reads
+    // as a multi-slot Basic Rate type (DH3/DH5/DM3/DM5/AUX1). Only bail out for
+    // short types that can never carry an EDR payload; the EDR header candidates
+    // and the payload CRC below decide the rest. Without a wideband window there
+    // is nothing new to try, so keep the old fast path.
+    if wideband.is_none()
+        && pkt.uap_verified
+        && pkt
+            .header
+            .is_some_and(|header| btbb::edr_bits_per_symbol(header.pkt_type).is_none())
+    {
+        return EdrAttempt::default();
+    }
+    if let Some(header) = pkt.header {
+        if btbb::edr_bits_per_symbol(header.pkt_type).is_none()
+            && !matches!(header.pkt_type & 0x0f, 0x8 | 0x9 | 0xa | 0xb | 0xe | 0xf)
+        {
+            // Short BR types (ID/NULL/POLL/FHS/DM1/DH1/HV*) are never EDR.
+            return EdrAttempt::default();
+        }
+    }
     let mut candidates = btbb::edr_header_candidates(&pkt.raw_header);
     if pkt.uap_verified {
         if let Some(uap) = pkt.uap {
@@ -660,21 +997,82 @@ fn try_enrich_edr(
             candidates.insert(0, (uap, header));
         }
     }
+    // A squelch-clipped EDR header can be corrupt enough that no clock yields an
+    // EDR candidate with the verified access-code UAP. The UAP itself is
+    // reliable (it comes from the access code, not the header), so when we have a
+    // wideband window fall back to every clock under that UAP and let the payload
+    // CRC pick the real one. Wideband-only, so Basic Rate is unaffected.
+    if wideband.is_some() {
+        if let Some(uap) = pkt.uap.filter(|_| pkt.uap_verified) {
+            if !candidates.iter().any(|(candidate_uap, _)| *candidate_uap == uap) {
+                // One candidate is enough: the wideband path searches all
+                // whitening phases, so the clock field is not used for it.
+                candidates.push((
+                    uap,
+                    btbb::BtHeader {
+                        lt_addr: 1,
+                        pkt_type: 0x0d,
+                        flow: 1,
+                        arqn: 0,
+                        seqn: 0,
+                        hec: 0,
+                        clk6: 0,
+                    },
+                ));
+            }
+        }
+    }
     if candidates.is_empty() {
         return EdrAttempt::default();
     }
-    let mut attempt = EdrAttempt {
-        candidate: true,
-        ..EdrAttempt::default()
-    };
-
+    if std::env::var_os("BD_EDR_DEBUG").is_some() {
+        let corrected = btbb::edr_header_candidates_corrected(&pkt.raw_header);
+        eprintln!(
+            "[edr-wb] LAP={:06X} burst={}.{:09} raw_header={:02X?} headers=[{}] corrected=[{}]",
+            pkt.lap,
+            burst.timestamp.tv_sec,
+            burst.timestamp.tv_nsec,
+            pkt.raw_header,
+            candidates
+                .iter()
+                .map(|(uap, header)| format!(
+                    "{:02X}/clk{}/{}",
+                    uap,
+                    header.clk6,
+                    btbb::pkt_type_name(header.pkt_type)
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            corrected
+                .iter()
+                .filter(|(uap, _)| !pkt.uap_verified || pkt.uap == Some(*uap))
+                .map(|(uap, header)| format!(
+                    "{:02X}/clk{}/{}",
+                    uap,
+                    header.clk6,
+                    btbb::pkt_type_name(header.pkt_type)
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     const SPS: usize = 2;
     const ACCESS_TRAILER_BITS: usize = 68;
     const CODED_HEADER_BITS: usize = 54;
     const EDR_GUARD_SYMBOLS: usize = 5;
     let sync_reference_symbol =
         pkt.sync_offset + ACCESS_TRAILER_BITS + CODED_HEADER_BITS + EDR_GUARD_SYMBOLS;
-    let sync_reference_sample = fsk_result.silence + 1 + sync_reference_symbol * SPS;
+    let sync_reference_sample =
+        channel_lead_samples + fsk_result.silence + 1 + sync_reference_symbol * SPS;
+    let wb_variants = wideband
+        .map(|window| {
+            edr_wideband_variants(window, offset_hz, raw_rate, sync_reference_sample)
+        })
+        .unwrap_or_default();
+    let mut attempt = EdrAttempt {
+        candidate: true,
+        ..EdrAttempt::default()
+    };
     let iq = bd_dsp::edr::prepare_iq(
         &burst.samples,
         fsk_result.cfo * std::f32::consts::PI,
@@ -788,6 +1186,72 @@ fn try_enrich_edr(
                 }
             }
         }
+
+        // Merge phase-preserving wideband variants for this modulation. The
+        // channelized path above works from a ~1 MHz PFB bin that clips the DPSK;
+        // the wideband path recovers the full constellation. The CRC below is
+        // still the sole authority for accepting a payload.
+        for (wb_bps, raw_payload, sync_score) in &wb_variants {
+            if *wb_bps != bits_per_symbol {
+                continue;
+            }
+            attempt.synchronized = true;
+            if attempt
+                .best_sync_score
+                .is_none_or(|best| *sync_score < best)
+            {
+                attempt.best_sync_score = Some(*sync_score);
+            }
+            // Wideband acceptance uses only uncorrected, HEC-consistent header
+            // interpretations. One-bit FEC repair multiplied by timing variants
+            // produced enough trials for accidental 16-bit CRC matches.
+            //
+            // The header's 4-bit TYPE field is unreliable here: the squelch often
+            // rises on the DPSK payload after the GFSK header has passed, so the
+            // recovered type can disagree with the modulation the signal actually
+            // carries (e.g. a clock's header reads 2-DH3 while the payload is
+            // 8DPSK). The whitening only needs the clock, and the modulation is
+            // fixed by which bits_per_symbol variant this is, so pair each unique
+            // HEC-consistent clock with a synthetic header of the matching rate
+            // and let the payload CRC decide.
+            // Whitening depends only on the clock; the type field is unreliable
+            // after a clipped header, so pair each unique UAP with a synthetic
+            // header of the right rate and search all whitening phases. The
+            // payload CRC is the sole authority.
+            let synth_type: u8 = if bits_per_symbol == 3 { 0x0d } else { 0x0c };
+            let mut tried_uaps: Vec<u8> = Vec::new();
+            for &(uap, base_header) in &candidates {
+                if tried_uaps.contains(&uap) {
+                    continue;
+                }
+                tried_uaps.push(uap);
+                let header = btbb::BtHeader {
+                    pkt_type: synth_type,
+                    ..base_header
+                };
+                let mut candidate = pkt.clone();
+                if btbb::enrich_edr_candidate_any_phase(&mut candidate, raw_payload, uap, header)
+                    && (2..=1024).contains(&candidate.decoded_payload.len())
+                    && !matches
+                        .iter()
+                        .any(|(_, seen_uap, _)| *seen_uap == uap)
+                {
+                    if std::env::var_os("BD_EDR_DEBUG").is_some() {
+                        let head: String = candidate
+                            .decoded_payload
+                            .iter()
+                            .take(24)
+                            .map(|b| format!("{:02x} ", b))
+                            .collect();
+                        eprintln!(
+                            "[edr-wb] CRC PASS LAP={:06X} UAP={:02X} bps={} bytes={} | {}",
+                            pkt.lap, uap, bits_per_symbol, candidate.decoded_payload.len(), head,
+                        );
+                    }
+                    matches.push((candidate, uap, header));
+                }
+            }
+        }
     }
 
     let [(candidate, uap, header)] = matches.as_slice() else {
@@ -805,6 +1269,9 @@ fn try_enrich_edr(
 #[allow(clippy::too_many_arguments)]
 fn process_burst(
     burst: &bd_dsp::burst::Burst,
+    wideband: Option<&[Complex32]>,
+    center_freq_mhz: u32,
+    raw_sample_rate: u32,
     fsk: &mut FskDemod,
     aa_correlator: &AaCorrelator,
     aa_correlator_2m: &AaCorrelator,
@@ -878,7 +1345,8 @@ fn process_burst(
         return;
     }
 
-    let fsk_result = match fsk.demodulate(&burst.samples) {
+    let normal_samples = &burst.samples[burst.edr_lead_samples.min(burst.samples.len())..];
+    let fsk_result = match fsk.demodulate(normal_samples) {
         Some(r) => r,
         None => {
             // FSK demod failed. Try raw FM + coded for any burst >= 1500 samples
@@ -944,10 +1412,21 @@ fn process_burst(
         burst_ts.clone(),
         syndrome_map,
     ) {
-        bt_pkt.timestamp = bt_sync_timestamp(&burst_ts, &fsk_result, bt_pkt.sync_offset);
+        let demod_ts = channel_samples_after(&burst_ts, burst.edr_lead_samples);
+        bt_pkt.timestamp = bt_sync_timestamp(&demod_ts, &fsk_result, bt_pkt.sync_offset);
         // Recover UAP (and full BD_ADDR from FHS) across packets/channels.
         let mut announce = btbb::enrich(&mut bt_pkt, bt_tracker);
-        let edr_attempt = try_enrich_edr(burst, &fsk_result, &mut bt_pkt, bt_tracker);
+        let offset_hz = (burst.freq as f64 - center_freq_mhz as f64) * 1_000_000.0;
+        let edr_attempt = try_enrich_edr(
+            burst,
+            &fsk_result,
+            &mut bt_pkt,
+            bt_tracker,
+            wideband,
+            offset_hz,
+            raw_sample_rate,
+            burst.edr_lead_samples,
+        );
         stats.record_edr(&edr_attempt);
         if edr_attempt.enriched {
             announce |= bt_tracker.mark_announced(bt_pkt.lap);
@@ -1219,8 +1698,85 @@ impl PipelineStats {
 /// Message sent from main thread to burst worker threads.
 struct BatchMsg {
     data: Arc<Vec<f32>>,
+    /// Interleaved raw SC16 IQ covering the same time span as `data`.
+    /// Present only for the opt-in EDR wideband path.
+    raw_iq: Option<Arc<Vec<i16>>>,
     batch_steps: usize,
     ts: Timespec,
+}
+
+struct BurstMsg {
+    burst: bd_dsp::burst::Burst,
+    wideband: Option<Vec<Complex32>>,
+}
+
+struct RawBatch {
+    iq: Arc<Vec<i16>>,
+    start_sample: u128,
+}
+
+struct RawBatchCache {
+    batches: std::collections::VecDeque<RawBatch>,
+    sample_rate: u32,
+}
+
+impl RawBatchCache {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            batches: std::collections::VecDeque::new(),
+            sample_rate,
+        }
+    }
+
+    fn sample_index(&self, ts: &Timespec) -> u128 {
+        ts.tv_sec as u128 * self.sample_rate as u128
+            + ts.tv_nsec as u128 * self.sample_rate as u128 / 1_000_000_000
+    }
+
+    fn push(&mut self, msg: &BatchMsg) {
+        let Some(iq) = msg.raw_iq.clone() else {
+            return;
+        };
+        self.batches.push_back(RawBatch {
+            iq,
+            start_sample: self.sample_index(&msg.ts),
+        });
+        while self.batches.len() > 8 {
+            self.batches.pop_front();
+        }
+    }
+
+    fn extract(&self, start: &Timespec, duration_us: u32) -> Option<Vec<Complex32>> {
+        let wanted_start = self.sample_index(start);
+        let wanted_len = self.sample_rate as usize * duration_us as usize / 1_000_000;
+        let wanted_end = wanted_start + wanted_len as u128;
+        let mut output = Vec::with_capacity(wanted_len);
+        let mut next_sample = wanted_start;
+
+        for batch in &self.batches {
+            let batch_len = batch.iq.len() / 2;
+            let batch_end = batch.start_sample + batch_len as u128;
+            if batch_end <= next_sample || batch.start_sample >= wanted_end {
+                continue;
+            }
+            if batch.start_sample > next_sample {
+                return None;
+            }
+            let first = (next_sample - batch.start_sample) as usize;
+            let last = ((wanted_end.min(batch_end)) - batch.start_sample) as usize;
+            for index in first..last {
+                output.push(Complex32::new(
+                    batch.iq[2 * index] as f32,
+                    batch.iq[2 * index + 1] as f32,
+                ));
+            }
+            next_sample = batch.start_sample + last as u128;
+            if next_sample >= wanted_end {
+                return Some(output);
+            }
+        }
+        None
+    }
 }
 
 /// Channel assignment for a single burst worker.
@@ -1354,6 +1910,9 @@ impl ChannelGain {
 #[allow(clippy::too_many_arguments)]
 fn spawn_parallel_pipeline(
     num_channels: usize,
+    center_freq_mhz: u32,
+    raw_sample_rate: u32,
+    edr_wideband_enabled: bool,
     fft_scale: f32,
     channel_gain_max: f32,
     channel_gain_enabled: bool,
@@ -1378,8 +1937,6 @@ fn spawn_parallel_pipeline(
     Vec<std::thread::JoinHandle<()>>,
     std::thread::JoinHandle<()>,
 ) {
-    use bd_dsp::burst::Burst;
-
     // Collect active channels
     let active: Vec<ChannelAssignment> = burst_catchers
         .iter()
@@ -1404,7 +1961,7 @@ fn spawn_parallel_pipeline(
     let n_workers = active.len().min(hw_threads.saturating_sub(2).max(4)).max(1);
 
     // Burst output channel: all workers send here, decode thread receives
-    let (burst_tx, burst_rx) = channel::bounded::<Burst>(512);
+    let (burst_tx, burst_rx) = channel::bounded::<BurstMsg>(512);
 
     let mut batch_txs = Vec::with_capacity(n_workers);
     let mut worker_handles = Vec::with_capacity(n_workers);
@@ -1434,12 +1991,16 @@ fn spawn_parallel_pipeline(
             .spawn(move || {
                 let mut current_squelch = i32::MIN;
                 let mut steps_since_resync: usize = 0;
+                let mut raw_cache = RawBatchCache::new(raw_sample_rate);
                 // Resync the per-channel gain target every ~64 ms at 1 Msps/ch.
                 // Long enough that p25 estimates have all updated at least
                 // once (each updates every ~16 ms), short enough to track a
                 // changing RF environment.
                 const RESYNC_STEPS: usize = 65536;
                 for msg in batch_rx.iter() {
+                    if edr_wideband_enabled {
+                        raw_cache.push(&msg);
+                    }
                     // Check for squelch update
                     let sq = sq_pending.load(Ordering::Relaxed);
                     if sq != current_squelch && sq != i32::MIN {
@@ -1466,12 +2027,27 @@ fn spawn_parallel_pipeline(
                                 raw
                             };
                             if let Some(burst) = catcher.execute_at(sample, &msg.ts, t) {
-                                let _ = burst_tx.send(burst);
+                                // Grab the raw wideband window for EDR-extended
+                                // bursts and any multi-slot-length burst: a
+                                // clipped EDR packet often detects as a Basic Rate
+                                // multi-slot type, and only the wideband path can
+                                // recover its DPSK payload. Short bursts skip it.
+                                let wideband = if edr_wideband_enabled
+                                    && (burst.edr_extended || burst.samples.len() >= 1000)
+                                {
+                                    raw_cache.extract(&burst.timestamp, 3_100)
+                                } else {
+                                    None
+                                };
+                                let _ = burst_tx.send(BurstMsg { burst, wideband });
                             }
                         }
                         // Emit scan bursts for advertising channels
                         if let Some(scan_burst) = catcher.take_scan_burst() {
-                            let _ = burst_tx.send(scan_burst);
+                            let _ = burst_tx.send(BurstMsg {
+                                burst: scan_burst,
+                                wideband: None,
+                            });
                         }
                     }
 
@@ -1557,7 +2133,8 @@ fn spawn_parallel_pipeline(
                 #[cfg(feature = "gps")]
                 let gps_client = gps_client;
 
-                for burst in burst_rx.iter() {
+                for burst_msg in burst_rx.iter() {
+                    let burst = burst_msg.burst;
                     record_burst(&mut burst_writer, &burst);
                     #[cfg(feature = "gps")]
                     let gps_fix = gps_client.as_ref().map(|c| c.get_fix());
@@ -1567,6 +2144,9 @@ fn spawn_parallel_pipeline(
 
                     process_burst(
                         &burst,
+                        burst_msg.wideband.as_deref(),
+                        center_freq_mhz,
+                        raw_sample_rate,
                         &mut fsk,
                         &aa_correlator,
                         &aa_correlator_2m,
@@ -1773,13 +2353,16 @@ fn format_smp_event(event: &bd_protocol::smp::SmpEvent) -> String {
 fn broadcast_batch(
     txs: &[channel::Sender<BatchMsg>],
     data: Vec<f32>,
+    raw_iq: Option<Vec<i16>>,
     batch_steps: usize,
     ts: &Timespec,
 ) {
     let arc = Arc::new(data);
+    let raw_iq = raw_iq.map(Arc::new);
     for tx in txs {
         let _ = tx.send(BatchMsg {
             data: arc.clone(),
+            raw_iq: raw_iq.clone(),
             batch_steps,
             ts: ts.clone(),
         });
@@ -2144,6 +2727,10 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     } = cfg;
     let sample_rate = num_channels as u32 * 1_000_000;
     let center_freq_hz = center_freq_mhz as u64 * 1_000_000;
+    let edr_wideband_enabled = std::env::var_os("BD_EDR_WIDEBAND").is_some();
+    if edr_wideband_enabled && sample_rate % 4_000_000 != 0 {
+        return Err("BD_EDR_WIDEBAND requires a channel count divisible by 4".to_string());
+    }
 
     // Per-channel adaptive gain is enabled for halfband (decim>1) mode
     // where it consistently improves CRC by ~7-8 points (attenuate-only
@@ -2619,6 +3206,9 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     // GPU path
     #[cfg(feature = "gpu")]
     if use_gpu {
+        if edr_wideband_enabled {
+            return Err("BD_EDR_WIDEBAND currently requires --no-gpu".to_string());
+        }
         return run_live_gpu_loop(
             sdr,
             &running,
@@ -2667,6 +3257,9 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     // Spawn parallel burst workers + decode thread
     let (batch_txs, worker_handles, decode_handle) = spawn_parallel_pipeline(
         num_channels,
+        center_freq_mhz,
+        sample_rate,
+        edr_wideband_enabled,
         1.0, // CPU path pre-scales by fft_scale, workers use 1.0
         channel_gain_max,
         channel_gain_enabled,
@@ -2767,6 +3360,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     const CPU_BATCH_STEPS: usize = 4096;
     let batch_floats = CPU_BATCH_STEPS * num_channels * 2;
     let mut batch = Vec::with_capacity(batch_floats);
+    let mut raw_batch = edr_wideband_enabled
+        .then(|| Vec::with_capacity(CPU_BATCH_STEPS * num_channels));
     let mut batch_steps: usize = 0;
     let mut next_batch_ts: Option<Timespec> = None;
 
@@ -2787,6 +3382,9 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                 float_tmp[j * 2 + 1] = val.im * fft_scale;
             }
             batch.extend_from_slice(&float_tmp);
+            if let Some(raw) = raw_batch.as_mut() {
+                raw.extend_from_slice(&i16_buf[offset..offset + step]);
+            }
             batch_steps += 1;
 
             if batch.len() >= batch_floats {
@@ -2796,6 +3394,9 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                 broadcast_batch(
                     &batch_txs,
                     std::mem::replace(&mut batch, Vec::with_capacity(batch_floats)),
+                    raw_batch
+                        .as_mut()
+                        .map(|raw| std::mem::replace(raw, Vec::with_capacity(CPU_BATCH_STEPS * num_channels))),
                     batch_steps,
                     &ts,
                 );
@@ -2806,7 +3407,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
 
     if !batch.is_empty() {
         let ts = next_batch_ts.unwrap_or_else(|| initial_batch_timestamp(batch_steps));
-        broadcast_batch(&batch_txs, batch, batch_steps, &ts);
+        broadcast_batch(&batch_txs, batch, raw_batch, batch_steps, &ts);
     }
 
     drop(batch_txs);
@@ -2873,6 +3474,9 @@ fn run_live_gpu_loop(
     // Spawn parallel burst workers + decode thread
     let (batch_txs, worker_handles, decode_handle) = spawn_parallel_pipeline(
         num_channels,
+        0,
+        num_channels as u32 * 1_000_000,
+        false,
         fft_scale, // GPU output is raw, workers apply fft_scale
         channel_gain_max,
         channel_gain_enabled,
@@ -2961,7 +3565,7 @@ fn run_live_gpu_loop(
                     let ts = next_batch_ts
                         .unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
                     next_batch_ts = Some(channel_samples_after(&ts, GPU_BATCH_SIZE));
-                    broadcast_batch(&batch_txs, result.to_vec(), GPU_BATCH_SIZE, &ts);
+                    broadcast_batch(&batch_txs, result.to_vec(), None, GPU_BATCH_SIZE, &ts);
                 }
                 pos = 0;
                 raw_buf = gpu.raw_buffer();
@@ -2977,13 +3581,13 @@ fn run_live_gpu_loop(
             let ts = next_batch_ts
                 .unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
             next_batch_ts = Some(channel_samples_after(&ts, GPU_BATCH_SIZE));
-            broadcast_batch(&batch_txs, result.to_vec(), GPU_BATCH_SIZE, &ts);
+            broadcast_batch(&batch_txs, result.to_vec(), None, GPU_BATCH_SIZE, &ts);
         }
     }
 
     if let Some(result) = gpu.flush() {
         let ts = next_batch_ts.unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
-        broadcast_batch(&batch_txs, result.to_vec(), GPU_BATCH_SIZE, &ts);
+        broadcast_batch(&batch_txs, result.to_vec(), None, GPU_BATCH_SIZE, &ts);
     }
 
     drop(batch_txs);

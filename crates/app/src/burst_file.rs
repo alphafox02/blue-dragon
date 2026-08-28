@@ -204,6 +204,8 @@ impl<R: Read> BurstReader<R> {
                 tv_nsec: tv_nsec as u64,
             },
             scan: u32::from_le_bytes(header[40..44].try_into().unwrap()) & FLAG_SCAN != 0,
+            edr_extended: false,
+            edr_lead_samples: 0,
         }))
     }
 }
@@ -225,6 +227,8 @@ mod tests {
                 tv_nsec: 345,
             },
             scan: false,
+            edr_extended: false,
+            edr_lead_samples: 0,
         }
     }
 
