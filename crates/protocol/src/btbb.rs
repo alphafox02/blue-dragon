@@ -1482,9 +1482,6 @@ fn decode_edr_payload_bits(raw: &[u8], uap: u8, clk6: u8) -> Option<Vec<u8>> {
         .collect();
     let payload_header = parse_payload_header(&data, true)?;
     let body_end = 16 + payload_header.length as usize * 8;
-
-    // AES-CCM appends a 32-bit MIC before the CRC. Try cleartext first, then
-    // encrypted framing; CRC covers the MIC when it is present.
     for mic_bits in [0usize, 32] {
         let crc_start = body_end + mic_bits;
         if data.len() < crc_start + 16 {
@@ -1500,6 +1497,66 @@ fn decode_edr_payload_bits(raw: &[u8], uap: u8, clk6: u8) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// Decode an EDR payload by trying every whitening start phase (all 127) instead
+/// of the clock-fixed offset. A clipped header can leave the payload-start symbol
+/// and thus the whitening phase ambiguous; trying each and letting the CRC decide
+/// recovers packets the clock path misses. Returns the dewhitened payload bits.
+fn decode_edr_payload_bits_any_phase(raw: &[u8], uap: u8) -> Option<Vec<u8>> {
+    for phase in 0..WHITENING_DATA.len() {
+        let data: Vec<u8> = raw
+            .iter()
+            .enumerate()
+            .map(|(i, &bit)| bit ^ WHITENING_DATA[(phase + i) % WHITENING_DATA.len()])
+            .collect();
+        let Some(payload_header) = parse_payload_header(&data, true) else {
+            continue;
+        };
+        let body_end = 16 + payload_header.length as usize * 8;
+        for mic_bits in [0usize, 32] {
+            let crc_start = body_end + mic_bits;
+            if data.len() < crc_start + 16 {
+                continue;
+            }
+            let mut received_crc = 0u16;
+            for bit in 0..16 {
+                received_crc |= (data[crc_start + bit] as u16 & 1) << bit;
+            }
+            if btcrc(&data[..crc_start], uap) == received_crc {
+                return Some(data[..crc_start].to_vec());
+            }
+        }
+    }
+    None
+}
+
+/// Attach an EDR payload located by whitening-phase search. For the wideband path
+/// when a clipped header yields no clock-consistent candidate. The payload CRC is
+/// the sole authority.
+pub fn enrich_edr_candidate_any_phase(
+    pkt: &mut ClassicBtPacket,
+    raw_bits: &[u8],
+    uap: u8,
+    header: BtHeader,
+) -> bool {
+    if edr_bits_per_symbol(header.pkt_type).is_none() {
+        return false;
+    }
+    let Some(decoded) = decode_edr_payload_bits_any_phase(raw_bits, uap) else {
+        return false;
+    };
+    let mut bytes = vec![0u8; decoded.len().div_ceil(8)];
+    for (index, &bit) in decoded.iter().enumerate() {
+        bytes[index / 8] |= (bit & 1) << (index % 8);
+    }
+    pkt.payload = raw_bits.to_vec();
+    pkt.uap = Some(uap);
+    pkt.uap_verified = true;
+    pkt.header = Some(header);
+    pkt.decoded_payload = bytes;
+    pkt.crc_ok = true;
+    true
 }
 
 /// Decode only the two-byte EDR payload header for diagnostics. No identity or
