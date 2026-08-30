@@ -2728,9 +2728,6 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     let sample_rate = num_channels as u32 * 1_000_000;
     let center_freq_hz = center_freq_mhz as u64 * 1_000_000;
     let edr_wideband_enabled = std::env::var_os("BD_EDR_WIDEBAND").is_some();
-    if edr_wideband_enabled && sample_rate % 4_000_000 != 0 {
-        return Err("BD_EDR_WIDEBAND requires a channel count divisible by 4".to_string());
-    }
 
     // Per-channel adaptive gain is enabled for halfband (decim>1) mode
     // where it consistently improves CRC by ~7-8 points (attenuate-only

@@ -796,31 +796,11 @@ fn extract_channel_4m(
     cutoff_hz: f64,
 ) -> Vec<Complex32> {
     const OUTPUT_RATE: u32 = 4_000_000;
-    if wideband.is_empty() || input_rate < OUTPUT_RATE || input_rate % OUTPUT_RATE != 0 {
+    if wideband.is_empty() || input_rate < OUTPUT_RATE {
         return Vec::new();
     }
-    let decimation = (input_rate / OUTPUT_RATE) as usize;
-    let tap_count = 48 * decimation + 1;
-    let half = tap_count / 2;
-    let normalized_cutoff = cutoff_hz / input_rate as f64;
-    let mut taps = Vec::with_capacity(tap_count);
-    for index in 0..tap_count {
-        let x = index as isize - half as isize;
-        let sinc = if x == 0 {
-            2.0 * normalized_cutoff
-        } else {
-            (2.0 * PI as f64 * normalized_cutoff * x as f64).sin()
-                / (PI as f64 * x as f64)
-        };
-        let phase = 2.0 * PI as f64 * index as f64 / (tap_count - 1) as f64;
-        let window = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
-        taps.push((sinc * window) as f32);
-    }
-    let gain = taps.iter().sum::<f32>();
-    for tap in &mut taps {
-        *tap /= gain;
-    }
 
+    // Shift the target channel to baseband before the anti-alias filter.
     let radians_per_sample = 2.0 * PI as f64 * offset_hz / input_rate as f64;
     let mut mixed = Vec::with_capacity(wideband.len());
     for (index, &sample) in wideband.iter().enumerate() {
@@ -828,16 +808,84 @@ fn extract_channel_4m(
         mixed.push(sample * Complex32::new(phase.cos() as f32, phase.sin() as f32));
     }
 
-    let output_len = wideband.len().div_ceil(decimation);
+    if input_rate % OUTPUT_RATE == 0 {
+        // Integer-decimation fast path (preserves the exact prior behavior for
+        // -C values that are a multiple of 4).
+        let decimation = (input_rate / OUTPUT_RATE) as usize;
+        let tap_count = 48 * decimation + 1;
+        let half = tap_count / 2;
+        let normalized_cutoff = cutoff_hz / input_rate as f64;
+        let mut taps = Vec::with_capacity(tap_count);
+        for index in 0..tap_count {
+            let x = index as isize - half as isize;
+            let sinc = if x == 0 {
+                2.0 * normalized_cutoff
+            } else {
+                (2.0 * PI as f64 * normalized_cutoff * x as f64).sin() / (PI as f64 * x as f64)
+            };
+            let phase = 2.0 * PI as f64 * index as f64 / (tap_count - 1) as f64;
+            let window = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
+            taps.push((sinc * window) as f32);
+        }
+        let gain = taps.iter().sum::<f32>();
+        for tap in &mut taps {
+            *tap /= gain;
+        }
+
+        let output_len = wideband.len().div_ceil(decimation);
+        let mut output = Vec::with_capacity(output_len);
+        for output_index in 0..output_len {
+            let center = output_index * decimation;
+            let tap_lo = half.saturating_sub(center);
+            let tap_hi = tap_count.min(wideband.len() + half - center);
+            let mut value = Complex32::new(0.0, 0.0);
+            for (tap_index, &tap) in taps.iter().enumerate().take(tap_hi).skip(tap_lo) {
+                let sample_index = center + tap_index - half;
+                value += mixed[sample_index] * tap;
+            }
+            output.push(value);
+        }
+        return output;
+    }
+
+    // Fractional resampler: resample to exactly 4 Msps from an arbitrary input
+    // rate so any -C works. Each output sample sits at a fractional input
+    // position, so the windowed-sinc anti-alias taps are evaluated at the
+    // fractional offset per output (a direct polyphase interpolation). The tap
+    // span scales with the resampling ratio to hold the same time support as the
+    // integer path, and each output is normalized by its tap sum for unit DC
+    // gain even at the window edges.
+    let pi = std::f64::consts::PI;
+    let ratio = input_rate as f64 / OUTPUT_RATE as f64; // input samples per output sample
+    let normalized_cutoff = cutoff_hz / input_rate as f64;
+    let tap_half = (24.0 * ratio).ceil() as isize;
+    let inv_half = 1.0 / tap_half as f64;
+    let output_len = (wideband.len() as f64 / ratio).floor() as usize;
     let mut output = Vec::with_capacity(output_len);
     for output_index in 0..output_len {
-        let center = output_index * decimation;
-        let tap_lo = half.saturating_sub(center);
-        let tap_hi = tap_count.min(wideband.len() + half - center);
+        let center = output_index as f64 * ratio;
+        let c0 = center.round() as isize;
         let mut value = Complex32::new(0.0, 0.0);
-        for (tap_index, &tap) in taps.iter().enumerate().take(tap_hi).skip(tap_lo) {
-            let sample_index = center + tap_index - half;
-            value += mixed[sample_index] * tap;
+        let mut wsum = 0.0f64;
+        for j in -tap_half..=tap_half {
+            let sample_index = c0 + j;
+            if sample_index < 0 || sample_index as usize >= mixed.len() {
+                continue;
+            }
+            let x = sample_index as f64 - center; // distance from the fractional center
+            let sinc = if x.abs() < 1e-9 {
+                2.0 * normalized_cutoff
+            } else {
+                (2.0 * pi * normalized_cutoff * x).sin() / (pi * x)
+            };
+            // Blackman window centered at x = 0 over [-tap_half, tap_half].
+            let w = 0.42 + 0.5 * (pi * x * inv_half).cos() + 0.08 * (2.0 * pi * x * inv_half).cos();
+            let tap = sinc * w;
+            wsum += tap;
+            value += mixed[sample_index as usize] * tap as f32;
+        }
+        if wsum.abs() > 1e-12 {
+            value *= (1.0 / wsum) as f32;
         }
         output.push(value);
     }
@@ -1093,4 +1141,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_fractional_resampler_preserves_tone() {
+        // A non-multiple-of-4 input rate (10 Msps) must resample cleanly to the
+        // 4 Msps EDR tap rate: the tone frequency is preserved and the passband
+        // gain stays near unity.
+        let input_rate = 10_000_000u32;
+        let tone_hz = 500_000.0f64; // inside the 1.6 MHz anti-alias passband
+        let n = 4000usize;
+        let wb: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let ph = 2.0 * std::f64::consts::PI * tone_hz * i as f64 / input_rate as f64;
+                Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+        let out = super::extract_channel_4m(&wb, 0.0, input_rate, 1_600_000.0);
+        assert!(out.len() > 100, "expected a resampled output");
+
+        // Steady-state middle: mean phase advance per output sample must match
+        // 2*pi*tone/4MHz, and the envelope must stay ~unity.
+        let lo = out.len() / 4;
+        let hi = out.len() * 3 / 4;
+        let mut phase_acc = 0.0f64;
+        let mut mag_acc = 0.0f64;
+        let mut count = 0.0f64;
+        for k in lo..hi {
+            phase_acc += (out[k] * out[k - 1].conj()).arg() as f64;
+            mag_acc += out[k].norm() as f64;
+            count += 1.0;
+        }
+        let measured = phase_acc / count;
+        let expected = 2.0 * std::f64::consts::PI * tone_hz / 4_000_000.0;
+        assert!(
+            (measured - expected).abs() < 0.02,
+            "tone drifted: measured {measured} expected {expected}"
+        );
+        let avg_mag = mag_acc / count;
+        assert!((avg_mag - 1.0).abs() < 0.1, "passband gain off: {avg_mag}");
+    }
 }
