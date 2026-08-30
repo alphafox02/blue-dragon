@@ -3203,9 +3203,6 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     // GPU path
     #[cfg(feature = "gpu")]
     if use_gpu {
-        if edr_wideband_enabled {
-            return Err("BD_EDR_WIDEBAND currently requires --no-gpu".to_string());
-        }
         return run_live_gpu_loop(
             sdr,
             &running,
@@ -3543,6 +3540,11 @@ fn run_live_gpu_loop(
         })
         .expect("failed to spawn sdr-recv-gpu thread");
 
+    // The EDR wideband path needs the raw pre-channelization IQ. The GPU only
+    // consumes it for the PFB/FFT, but the same i16 buffer is right here, so tee
+    // a copy to the burst workers (exactly as the CPU path does) when the
+    // feature is on. The GPU compute is untouched.
+    let edr_wideband_enabled = std::env::var_os("BD_EDR_WIDEBAND").is_some();
     let mut pos: usize = 0;
     let mut raw_buf = gpu.raw_buffer();
     let mut next_batch_ts: Option<Timespec> = None;
@@ -3558,11 +3560,13 @@ fn run_live_gpu_loop(
             src_pos += copy_len;
 
             if pos >= buffer_len {
+                // Capture the raw batch before submit() reborrows the GPU.
+                let raw = edr_wideband_enabled.then(|| raw_buf[..buffer_len].to_vec());
                 if let Some(result) = gpu.submit() {
                     let ts = next_batch_ts
                         .unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
                     next_batch_ts = Some(channel_samples_after(&ts, GPU_BATCH_SIZE));
-                    broadcast_batch(&batch_txs, result.to_vec(), None, GPU_BATCH_SIZE, &ts);
+                    broadcast_batch(&batch_txs, result.to_vec(), raw, GPU_BATCH_SIZE, &ts);
                 }
                 pos = 0;
                 raw_buf = gpu.raw_buffer();
@@ -3574,11 +3578,12 @@ fn run_live_gpu_loop(
         for i in pos..buffer_len {
             raw_buf[i] = 0;
         }
+        let raw = edr_wideband_enabled.then(|| raw_buf[..buffer_len].to_vec());
         if let Some(result) = gpu.submit() {
             let ts = next_batch_ts
                 .unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
             next_batch_ts = Some(channel_samples_after(&ts, GPU_BATCH_SIZE));
-            broadcast_batch(&batch_txs, result.to_vec(), None, GPU_BATCH_SIZE, &ts);
+            broadcast_batch(&batch_txs, result.to_vec(), raw, GPU_BATCH_SIZE, &ts);
         }
     }
 
