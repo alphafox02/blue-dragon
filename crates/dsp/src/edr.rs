@@ -177,15 +177,10 @@ pub fn prepare_iq(
 /// Apply the Bluetooth EDR square-root raised-cosine receive filter. The
 /// centered convolution preserves sample indices so callers can use the GFSK
 /// access-code timing as the initial synchronization estimate.
-pub fn rrc_matched_filter(
-    samples: &[Complex32],
-    sps: usize,
-    rolloff: f32,
-    span_symbols: usize,
-) -> Vec<Complex32> {
-    if samples.is_empty() || sps == 0 || !(0.0..=1.0).contains(&rolloff) {
-        return Vec::new();
-    }
+/// Build the energy-normalized square-root raised-cosine tap set. Factored out
+/// so the CFO search can compute the taps once instead of rebuilding them (with
+/// their transcendental terms) on every frequency hypothesis.
+fn rrc_taps(sps: usize, rolloff: f32, span_symbols: usize) -> Vec<f32> {
     let half = span_symbols * sps / 2;
     let mut taps = Vec::with_capacity(2 * half + 1);
     for index in 0..=2 * half {
@@ -208,16 +203,38 @@ pub fn rrc_matched_filter(
     for tap in &mut taps {
         *tap /= energy;
     }
+    taps
+}
 
-    let mut output = vec![Complex32::new(0.0, 0.0); samples.len()];
-    for (out_index, output_sample) in output.iter_mut().enumerate() {
+/// Centered real-tap convolution into a caller-provided buffer (same index
+/// convention as `rrc_matched_filter`), avoiding a per-call allocation.
+fn convolve_taps(samples: &[Complex32], taps: &[f32], half: usize, output: &mut [Complex32]) {
+    for out_index in 0..samples.len() {
+        let mut acc = Complex32::new(0.0, 0.0);
         let tap_start = half.saturating_sub(out_index);
         let tap_end = taps.len().min(samples.len() + half - out_index);
-        for (tap_index, &tap) in taps.iter().enumerate().take(tap_end).skip(tap_start) {
+        for tap_index in tap_start..tap_end {
             let sample_index = out_index + tap_index - half;
-            *output_sample += samples[sample_index] * tap;
+            acc += samples[sample_index] * taps[tap_index];
         }
+        output[out_index] = acc;
     }
+}
+
+pub fn rrc_matched_filter(
+    samples: &[Complex32],
+    sps: usize,
+    rolloff: f32,
+    span_symbols: usize,
+) -> Vec<Complex32> {
+    if samples.is_empty() || sps == 0 || !(0.0..=1.0).contains(&rolloff) {
+        return Vec::new();
+    }
+    let half = span_symbols * sps / 2;
+    let taps = rrc_taps(sps, rolloff, span_symbols);
+
+    let mut output = vec![Complex32::new(0.0, 0.0); samples.len()];
+    convolve_taps(samples, &taps, half, &mut output);
     output
 }
 
@@ -518,22 +535,30 @@ pub fn refine_cfo(
     // the per-step matched filter stays cheap across the frequency search.
     let n = samples.len().min(4096);
     let samples = &samples[..n];
+    // Build the taps once and reuse the scratch buffers across the whole search
+    // rather than reallocating (and recomputing transcendental taps) per step.
+    let taps = rrc_taps(sps, 0.4, 6);
+    let half = taps.len() / 2;
+    let mut derot = vec![Complex32::new(0.0, 0.0); n];
+    let mut mf = vec![Complex32::new(0.0, 0.0); n];
     let mut best_conc = f32::NEG_INFINITY;
     let mut best = 0.0f32;
     let mut w = -search_radians;
     while w <= search_radians {
-        let mut x = samples.to_vec();
-        derotate(&mut x, w);
-        let mf = rrc_matched_filter(&x, sps, 0.4, 6);
-        // A mistimed phase can make a clean constellation look random and
-        // select the wrong 125 kHz CFO alias. Score every timing phase after
-        // the shared matched-filter pass and retain the strongest one.
+        for (i, out) in derot.iter_mut().enumerate() {
+            let ph = -w * i as f32;
+            *out = samples[i] * Complex32::new(ph.cos(), ph.sin());
+        }
+        convolve_taps(&derot, &taps, half, &mut mf);
+        // A mistimed phase can make a clean constellation look random and select
+        // the wrong 125 kHz CFO alias, so score every timing phase and keep the
+        // strongest.
         for timing in 0..sps {
             let mut sum = 0.0f32;
             let mut count = 0u32;
             let mut prev: Option<Complex32> = None;
             let mut i = timing;
-            while i < mf.len() {
+            while i < n {
                 let cur = mf[i];
                 if let Some(p) = prev {
                     let d = (cur * p.conj()).arg();
