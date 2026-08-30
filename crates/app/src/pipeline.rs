@@ -2133,7 +2133,14 @@ fn spawn_parallel_pipeline(
                 #[cfg(feature = "gps")]
                 let gps_client = gps_client;
 
-                for burst_msg in burst_rx.iter() {
+                // When the decode thread falls behind (bursts queueing faster
+                // than they decode), shed the expensive EDR wideband enrichment
+                // so Basic Rate and BLE decode keeps up and the SDR does not
+                // overflow. Under normal, sparse traffic the queue sits near
+                // empty and nothing is shed; only an EDR flood trips it.
+                const WIDEBAND_SHED_DEPTH: usize = 128;
+                let mut wideband_shed: u64 = 0;
+                while let Ok(burst_msg) = burst_rx.recv() {
                     let burst = burst_msg.burst;
                     record_burst(&mut burst_writer, &burst);
                     #[cfg(feature = "gps")]
@@ -2142,9 +2149,18 @@ fn spawn_parallel_pipeline(
                     let gps_fix: Option<bd_output::pcap::GpsFix> = None;
                     let gps_ref = gps_fix.as_ref().filter(|f| f.valid);
 
+                    let wideband = if burst_msg.wideband.is_some()
+                        && burst_rx.len() > WIDEBAND_SHED_DEPTH
+                    {
+                        wideband_shed += 1;
+                        None
+                    } else {
+                        burst_msg.wideband.as_deref()
+                    };
+
                     process_burst(
                         &burst,
-                        burst_msg.wideband.as_deref(),
+                        wideband,
                         center_freq_mhz,
                         raw_sample_rate,
                         &mut fsk,
@@ -2188,7 +2204,7 @@ fn spawn_parallel_pipeline(
                             String::new()
                         };
                         eprint!(
-                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{}\n",
+                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{} shed:{}\n",
                             elapsed,
                             stats.total_ble,
                             phy_str,
@@ -2212,6 +2228,7 @@ fn spawn_parallel_pipeline(
                             stats.burst_1k_5k,
                             stats.burst_5k_50k,
                             stats.burst_50k_plus,
+                            wideband_shed,
                         );
 
                         last_stats = Instant::now();
@@ -2227,7 +2244,7 @@ fn spawn_parallel_pipeline(
                         String::new()
                     };
                     eprintln!(
-                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} EDR: try={} sync={} crc={} best={:.3}",
+                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} EDR: try={} sync={} crc={} best={:.3} shed={}",
                         elapsed,
                         stats.total_ble,
                         phy_str,
@@ -2241,6 +2258,7 @@ fn spawn_parallel_pipeline(
                         stats.edr_syncs,
                         stats.edr_crc_matches,
                         stats.edr_best_sync_score.unwrap_or(f32::NAN),
+                        wideband_shed,
                     );
                 }
             })
