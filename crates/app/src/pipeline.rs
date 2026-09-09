@@ -14,7 +14,7 @@ use num_complex::Complex32;
 
 use bd_dsp::burst::BurstCatcher;
 use bd_dsp::fft::BatchFft;
-use bd_dsp::fsk::{self, FskDemod};
+use bd_dsp::fsk::{self, FskDemod, FskResult};
 use bd_dsp::pfb::PfbChannelizer;
 use bd_dsp::window;
 use bd_output::pcap::PcapWriter;
@@ -25,6 +25,44 @@ use bd_protocol::Timespec;
 use bd_sdr::file::{FileSource, SampleFormat};
 use bd_sdr::SdrSource;
 
+use crate::burst_file::{FileBurstReader, FileBurstWriter};
+
+fn open_burst_writer(
+    path: Option<&Path>,
+    max_bytes: u64,
+) -> Result<Option<FileBurstWriter>, String> {
+    path.map(|path| {
+        FileBurstWriter::create(path, max_bytes)
+            .map_err(|e| format!("failed to create {}: {}", path.display(), e))
+    })
+    .transpose()
+}
+
+fn record_burst(writer: &mut Option<FileBurstWriter>, burst: &bd_dsp::burst::Burst) {
+    let result = match writer.as_mut() {
+        Some(writer) => writer.write_burst(burst),
+        None => return,
+    };
+    match result {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("burst capture size limit reached; recording stopped");
+            *writer = None;
+        }
+        Err(e) => {
+            eprintln!("burst capture write error: {}; recording stopped", e);
+            *writer = None;
+        }
+    }
+}
+
+fn seed_classic_uaps(tracker: &mut btbb::PiconetTracker, classic_uaps: &[(u32, u8)]) {
+    for &(lap, uap) in classic_uaps {
+        tracker.set_uap(lap, uap);
+        eprintln!("Classic ground truth: UAP={:02X} LAP={:06X}", uap, lap);
+    }
+}
+
 /// Run the full pipeline from IQ file to PCAP output.
 pub fn run_file(
     file_path: &Path,
@@ -32,9 +70,12 @@ pub fn run_file(
     center_freq_mhz: u32,
     num_channels: usize,
     pcap_path: Option<&Path>,
+    burst_path: Option<&Path>,
+    burst_limit_bytes: u64,
     check_crc: bool,
     squelch_db: f32,
     print_stats: bool,
+    classic_uaps: &[(u32, u8)],
 ) -> Result<(), String> {
     let sample_rate = num_channels as u32 * 1_000_000; // 1 MHz per channel
     let center_freq_hz = center_freq_mhz as u64 * 1_000_000;
@@ -52,7 +93,7 @@ pub fn run_file(
         })
         .collect();
 
-    // Map FFT bins to valid BLE/BT channels (even MHz, 2402-2480)
+    // Map FFT bins to valid BLE channels (even MHz, 2402-2480).
     // live_ch[ble_channel] = fft_bin_index, where ble_channel = (freq - 2402) / 2
     let mut live_ch: [i32; 40] = [-1; 40];
     let mut first_live: usize = 40;
@@ -77,10 +118,15 @@ pub fn run_file(
     let active_channels = (first_live..=last_live)
         .filter(|&ch| live_ch[ch] >= 0)
         .count();
+    let active_bt_channels = channel_freqs
+        .iter()
+        .filter(|&&freq| (2402..=2480).contains(&freq))
+        .count();
 
     eprintln!(
-        "channels: {} FFT bins, {} BLE channels (ch {}-{}, {}-{} MHz)",
+        "channels: {} FFT bins, {} Classic + {} BLE channels (ch {}-{}, {}-{} MHz)",
         num_channels,
+        active_bt_channels,
         active_channels,
         first_live,
         last_live,
@@ -89,10 +135,12 @@ pub fn run_file(
     );
 
     // Initialize protocol subsystems
-    let aa_correlator = AaCorrelator::new();       // LE 1M: SPS=2
+    let aa_correlator = AaCorrelator::new(); // LE 1M: SPS=2
     let aa_correlator_2m = AaCorrelator::with_sps(1); // LE 2M: SPS=1
     let syndrome_map = SyndromeMap::new(1);
     let mut conn_table = ConnectionTable::new();
+    let mut bt_tracker = btbb::PiconetTracker::new();
+    seed_classic_uaps(&mut bt_tracker, classic_uaps);
     let mut smp_parser = bd_protocol::smp::SmpParser::new();
 
     // Initialize DSP -- Type 2 PFB matching C code (semi_len m=4)
@@ -102,11 +150,12 @@ pub fn run_file(
     let mut fft = BatchFft::new(num_channels);
     let sps = 2usize; // 2 samples per symbol (type 2 PFB output rate)
 
-    // Per-channel burst catchers (only for valid BLE channels)
-    let mut burst_catchers: Vec<Option<BurstCatcher>> = (0..40)
-        .map(|ch| {
-            if ch >= first_live && ch <= last_live && live_ch[ch] >= 0 {
-                Some(BurstCatcher::new(2402 + ch as u32 * 2, squelch_db))
+    // One catcher per in-band Classic channel (every MHz, 2402-2480).
+    let mut burst_catchers: Vec<Option<BurstCatcher>> = channel_freqs
+        .iter()
+        .map(|&freq| {
+            if (2402..=2480).contains(&freq) {
+                Some(BurstCatcher::new(freq, squelch_db))
             } else {
                 None
             }
@@ -121,13 +170,11 @@ pub fn run_file(
         let file = File::create(path)
             .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
         let writer = BufWriter::new(file);
-        Some(
-            PcapWriter::new(writer)
-                .map_err(|e| format!("failed to write PCAP header: {}", e))?,
-        )
+        Some(PcapWriter::new(writer).map_err(|e| format!("failed to write PCAP header: {}", e))?)
     } else {
         None
     };
+    let mut burst_writer = open_burst_writer(burst_path, burst_limit_bytes)?;
 
     // Stats
     let mut total_ble: u64 = 0;
@@ -173,11 +220,29 @@ pub fn run_file(
     // Pre-allocated buffers (avoid per-step allocation)
     let mut fft_buf = vec![Complex32::new(0.0, 0.0); num_channels];
 
+    // Raw wideband ring buffer for phase-preserving EDR demod. An EDR packet's
+    // DPSK payload is ~1.4 MHz wide and the ~1 MHz PFB channel clips it, so we
+    // keep recent raw samples and re-extract the channel at full bandwidth when
+    // an EDR-typed packet is detected. Bounded to a few tens of milliseconds.
+    let edr_wideband_enabled = std::env::var_os("BD_EDR_WIDEBAND").is_some();
+    let raw_ring_cap: usize = (sample_rate as usize / 25).max(1 << 16); // ~40 ms
+    let mut raw_ring: Vec<Complex32> = Vec::with_capacity(raw_ring_cap + (1 << 16));
+    let mut raw_ring_start: u64 = 0; // raw complex index of raw_ring[0]
+
     // Main processing loop
     for buf in rx.iter() {
         // Type 2 PFB: each call takes M int16 values (M/2 complex samples)
         let step = num_channels; // M int16 values per PFB call
         let num_blocks = buf.data.len() / step;
+
+        // Append this block's raw complex samples to the wideband ring buffer
+        // (only when the opt-in wideband EDR path is active).
+        if edr_wideband_enabled {
+            raw_ring_start += trim_ring(&mut raw_ring, raw_ring_cap);
+            for i in 0..buf.num_samples {
+                raw_ring.push(Complex32::new(buf.data[2 * i] as f32, buf.data[2 * i + 1] as f32));
+            }
+        }
 
         for block in 0..num_blocks {
             let offset = block * step;
@@ -197,14 +262,9 @@ pub fn run_file(
 
             let ts = samples_to_timespec(sample_count, sample_rate);
 
-            // Feed each live BLE channel through its burst catcher
-            for ch_idx in first_live..=last_live {
-                let fft_bin = live_ch[ch_idx];
-                if fft_bin < 0 {
-                    continue;
-                }
-                let fft_bin = fft_bin as usize;
-                let catcher = match burst_catchers[ch_idx].as_mut() {
+            // Feed every in-band Classic channel; even-MHz bins also carry BLE.
+            for fft_bin in 0..num_channels {
+                let catcher = match burst_catchers[fft_bin].as_mut() {
                     Some(c) => c,
                     None => continue,
                 };
@@ -212,36 +272,135 @@ pub fn run_file(
                 let sample = fft_buf[fft_bin];
                 if let Some(burst) = catcher.execute(sample, &ts) {
                     total_bursts += 1;
+                    record_burst(&mut burst_writer, &burst);
 
                     // Skip very short bursts (< 132 samples, matching C)
                     if burst.samples.len() < 132 {
                         continue;
                     }
 
-                    // FSK demodulate the burst
-                    if let Some(fsk_result) = fsk.demodulate(&burst.samples) {
+                    // Preserve the normal decoder's original input. Any EDR
+                    // lead-in is reserved for the missed-header fallback.
+                    let normal_samples =
+                        &burst.samples[burst.edr_lead_samples.min(burst.samples.len())..];
+                    if let Some(mut fsk_result) = fsk.demodulate(normal_samples) {
                         let freq = burst.freq;
                         let burst_ts = burst.timestamp.clone();
                         let rssi = burst.rssi_db as i32;
                         let noise = burst.noise_db as i32;
-
-                        // Try Classic BT first
-                        if let Some(bt_pkt) = btbb::detect(
+                        let raw_start = burst.timestamp.tv_sec as u64 * sample_rate as u64
+                            + (burst.timestamp.tv_nsec as u64 * sample_rate as u64)
+                                / 1_000_000_000;
+                        let raw_len = (sample_rate as usize / 1000) * 3;
+                        // Provide the raw wideband window for any burst (a cheap
+                        // slice). The narrow-channel EDR envelope test misses
+                        // packets whose 1 MHz bin clips the DPSK, so gating the
+                        // window on burst.edr_extended alone drops real EDR; the
+                        // EDR header candidates + payload CRC inside decide.
+                        let wideband = if edr_wideband_enabled {
+                            ring_window(&raw_ring, raw_ring_start, raw_start, raw_len)
+                        } else {
+                            None
+                        };
+                        let offset_hz =
+                            (burst.freq as f64 - center_freq_mhz as f64) * 1_000_000.0;
+                        let mut demod_offset = burst.edr_lead_samples;
+                        let mut classic = btbb::detect(
                             &fsk_result.bits,
                             freq,
                             rssi,
                             noise,
                             burst_ts.clone(),
                             &syndrome_map,
-                        ) {
+                        );
+                        if burst.edr_extended {
+                            if let Some((fallback_fsk, fallback_packet, fallback_offset)) =
+                                recover_edr_lead_header(
+                                    &mut fsk,
+                                    &burst,
+                                    rssi,
+                                    noise,
+                                    &syndrome_map,
+                                )
+                            {
+                                fsk_result = fallback_fsk;
+                                classic = Some(fallback_packet);
+                                demod_offset = fallback_offset;
+                            }
+                        }
+                        // Re-decode the header from clean raw IQ when there is no
+                        // header, or when the channelized header decoded as a
+                        // multi-slot Basic Rate type: a squelch-clipped EDR header
+                        // reads that way and yields no EDR candidate with the
+                        // verified UAP.
+                        let header_needs_raw = classic.as_ref().is_none_or(|packet| {
+                            !packet.has_header
+                                || packet.header.is_some_and(|h| {
+                                    btbb::edr_bits_per_symbol(h.pkt_type).is_none()
+                                        && matches!(h.pkt_type & 0x0f, 0x8 | 0x9 | 0xa | 0xb | 0xe | 0xf)
+                                })
+                        });
+                        if header_needs_raw {
+                            if let Some((fallback_fsk, fallback_packet, fallback_offset)) =
+                                wideband.and_then(|window| {
+                                    recover_edr_wideband_header(
+                                        window,
+                                        offset_hz,
+                                        sample_rate,
+                                        burst.freq,
+                                        rssi,
+                                        noise,
+                                        &syndrome_map,
+                                        burst.edr_lead_samples,
+                                    )
+                                })
+                            {
+                                fsk_result = fallback_fsk;
+                                classic = Some(fallback_packet);
+                                demod_offset = fallback_offset;
+                            }
+                        }
+
+                        // Try Classic BT first
+                        if let Some(mut bt_pkt) = classic {
+                            let demod_ts = channel_samples_after(&burst_ts, demod_offset);
+                            bt_pkt.timestamp =
+                                bt_sync_timestamp(&demod_ts, &fsk_result, bt_pkt.sync_offset);
+                            let mut announce = btbb::enrich(&mut bt_pkt, &mut bt_tracker);
+                            if try_enrich_edr(
+                                &burst,
+                                &fsk_result,
+                                &mut bt_pkt,
+                                &mut bt_tracker,
+                                wideband,
+                                offset_hz,
+                                sample_rate,
+                                demod_offset,
+                            )
+                            .enriched
+                            {
+                                announce |= bt_tracker.mark_announced(bt_pkt.lap);
+                            }
+                            if announce {
+                                log_bt_address(&bt_pkt);
+                            }
                             total_bt += 1;
+                            if bt_pkt.crc_ok {
+                                total_crc += 1;
+                                valid_crc += 1;
+                            }
                             if let Some(ref mut writer) = pcap_writer {
                                 if let Err(e) = writer.write_bt(&bt_pkt, None) {
-                                    if pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                                    if pcap_errors == 0 {
+                                        eprintln!("PCAP write error: {}", e);
+                                    }
                                     pcap_errors += 1;
                                 }
                             }
                         } else {
+                            if freq & 1 != 0 {
+                                continue;
+                            }
                             let burst_len = fsk_result.demod.len();
                             let mut pkt = None;
 
@@ -280,7 +439,8 @@ pub fn run_file(
 
                             // Try LE 2M: reslice at SPS=1
                             if pkt.is_none() {
-                                let bits_2m = fsk::reslice(&fsk_result.demod, fsk_result.silence, 1);
+                                let bits_2m =
+                                    fsk::reslice(&fsk_result.demod, fsk_result.silence, 1);
                                 pkt = ble::ble_burst_2m(
                                     &bits_2m,
                                     freq,
@@ -323,13 +483,26 @@ pub fn run_file(
 
                                 // Parse SMP from data channel packets
                                 if p.aa != ble::BLE_ADV_AA && p.crc_valid && p.is_data {
-                                    if let Some((cid, payload)) = bd_protocol::smp::extract_l2cap(&p.data) {
-                                        for event in smp_parser.parse_l2cap(p.aa, cid, payload, true) {
+                                    if let Some((cid, payload)) =
+                                        bd_protocol::smp::extract_l2cap(&p.data)
+                                    {
+                                        for event in
+                                            smp_parser.parse_l2cap(p.aa, cid, payload, true)
+                                        {
                                             match &event {
-                                                bd_protocol::smp::SmpEvent::WeakPairing { aa, reason } => {
-                                                    eprintln!("SMP WARNING: 0x{:08X}: {}", aa, reason);
+                                                bd_protocol::smp::SmpEvent::WeakPairing {
+                                                    aa,
+                                                    reason,
+                                                } => {
+                                                    eprintln!(
+                                                        "SMP WARNING: 0x{:08X}: {}",
+                                                        aa, reason
+                                                    );
                                                 }
-                                                bd_protocol::smp::SmpEvent::LtkDistributed { aa, .. } => {
+                                                bd_protocol::smp::SmpEvent::LtkDistributed {
+                                                    aa,
+                                                    ..
+                                                } => {
                                                     eprintln!("SMP: 0x{:08X} LTK captured", aa);
                                                 }
                                                 _ => {}
@@ -349,7 +522,9 @@ pub fn run_file(
                                 total_ble += 1;
                                 if let Some(ref mut writer) = pcap_writer {
                                     if let Err(e) = writer.write_ble(&p, None) {
-                                        if pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                                        if pcap_errors == 0 {
+                                            eprintln!("PCAP write error: {}", e);
+                                        }
                                         pcap_errors += 1;
                                     }
                                 }
@@ -357,7 +532,6 @@ pub fn run_file(
                         }
                     }
                 }
-
             }
 
             // M/2 complex samples consumed per PFB call
@@ -400,6 +574,82 @@ pub fn run_file(
     Ok(())
 }
 
+/// Replay compact channelized bursts without rerunning the wideband channelizer.
+pub fn run_burst_file(
+    path: &Path,
+    pcap_path: Option<&Path>,
+    check_crc: bool,
+    print_stats: bool,
+    classic_uaps: &[(u32, u8)],
+) -> Result<(), String> {
+    let mut reader = FileBurstReader::open(path)
+        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let mut pcap_writer = if let Some(path) = pcap_path {
+        let file = File::create(path)
+            .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
+        Some(
+            PcapWriter::new(BufWriter::new(file))
+                .map_err(|e| format!("failed to write PCAP header: {}", e))?,
+        )
+    } else {
+        None
+    };
+
+    let mut fsk = FskDemod::new(2);
+    let aa_correlator = AaCorrelator::new();
+    let aa_correlator_2m = AaCorrelator::with_sps(1);
+    let syndrome_map = SyndromeMap::new(1);
+    let mut bt_tracker = btbb::PiconetTracker::new();
+    seed_classic_uaps(&mut bt_tracker, classic_uaps);
+    let mut conn_table = ConnectionTable::new();
+    let mut smp_parser = bd_protocol::smp::SmpParser::new();
+    let mut stats = PipelineStats::new();
+    #[cfg(feature = "zmq")]
+    let zmq_pub: Option<bd_output::zmq_pub::ZmqPublisher> = None;
+
+    while let Some(burst) = reader
+        .read_burst()
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?
+    {
+        process_burst(
+            &burst,
+            None,
+            0,
+            1,
+            &mut fsk,
+            &aa_correlator,
+            &aa_correlator_2m,
+            &syndrome_map,
+            &mut bt_tracker,
+            &mut conn_table,
+            &mut smp_parser,
+            &mut pcap_writer,
+            #[cfg(feature = "zmq")]
+            &zmq_pub,
+            None,
+            check_crc,
+            &mut stats,
+        );
+    }
+
+    if print_stats {
+        eprintln!(
+            "replay done: BLE: {} BT: {} bursts: {} CRC: {:.1}% ({}/{}) EDR: try={} sync={} crc={} best={:.3}",
+            stats.total_ble,
+            stats.total_bt,
+            stats.total_bursts,
+            stats.crc_pct(),
+            stats.valid_crc,
+            stats.total_crc,
+            stats.edr_attempts,
+            stats.edr_syncs,
+            stats.edr_crc_matches,
+            stats.edr_best_sync_score.unwrap_or(f32::NAN),
+        );
+    }
+    Ok(())
+}
+
 /// Build channel frequency table and live channel mapping.
 /// Returns (channel_freqs, live_ch, first_live, last_live).
 fn build_channel_map(
@@ -439,14 +689,594 @@ fn build_channel_map(
     Ok((channel_freqs, live_ch, first_live, last_live))
 }
 
-/// Process a burst: FSK demod -> BLE/BT detect -> PCAP write + ZMQ publish
+/// Print a one-line note when a Classic BT device's address is first recovered.
+fn log_bt_address(pkt: &bd_protocol::btbb::ClassicBtPacket) {
+    let lap = pkt.lap;
+    match (pkt.uap, pkt.nap) {
+        (Some(uap), Some(nap)) => eprintln!(
+            "BT addr {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} (full, from FHS)",
+            (nap >> 8) as u8,
+            nap as u8,
+            uap,
+            (lap >> 16) as u8,
+            (lap >> 8) as u8,
+            lap as u8,
+        ),
+        (Some(uap), None) => eprintln!(
+            "BT addr ??:??:{:02X}:{:02X}:{:02X}:{:02X}  UAP CRC-verified (LAP+UAP){}",
+            uap,
+            (lap >> 16) as u8,
+            (lap >> 8) as u8,
+            lap as u8,
+            pkt.clkn
+                .map(|c| format!("  CLK={:07X}", c))
+                .unwrap_or_default(),
+        ),
+        _ => {}
+    }
+}
+
+fn bt_sync_timestamp(
+    burst_timestamp: &Timespec,
+    fsk_result: &FskResult,
+    sync_offset: usize,
+) -> Timespec {
+    const CHANNEL_SAMPLE_RATE: u64 = 2_000_000;
+    const SPS: usize = 2;
+
+    let sample_offset = fsk_result.silence + 1 + sync_offset * SPS;
+    let offset_ns = sample_offset as u64 * 1_000_000_000 / CHANNEL_SAMPLE_RATE;
+    let total_ns = burst_timestamp.tv_nsec + offset_ns;
+    Timespec {
+        tv_sec: burst_timestamp.tv_sec + total_ns / 1_000_000_000,
+        tv_nsec: total_ns % 1_000_000_000,
+    }
+}
+
+fn recover_edr_lead_header(
+    fsk: &mut FskDemod,
+    burst: &bd_dsp::burst::Burst,
+    rssi: i32,
+    noise: i32,
+    syndrome_map: &SyndromeMap,
+) -> Option<(FskResult, btbb::ClassicBtPacket, usize)> {
+    if !burst.edr_extended || burst.edr_lead_samples < 16 {
+        return None;
+    }
+    for offset in (0..burst.edr_lead_samples).step_by(8) {
+        let Some(result) = fsk.demodulate(&burst.samples[offset..]) else {
+            continue;
+        };
+        let Some(packet) = btbb::detect(
+            &result.bits,
+            burst.freq,
+            rssi,
+            noise,
+            burst.timestamp.clone(),
+            syndrome_map,
+        ) else {
+            continue;
+        };
+        if packet.has_header {
+            if std::env::var_os("BD_EDR_DEBUG").is_some() {
+                eprintln!(
+                    "[edr-lead] freq={} offset={} LAP={:06X} access_errors={}",
+                    burst.freq, offset, packet.lap, packet.ac_errors
+                );
+            }
+            return Some((result, packet, offset));
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_edr_wideband_header(
+    wideband: &[Complex32],
+    offset_hz: f64,
+    raw_rate: u32,
+    freq: u32,
+    rssi: i32,
+    noise: i32,
+    syndrome_map: &SyndromeMap,
+    lead_samples: usize,
+) -> Option<(FskResult, btbb::ClassicBtPacket, usize)> {
+    let baseband_4m = bd_dsp::edr::extract_br_channel_4m(wideband, offset_hz, raw_rate);
+    if baseband_4m.len() < 512 {
+        return None;
+    }
+    if std::env::var_os("BD_EDR_DEBUG").is_some() {
+        let search_end_4m = lead_samples
+            .saturating_mul(2)
+            .min(baseband_4m.len().saturating_sub(264));
+        let mut probe = FskDemod::new(4);
+        for offset in (0..=search_end_4m).step_by(8) {
+            let Some(result) = probe.demodulate(&baseband_4m[offset..]) else {
+                continue;
+            };
+            if let Some(packet) = btbb::detect(
+                &result.bits,
+                freq,
+                rssi,
+                noise,
+                Timespec::default(),
+                syndrome_map,
+            ) {
+                if packet.has_header {
+                    eprintln!(
+                        "[edr-raw4-header] freq={} offset={} LAP={:06X} access_errors={}",
+                        freq, offset, packet.lap, packet.ac_errors
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    let baseband_2m = baseband_4m.iter().step_by(2).copied().collect::<Vec<_>>();
+    let search_end = lead_samples.min(baseband_2m.len().saturating_sub(136));
+    let mut fsk = FskDemod::new(2);
+    for offset in (0..=search_end).step_by(4) {
+        let Some(result) = fsk.demodulate(&baseband_2m[offset..]) else {
+            continue;
+        };
+        let Some(packet) = btbb::detect(
+            &result.bits,
+            freq,
+            rssi,
+            noise,
+            Timespec::default(),
+            syndrome_map,
+        ) else {
+            continue;
+        };
+        if packet.has_header {
+            if std::env::var_os("BD_EDR_DEBUG").is_some() {
+                eprintln!(
+                    "[edr-raw-header] freq={} offset={} LAP={:06X} access_errors={}",
+                    freq, offset, packet.lap, packet.ac_errors
+                );
+            }
+            return Some((result, packet, offset));
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct EdrAttempt {
+    candidate: bool,
+    synchronized: bool,
+    crc_match: bool,
+    enriched: bool,
+    best_sync_score: Option<f32>,
+}
+
+/// Drop the oldest samples once the ring exceeds its cap; returns how many were
+/// removed so the caller can advance the ring's base sample index.
+fn trim_ring(ring: &mut Vec<Complex32>, cap: usize) -> u64 {
+    if ring.len() > cap {
+        let drop = ring.len() - cap;
+        ring.drain(..drop);
+        drop as u64
+    } else {
+        0
+    }
+}
+
+/// Extract the raw wideband window covering a burst from the ring buffer, given
+/// the burst's start sample index and raw length. Returns `None` if the window
+/// is not fully resident (e.g. trimmed away).
+fn ring_window(
+    ring: &[Complex32],
+    ring_start: u64,
+    raw_start: u64,
+    raw_len: usize,
+) -> Option<&[Complex32]> {
+    let off = raw_start.checked_sub(ring_start)? as usize;
+    let end = off.checked_add(raw_len)?;
+    if end <= ring.len() {
+        Some(&ring[off..end])
+    } else if off < ring.len() {
+        Some(&ring[off..])
+    } else {
+        None
+    }
+}
+
+/// Decode EDR payloads from a raw wideband window around the packet. The fixed
+/// sync chooses the payload boundary before CRC validation; CRC is never used
+/// to search for symbol alignment.
+fn edr_wideband_variants(
+    window: &[Complex32],
+    offset_hz: f64,
+    raw_rate: u32,
+    channel_sync_reference: usize,
+) -> Vec<(usize, Vec<u8>, f32)> {
+    const SPS: usize = 4;
+    const MAX_SYNC_SCORE: f32 = 0.08;
+    let mut baseband = bd_dsp::edr::extract_edr_channel_4m(window, offset_hz, raw_rate);
+    if baseband.len() < 64 * SPS {
+        return Vec::new();
+    }
+    let _ = channel_sync_reference;
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let search = two_pi * (300_000.0 / 4_000_000.0);
+    let step = two_pi * (5_000.0 / 4_000_000.0);
+    // Estimate the CFO from the packet itself, not a header-derived reference
+    // (which is unreliable when the squelch clipped the access code).
+    let correction = bd_dsp::edr::refine_cfo(&baseband, SPS, search, step);
+    bd_dsp::edr::derotate(&mut baseband, correction);
+    let matched = bd_dsp::edr::rrc_matched_filter(&baseband, SPS, 0.4, 6);
+    // The fixed sync is a strong 10-symbol pattern (real locks score ~0.005),
+    // so scan the whole window with the strict threshold rather than trusting an
+    // approximate reference.
+    let Some(lock) = bd_dsp::edr::locate_edr_sync(
+        &matched,
+        matched.len() / 2,
+        matched.len() / 2,
+        SPS,
+        MAX_SYNC_SCORE,
+    ) else {
+        return Vec::new();
+    };
+
+    // The payload starts a fixed distance after the sync, but the exact symbol
+    // count (guard/reference) leaves it a symbol or two ambiguous; a mis-set
+    // start shifts the whitening phase and hides the CRC. Emit the demod for a
+    // few start offsets around the lock and let the CRC choose.
+    let mut out = Vec::new();
+    for &bps in &[2usize, 3usize] {
+        for delta in -3i32..=3 {
+            let mut shifted = lock;
+            let ref_sample = lock.reference_sample as i32 + delta * SPS as i32;
+            if ref_sample < 0 {
+                continue;
+            }
+            shifted.reference_sample = ref_sample as usize;
+            let bits = bd_dsp::edr::demod_dpsk_detrended_from_sync(&matched, shifted, SPS, bps);
+            if !bits.is_empty() && !out.iter().any(|(b, existing, _)| *b == bps && existing == &bits) {
+                out.push((bps, bits, lock.score));
+            }
+        }
+    }
+    if std::env::var_os("BD_EDR_DEBUG").is_some() {
+        eprintln!(
+            "[edr-wb] sync={} score={:.4} conjugated={} cfo={:.0}Hz bits={:?}",
+            lock.reference_sample,
+            lock.score,
+            lock.conjugated,
+            correction * 4_000_000.0 / two_pi,
+            out.iter().map(|(bps, bits, _)| (*bps, bits.len())).collect::<Vec<_>>()
+        );
+    }
+    out
+}
+
+fn try_enrich_edr(
+    burst: &bd_dsp::burst::Burst,
+    fsk_result: &FskResult,
+    pkt: &mut bd_protocol::btbb::ClassicBtPacket,
+    tracker: &mut btbb::PiconetTracker,
+    wideband: Option<&[Complex32]>,
+    offset_hz: f64,
+    raw_rate: u32,
+    channel_lead_samples: usize,
+) -> EdrAttempt {
+    if !pkt.has_header {
+        return EdrAttempt::default();
+    }
+    // A 3-DHx EDR packet whose GFSK header decoded under the wrong clock reads
+    // as a multi-slot Basic Rate type (DH3/DH5/DM3/DM5/AUX1). Only bail out for
+    // short types that can never carry an EDR payload; the EDR header candidates
+    // and the payload CRC below decide the rest. Without a wideband window there
+    // is nothing new to try, so keep the old fast path.
+    if wideband.is_none()
+        && pkt.uap_verified
+        && pkt
+            .header
+            .is_some_and(|header| btbb::edr_bits_per_symbol(header.pkt_type).is_none())
+    {
+        return EdrAttempt::default();
+    }
+    if let Some(header) = pkt.header {
+        if btbb::edr_bits_per_symbol(header.pkt_type).is_none()
+            && !matches!(header.pkt_type & 0x0f, 0x8 | 0x9 | 0xa | 0xb | 0xe | 0xf)
+        {
+            // Short BR types (ID/NULL/POLL/FHS/DM1/DH1/HV*) are never EDR.
+            return EdrAttempt::default();
+        }
+    }
+    let mut candidates = btbb::edr_header_candidates(&pkt.raw_header);
+    if pkt.uap_verified {
+        if let Some(uap) = pkt.uap {
+            candidates.retain(|(candidate_uap, _)| *candidate_uap == uap);
+        }
+    }
+    if let (Some(uap), Some(header)) = (pkt.uap, pkt.header) {
+        if btbb::edr_bits_per_symbol(header.pkt_type).is_some() {
+            candidates.insert(0, (uap, header));
+        }
+    }
+    // A squelch-clipped EDR header can be corrupt enough that no clock yields an
+    // EDR candidate with the verified access-code UAP. The UAP itself is
+    // reliable (it comes from the access code, not the header), so when we have a
+    // wideband window fall back to every clock under that UAP and let the payload
+    // CRC pick the real one. Wideband-only, so Basic Rate is unaffected.
+    if wideband.is_some() {
+        if let Some(uap) = pkt.uap.filter(|_| pkt.uap_verified) {
+            if !candidates.iter().any(|(candidate_uap, _)| *candidate_uap == uap) {
+                // One candidate is enough: the wideband path searches all
+                // whitening phases, so the clock field is not used for it.
+                candidates.push((
+                    uap,
+                    btbb::BtHeader {
+                        lt_addr: 1,
+                        pkt_type: 0x0d,
+                        flow: 1,
+                        arqn: 0,
+                        seqn: 0,
+                        hec: 0,
+                        clk6: 0,
+                    },
+                ));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return EdrAttempt::default();
+    }
+    if std::env::var_os("BD_EDR_DEBUG").is_some() {
+        let corrected = btbb::edr_header_candidates_corrected(&pkt.raw_header);
+        eprintln!(
+            "[edr-wb] LAP={:06X} burst={}.{:09} raw_header={:02X?} headers=[{}] corrected=[{}]",
+            pkt.lap,
+            burst.timestamp.tv_sec,
+            burst.timestamp.tv_nsec,
+            pkt.raw_header,
+            candidates
+                .iter()
+                .map(|(uap, header)| format!(
+                    "{:02X}/clk{}/{}",
+                    uap,
+                    header.clk6,
+                    btbb::pkt_type_name(header.pkt_type)
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            corrected
+                .iter()
+                .filter(|(uap, _)| !pkt.uap_verified || pkt.uap == Some(*uap))
+                .map(|(uap, header)| format!(
+                    "{:02X}/clk{}/{}",
+                    uap,
+                    header.clk6,
+                    btbb::pkt_type_name(header.pkt_type)
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    const SPS: usize = 2;
+    const ACCESS_TRAILER_BITS: usize = 68;
+    const CODED_HEADER_BITS: usize = 54;
+    const EDR_GUARD_SYMBOLS: usize = 5;
+    let sync_reference_symbol =
+        pkt.sync_offset + ACCESS_TRAILER_BITS + CODED_HEADER_BITS + EDR_GUARD_SYMBOLS;
+    let sync_reference_sample =
+        channel_lead_samples + fsk_result.silence + 1 + sync_reference_symbol * SPS;
+    let wb_variants = wideband
+        .map(|window| {
+            edr_wideband_variants(window, offset_hz, raw_rate, sync_reference_sample)
+        })
+        .unwrap_or_default();
+    let mut attempt = EdrAttempt {
+        candidate: true,
+        ..EdrAttempt::default()
+    };
+    let iq = bd_dsp::edr::prepare_iq(
+        &burst.samples,
+        fsk_result.cfo * std::f32::consts::PI,
+        fsk_result.resample_ratio,
+    );
+    let matched_iq = bd_dsp::edr::rrc_matched_filter(&iq, SPS, 0.4, 6);
+    let mut corrected_candidates = None;
+    let mut matches: Vec<(bd_protocol::btbb::ClassicBtPacket, u8, btbb::BtHeader)> = Vec::new();
+    for bits_per_symbol in [2usize, 3] {
+        if !candidates
+            .iter()
+            .any(|(_, header)| btbb::edr_bits_per_symbol(header.pkt_type) == Some(bits_per_symbol))
+        {
+            continue;
+        }
+        let crc_candidates = corrected_candidates.get_or_insert_with(|| {
+            let mut corrected = btbb::edr_header_candidates_corrected(&pkt.raw_header);
+            if pkt.uap_verified {
+                if let Some(uap) = pkt.uap {
+                    corrected.retain(|(candidate_uap, _)| *candidate_uap == uap);
+                }
+            }
+            corrected
+        });
+        for (filter_name, demod_iq) in [("rrc", &matched_iq), ("raw", &iq)] {
+            let (payload_variants, diagnostic) =
+                bd_dsp::edr::demod_payload_variants_with_diagnostic(
+                    demod_iq,
+                    sync_reference_sample,
+                    SPS,
+                    bits_per_symbol,
+                );
+            if let Some(diagnostic) = diagnostic {
+                if attempt
+                    .best_sync_score
+                    .is_none_or(|score| diagnostic.score < score)
+                {
+                    attempt.best_sync_score = Some(diagnostic.score);
+                }
+            }
+            attempt.synchronized |= !payload_variants.is_empty();
+            if !payload_variants.is_empty() {
+                if let Some(diagnostic) = diagnostic {
+                    let header_summary = crc_candidates
+                        .iter()
+                        .map(|(uap, header)| {
+                            format!(
+                                "{:02X}/clk{:02}/{}",
+                                uap,
+                                header.clk6,
+                                btbb::pkt_type_name(header.pkt_type)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let payload_summary = payload_variants
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(variant, bits)| {
+                            crc_candidates.iter().filter_map(move |(_, header)| {
+                                if btbb::edr_bits_per_symbol(header.pkt_type)
+                                    != Some(bits_per_symbol)
+                                {
+                                    return None;
+                                }
+                                btbb::edr_payload_header(bits, header.clk6).map(|payload| {
+                                    format!(
+                                        "v{}({})/clk{}:{}/{}/{}",
+                                        variant,
+                                        bits.len(),
+                                        header.clk6,
+                                        payload.llid,
+                                        payload.flow,
+                                        payload.length
+                                    )
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    log::debug!(
+                        "EDR sync LAP={:06X} freq={} bps={} filter={} score={:.4} offset={} conjugated={} variants={} headers=[{}] payloads=[{}]",
+                        pkt.lap,
+                        pkt.freq,
+                        bits_per_symbol,
+                        filter_name,
+                        diagnostic.score,
+                        diagnostic.offset,
+                        diagnostic.conjugated,
+                        payload_variants.len(),
+                        header_summary,
+                        payload_summary,
+                    );
+                }
+            }
+            for raw_payload in payload_variants {
+                for &(uap, header) in crc_candidates.iter() {
+                    if btbb::edr_bits_per_symbol(header.pkt_type) != Some(bits_per_symbol) {
+                        continue;
+                    }
+                    let mut candidate = pkt.clone();
+                    if btbb::enrich_edr_candidate(&mut candidate, &raw_payload, uap, header)
+                        && !matches.iter().any(|(_, seen_uap, seen_header)| {
+                            *seen_uap == uap
+                                && seen_header.clk6 == header.clk6
+                                && seen_header.pkt_type == header.pkt_type
+                        })
+                    {
+                        matches.push((candidate, uap, header));
+                    }
+                }
+            }
+        }
+
+        // Merge phase-preserving wideband variants for this modulation. The
+        // channelized path above works from a ~1 MHz PFB bin that clips the DPSK;
+        // the wideband path recovers the full constellation. The CRC below is
+        // still the sole authority for accepting a payload.
+        for (wb_bps, raw_payload, sync_score) in &wb_variants {
+            if *wb_bps != bits_per_symbol {
+                continue;
+            }
+            attempt.synchronized = true;
+            if attempt
+                .best_sync_score
+                .is_none_or(|best| *sync_score < best)
+            {
+                attempt.best_sync_score = Some(*sync_score);
+            }
+            // Wideband acceptance uses only uncorrected, HEC-consistent header
+            // interpretations. One-bit FEC repair multiplied by timing variants
+            // produced enough trials for accidental 16-bit CRC matches.
+            //
+            // The header's 4-bit TYPE field is unreliable here: the squelch often
+            // rises on the DPSK payload after the GFSK header has passed, so the
+            // recovered type can disagree with the modulation the signal actually
+            // carries (e.g. a clock's header reads 2-DH3 while the payload is
+            // 8DPSK). The whitening only needs the clock, and the modulation is
+            // fixed by which bits_per_symbol variant this is, so pair each unique
+            // HEC-consistent clock with a synthetic header of the matching rate
+            // and let the payload CRC decide.
+            // Whitening depends only on the clock; the type field is unreliable
+            // after a clipped header, so pair each unique UAP with a synthetic
+            // header of the right rate and search all whitening phases. The
+            // payload CRC is the sole authority.
+            let synth_type: u8 = if bits_per_symbol == 3 { 0x0d } else { 0x0c };
+            let mut tried_uaps: Vec<u8> = Vec::new();
+            for &(uap, base_header) in &candidates {
+                if tried_uaps.contains(&uap) {
+                    continue;
+                }
+                tried_uaps.push(uap);
+                let header = btbb::BtHeader {
+                    pkt_type: synth_type,
+                    ..base_header
+                };
+                let mut candidate = pkt.clone();
+                if btbb::enrich_edr_candidate_any_phase(&mut candidate, raw_payload, uap, header)
+                    && (2..=1024).contains(&candidate.decoded_payload.len())
+                    && !matches
+                        .iter()
+                        .any(|(_, seen_uap, _)| *seen_uap == uap)
+                {
+                    if std::env::var_os("BD_EDR_DEBUG").is_some() {
+                        let head: String = candidate
+                            .decoded_payload
+                            .iter()
+                            .take(24)
+                            .map(|b| format!("{:02x} ", b))
+                            .collect();
+                        eprintln!(
+                            "[edr-wb] CRC PASS LAP={:06X} UAP={:02X} bps={} bytes={} | {}",
+                            pkt.lap, uap, bits_per_symbol, candidate.decoded_payload.len(), head,
+                        );
+                    }
+                    matches.push((candidate, uap, header));
+                }
+            }
+        }
+    }
+
+    let [(candidate, uap, header)] = matches.as_slice() else {
+        return attempt;
+    };
+    attempt.crc_match = true;
+    if tracker.confirm_uap_at(pkt.lap, *uap, header.clk6, &pkt.timestamp) {
+        *pkt = candidate.clone();
+        attempt.enriched = true;
+    }
+    attempt
+}
+
+/// Process a burst: FSK demod -> BLE/BT detect -> PCAP write + ZMQ publish.
 #[allow(clippy::too_many_arguments)]
 fn process_burst(
     burst: &bd_dsp::burst::Burst,
+    wideband: Option<&[Complex32]>,
+    center_freq_mhz: u32,
+    raw_sample_rate: u32,
     fsk: &mut FskDemod,
     aa_correlator: &AaCorrelator,
     aa_correlator_2m: &AaCorrelator,
     syndrome_map: &SyndromeMap,
+    bt_tracker: &mut btbb::PiconetTracker,
     conn_table: &mut ConnectionTable,
     smp_parser: &mut bd_protocol::smp::SmpParser,
     pcap_writer: &mut Option<PcapWriter<BufWriter<File>>>,
@@ -477,13 +1307,17 @@ fn process_burst(
             }
             if p.crc_checked {
                 stats.total_crc += 1;
-                if p.crc_valid { stats.valid_crc += 1; }
+                if p.crc_valid {
+                    stats.valid_crc += 1;
+                }
             }
             stats.total_ble += 1;
             stats.total_ble_coded += 1;
             if let Some(ref mut writer) = pcap_writer {
                 if let Err(e) = writer.write_ble(&p, gps_fix) {
-                    if stats.pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                    if stats.pcap_errors == 0 {
+                        eprintln!("PCAP write error: {}", e);
+                    }
                     stats.pcap_errors += 1;
                 }
             }
@@ -511,7 +1345,8 @@ fn process_burst(
         return;
     }
 
-    let fsk_result = match fsk.demodulate(&burst.samples) {
+    let normal_samples = &burst.samples[burst.edr_lead_samples.min(burst.samples.len())..];
+    let fsk_result = match fsk.demodulate(normal_samples) {
         Some(r) => r,
         None => {
             // FSK demod failed. Try raw FM + coded for any burst >= 1500 samples
@@ -539,15 +1374,19 @@ fn process_burst(
                     }
                     if p.crc_checked {
                         stats.total_crc += 1;
-                        if p.crc_valid { stats.valid_crc += 1; }
+                        if p.crc_valid {
+                            stats.valid_crc += 1;
+                        }
                     }
                     stats.total_ble += 1;
                     stats.total_ble_coded += 1;
                     if let Some(ref mut writer) = pcap_writer {
                         if let Err(e) = writer.write_ble(&p, gps_fix) {
-                    if stats.pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
-                    stats.pcap_errors += 1;
-                }
+                            if stats.pcap_errors == 0 {
+                                eprintln!("PCAP write error: {}", e);
+                            }
+                            stats.pcap_errors += 1;
+                        }
                     }
                     #[cfg(feature = "zmq")]
                     if let Some(ref pub_socket) = zmq_pub {
@@ -565,7 +1404,7 @@ fn process_burst(
     let noise = burst.noise_db as i32;
 
     // Try Classic BT first
-    if let Some(bt_pkt) = btbb::detect(
+    if let Some(mut bt_pkt) = btbb::detect(
         &fsk_result.bits,
         freq,
         rssi,
@@ -573,10 +1412,38 @@ fn process_burst(
         burst_ts.clone(),
         syndrome_map,
     ) {
+        let demod_ts = channel_samples_after(&burst_ts, burst.edr_lead_samples);
+        bt_pkt.timestamp = bt_sync_timestamp(&demod_ts, &fsk_result, bt_pkt.sync_offset);
+        // Recover UAP (and full BD_ADDR from FHS) across packets/channels.
+        let mut announce = btbb::enrich(&mut bt_pkt, bt_tracker);
+        let offset_hz = (burst.freq as f64 - center_freq_mhz as f64) * 1_000_000.0;
+        let edr_attempt = try_enrich_edr(
+            burst,
+            &fsk_result,
+            &mut bt_pkt,
+            bt_tracker,
+            wideband,
+            offset_hz,
+            raw_sample_rate,
+            burst.edr_lead_samples,
+        );
+        stats.record_edr(&edr_attempt);
+        if edr_attempt.enriched {
+            announce |= bt_tracker.mark_announced(bt_pkt.lap);
+        }
+        if announce {
+            log_bt_address(&bt_pkt);
+        }
         stats.total_bt += 1;
+        if bt_pkt.crc_ok {
+            stats.total_crc += 1;
+            stats.valid_crc += 1;
+        }
         if let Some(ref mut writer) = pcap_writer {
             if let Err(e) = writer.write_bt(&bt_pkt, gps_fix) {
-                if stats.pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                if stats.pcap_errors == 0 {
+                    eprintln!("PCAP write error: {}", e);
+                }
                 stats.pcap_errors += 1;
             }
         }
@@ -587,12 +1454,16 @@ fn process_burst(
         return;
     }
 
+    // BLE channels are spaced every 2 MHz. Odd-MHz bins are Classic-only.
+    if freq & 1 != 0 {
+        return;
+    }
+
     // For long bursts (> 2000 samples), try coded FIRST since coded packets
     // are always long (min ~2700 at S=2, ~6800+ at S=8). The coded preamble
     // check is cheap and highly distinctive (80 symbols of 00111100).
     let mut pkt = None;
     let burst_len = fsk_result.demod.len();
-
 
     if burst_len > 2000 {
         stats.coded_attempts += 1;
@@ -609,44 +1480,27 @@ fn process_burst(
 
     // Try BLE LE 1M preamble-first detection
     if pkt.is_none() {
-        pkt = ble::ble_burst(
-            &fsk_result.bits,
-            freq,
-            burst_ts.clone(),
-            check_crc,
-            |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
-        );
+        pkt = ble::ble_burst(&fsk_result.bits, freq, burst_ts.clone(), check_crc, |aa| {
+            conn_table.crc_init_for_aa(aa, burst_ts.tv_sec)
+        });
     }
 
     // Fall back to LE 1M AA correlator
     if pkt.is_none() {
-        pkt = aa_correlator.correlate(
-            &fsk_result.demod,
-            freq,
-            burst_ts.clone(),
-            check_crc,
-        );
+        pkt = aa_correlator.correlate(&fsk_result.demod, freq, burst_ts.clone(), check_crc);
     }
 
     // Try LE 2M: reslice the demod at SPS=1 and try preamble-first
     if pkt.is_none() {
         let bits_2m = fsk::reslice(&fsk_result.demod, fsk_result.silence, 1);
-        pkt = ble::ble_burst_2m(
-            &bits_2m,
-            freq,
-            burst_ts.clone(),
-            check_crc,
-            |aa| conn_table.crc_init_for_aa(aa, burst_ts.tv_sec),
-        );
+        pkt = ble::ble_burst_2m(&bits_2m, freq, burst_ts.clone(), check_crc, |aa| {
+            conn_table.crc_init_for_aa(aa, burst_ts.tv_sec)
+        });
 
         // Fall back to LE 2M AA correlator
         if pkt.is_none() {
-            pkt = aa_correlator_2m.correlate_2m(
-                &fsk_result.demod,
-                freq,
-                burst_ts.clone(),
-                check_crc,
-            );
+            pkt =
+                aa_correlator_2m.correlate_2m(&fsk_result.demod, freq, burst_ts.clone(), check_crc);
         }
     }
 
@@ -677,12 +1531,21 @@ fn process_burst(
                 // Direction: assume central is the initiator for now
                 // (proper direction tracking requires connection role from CONNECT_IND)
                 let from_central = true;
-                let smp_events = smp_parser.parse_l2cap(p.aa, l2cap_cid, l2cap_payload, from_central);
+                let smp_events =
+                    smp_parser.parse_l2cap(p.aa, l2cap_cid, l2cap_payload, from_central);
                 for event in &smp_events {
                     // Log to stderr
                     match event {
-                        bd_protocol::smp::SmpEvent::FeaturesExchanged { aa, method, security, .. } => {
-                            eprintln!("SMP: connection 0x{:08X} pairing {:?} ({:?})", aa, method, security);
+                        bd_protocol::smp::SmpEvent::FeaturesExchanged {
+                            aa,
+                            method,
+                            security,
+                            ..
+                        } => {
+                            eprintln!(
+                                "SMP: connection 0x{:08X} pairing {:?} ({:?})",
+                                aa, method, security
+                            );
                         }
                         bd_protocol::smp::SmpEvent::WeakPairing { aa, reason } => {
                             eprintln!("SMP WARNING: connection 0x{:08X}: {}", aa, reason);
@@ -694,7 +1557,10 @@ fn process_burst(
                             eprintln!("SMP: connection 0x{:08X} IRK captured", aa);
                         }
                         bd_protocol::smp::SmpEvent::PairingFailed { aa, reason } => {
-                            eprintln!("SMP: connection 0x{:08X} pairing failed (reason {})", aa, reason);
+                            eprintln!(
+                                "SMP: connection 0x{:08X} pairing failed (reason {})",
+                                aa, reason
+                            );
                         }
                         _ => {}
                     }
@@ -717,8 +1583,10 @@ fn process_burst(
                     ble::BlePhy::PhyCoded => "Coded",
                 };
                 let ch_freq = 2402 + (aux.channel as u32) * 2;
-                eprintln!("ADV_EXT_IND: freq={} rssi={} -> AuxPtr ch={} ({}MHz) phy={} offset={}us",
-                    freq, rssi, aux.channel, ch_freq, phy_str, aux.offset_usec);
+                eprintln!(
+                    "ADV_EXT_IND: freq={} rssi={} -> AuxPtr ch={} ({}MHz) phy={} offset={}us",
+                    freq, rssi, aux.channel, ch_freq, phy_str, aux.offset_usec
+                );
             }
         }
 
@@ -738,7 +1606,9 @@ fn process_burst(
         stats.total_ble += 1;
         if let Some(ref mut writer) = pcap_writer {
             if let Err(e) = writer.write_ble(&p, gps_fix) {
-                if stats.pcap_errors == 0 { eprintln!("PCAP write error: {}", e); }
+                if stats.pcap_errors == 0 {
+                    eprintln!("PCAP write error: {}", e);
+                }
                 stats.pcap_errors += 1;
             }
         }
@@ -757,6 +1627,10 @@ struct PipelineStats {
     total_crc: u64,
     valid_crc: u64,
     total_bursts: u64,
+    edr_attempts: u64,
+    edr_syncs: u64,
+    edr_crc_matches: u64,
+    edr_best_sync_score: Option<f32>,
     /// Debug: bursts that reached the coded decoder (all prior decoders returned None)
     coded_attempts: u64,
     /// Debug: FSK demod failures >= 1500 samples
@@ -784,6 +1658,10 @@ impl PipelineStats {
             total_crc: 0,
             valid_crc: 0,
             total_bursts: 0,
+            edr_attempts: 0,
+            edr_syncs: 0,
+            edr_crc_matches: 0,
+            edr_best_sync_score: None,
             coded_attempts: 0,
             fsk_reject_long: 0,
             coded_fsk_ok: 0,
@@ -804,13 +1682,101 @@ impl PipelineStats {
             0.0
         }
     }
+
+    fn record_edr(&mut self, attempt: &EdrAttempt) {
+        self.edr_attempts += u64::from(attempt.candidate);
+        self.edr_syncs += u64::from(attempt.synchronized);
+        self.edr_crc_matches += u64::from(attempt.crc_match);
+        if let Some(score) = attempt.best_sync_score {
+            if self.edr_best_sync_score.is_none_or(|best| score < best) {
+                self.edr_best_sync_score = Some(score);
+            }
+        }
+    }
 }
 
 /// Message sent from main thread to burst worker threads.
 struct BatchMsg {
     data: Arc<Vec<f32>>,
+    /// Interleaved raw SC16 IQ covering the same time span as `data`.
+    /// Present only for the opt-in EDR wideband path.
+    raw_iq: Option<Arc<Vec<i16>>>,
     batch_steps: usize,
     ts: Timespec,
+}
+
+struct BurstMsg {
+    burst: bd_dsp::burst::Burst,
+    wideband: Option<Vec<Complex32>>,
+}
+
+struct RawBatch {
+    iq: Arc<Vec<i16>>,
+    start_sample: u128,
+}
+
+struct RawBatchCache {
+    batches: std::collections::VecDeque<RawBatch>,
+    sample_rate: u32,
+}
+
+impl RawBatchCache {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            batches: std::collections::VecDeque::new(),
+            sample_rate,
+        }
+    }
+
+    fn sample_index(&self, ts: &Timespec) -> u128 {
+        ts.tv_sec as u128 * self.sample_rate as u128
+            + ts.tv_nsec as u128 * self.sample_rate as u128 / 1_000_000_000
+    }
+
+    fn push(&mut self, msg: &BatchMsg) {
+        let Some(iq) = msg.raw_iq.clone() else {
+            return;
+        };
+        self.batches.push_back(RawBatch {
+            iq,
+            start_sample: self.sample_index(&msg.ts),
+        });
+        while self.batches.len() > 8 {
+            self.batches.pop_front();
+        }
+    }
+
+    fn extract(&self, start: &Timespec, duration_us: u32) -> Option<Vec<Complex32>> {
+        let wanted_start = self.sample_index(start);
+        let wanted_len = self.sample_rate as usize * duration_us as usize / 1_000_000;
+        let wanted_end = wanted_start + wanted_len as u128;
+        let mut output = Vec::with_capacity(wanted_len);
+        let mut next_sample = wanted_start;
+
+        for batch in &self.batches {
+            let batch_len = batch.iq.len() / 2;
+            let batch_end = batch.start_sample + batch_len as u128;
+            if batch_end <= next_sample || batch.start_sample >= wanted_end {
+                continue;
+            }
+            if batch.start_sample > next_sample {
+                return None;
+            }
+            let first = (next_sample - batch.start_sample) as usize;
+            let last = ((wanted_end.min(batch_end)) - batch.start_sample) as usize;
+            for index in first..last {
+                output.push(Complex32::new(
+                    batch.iq[2 * index] as f32,
+                    batch.iq[2 * index + 1] as f32,
+                ));
+            }
+            next_sample = batch.start_sample + last as u128;
+            if next_sample >= wanted_end {
+                return Some(output);
+            }
+        }
+        None
+    }
 }
 
 /// Channel assignment for a single burst worker.
@@ -822,7 +1788,7 @@ struct ChannelAssignment {
 
 /// Per-channel adaptive gain. Tracks rolling chunk-RMS and snaps the per-bin
 /// scale so each channel's noise floor sits near `TARGET_NOISE_RMS`. This
-/// equalizes the AGC operating point across all 40 BLE channels even when
+/// equalizes the AGC operating point across all active channels even when
 /// WiFi raises some bins by 30+ dB -- without per-bin equalization, the
 /// shared squelch threshold is biased by the WiFi-noisy channels and the
 /// AGC takes longer to converge on burst start (corrupting early symbols).
@@ -845,20 +1811,20 @@ struct ChannelGain {
     target_p25: f32,
 }
 
-const CHANNEL_GAIN_CHUNK: u32 = 256;          // ~256 µs per chunk at 1 Msps/ch
-const CHANNEL_GAIN_HISTORY: usize = 64;       // 64 chunks ≈ 16 ms total window
-const CHANNEL_GAIN_UPDATE_CHUNKS: u32 = 64;   // recompute scale every full window
-const CHANNEL_GAIN_TARGET: f32 = 0.01;        // post-scale RMS target (per channel)
-const CHANNEL_GAIN_INIT: f32 = 1.0;           // pass-through until we have data
-// Clamp range for the per-channel adaptive gain. The block is enabled
-// only in decim>1 (halfband+) modes, where some bins receive WiFi-loud
-// energy and others are filter-rejected; attenuate-only equalization
-// pulls the loud bins down to the cross-channel median so the AGC sees
-// a uniform operating point. Amplification (max>1) was tried for
-// decim=1 mode but was unstable across RF environments, so the gain
-// block is disabled there entirely.
-const CHANNEL_GAIN_MIN: f32 = 0.1;            // attenuate by up to 20 dB
-const CHANNEL_GAIN_MAX_DECIM: f32 = 1.0;      // never amplify
+const CHANNEL_GAIN_CHUNK: u32 = 256; // ~256 µs per chunk at 1 Msps/ch
+const CHANNEL_GAIN_HISTORY: usize = 64; // 64 chunks ≈ 16 ms total window
+const CHANNEL_GAIN_UPDATE_CHUNKS: u32 = 64; // recompute scale every full window
+const CHANNEL_GAIN_TARGET: f32 = 0.01; // post-scale RMS target (per channel)
+const CHANNEL_GAIN_INIT: f32 = 1.0; // pass-through until we have data
+                                    // Clamp range for the per-channel adaptive gain. The block is enabled
+                                    // only in decim>1 (halfband+) modes, where some bins receive WiFi-loud
+                                    // energy and others are filter-rejected; attenuate-only equalization
+                                    // pulls the loud bins down to the cross-channel median so the AGC sees
+                                    // a uniform operating point. Amplification (max>1) was tried for
+                                    // decim=1 mode but was unstable across RF environments, so the gain
+                                    // block is disabled there entirely.
+const CHANNEL_GAIN_MIN: f32 = 0.1; // attenuate by up to 20 dB
+const CHANNEL_GAIN_MAX_DECIM: f32 = 1.0; // never amplify
 
 impl ChannelGain {
     fn new(max_scale: f32) -> Self {
@@ -878,7 +1844,9 @@ impl ChannelGain {
         }
     }
 
-    fn last_p25(&self) -> f32 { self.last_p25 }
+    fn last_p25(&self) -> f32 {
+        self.last_p25
+    }
 
     /// Set the cross-channel reference. Worker calls this every ~tens-of-ms
     /// with the median p25 across its assigned channels. The new scale is
@@ -890,8 +1858,7 @@ impl ChannelGain {
 
     fn recompute_scale(&mut self) {
         if self.last_p25 > 1e-9 {
-            self.scale = (self.target_p25 / self.last_p25)
-                .clamp(CHANNEL_GAIN_MIN, self.max_scale);
+            self.scale = (self.target_p25 / self.last_p25).clamp(CHANNEL_GAIN_MIN, self.max_scale);
         }
     }
 
@@ -920,7 +1887,8 @@ impl ChannelGain {
                 // are <75% duty cycle (always true for BLE; usually true for
                 // WiFi channels too because WiFi has gaps between frames).
                 let mut sorted = self.history;
-                sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                sorted
+                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 self.last_p25 = sorted[CHANNEL_GAIN_HISTORY / 4];
                 self.recompute_scale();
                 self.chunks_since_update = 0;
@@ -942,43 +1910,42 @@ impl ChannelGain {
 #[allow(clippy::too_many_arguments)]
 fn spawn_parallel_pipeline(
     num_channels: usize,
+    center_freq_mhz: u32,
+    raw_sample_rate: u32,
+    edr_wideband_enabled: bool,
     fft_scale: f32,
     channel_gain_max: f32,
     channel_gain_enabled: bool,
-    live_ch: [i32; 40],
-    first_live: usize,
-    last_live: usize,
     mut burst_catchers: Vec<Option<BurstCatcher>>,
     fsk: FskDemod,
     aa_correlator: AaCorrelator,
     aa_correlator_2m: AaCorrelator,
     syndrome_map: SyndromeMap,
     conn_table: ConnectionTable,
+    classic_uaps: Vec<(u32, u8)>,
     pcap_writer: Option<PcapWriter<BufWriter<File>>>,
+    burst_writer: Option<FileBurstWriter>,
     check_crc: bool,
     print_stats: bool,
     overflow_count: Arc<std::sync::atomic::AtomicU64>,
     squelch_pending: Arc<AtomicI32>,
-    #[cfg(feature = "zmq")]
-    zmq_config: Option<(String, Option<String>, Option<String>)>,
-    #[cfg(feature = "zmq")]
-    hb_state: Option<Arc<Mutex<bd_output::control::HeartbeatState>>>,
-    #[cfg(feature = "gps")]
-    gps_client: Option<bd_output::gps::GpsClient>,
+    #[cfg(feature = "zmq")] zmq_config: Option<(String, Option<String>, Option<String>)>,
+    #[cfg(feature = "zmq")] hb_state: Option<Arc<Mutex<bd_output::control::HeartbeatState>>>,
+    #[cfg(feature = "gps")] gps_client: Option<bd_output::gps::GpsClient>,
 ) -> (
     Vec<channel::Sender<BatchMsg>>,
     Vec<std::thread::JoinHandle<()>>,
     std::thread::JoinHandle<()>,
 ) {
-    use bd_dsp::burst::Burst;
-
     // Collect active channels
-    let active: Vec<ChannelAssignment> = (first_live..=last_live)
-        .filter_map(|ch_idx| {
-            if live_ch[ch_idx] >= 0 {
+    let active: Vec<ChannelAssignment> = burst_catchers
+        .iter()
+        .enumerate()
+        .filter_map(|(fft_bin, catcher)| {
+            if catcher.is_some() {
                 Some(ChannelAssignment {
-                    ch_idx,
-                    fft_bin: live_ch[ch_idx] as usize,
+                    ch_idx: fft_bin,
+                    fft_bin,
                 })
             } else {
                 None
@@ -994,7 +1961,7 @@ fn spawn_parallel_pipeline(
     let n_workers = active.len().min(hw_threads.saturating_sub(2).max(4)).max(1);
 
     // Burst output channel: all workers send here, decode thread receives
-    let (burst_tx, burst_rx) = channel::bounded::<Burst>(512);
+    let (burst_tx, burst_rx) = channel::bounded::<BurstMsg>(512);
 
     let mut batch_txs = Vec::with_capacity(n_workers);
     let mut worker_handles = Vec::with_capacity(n_workers);
@@ -1024,12 +1991,16 @@ fn spawn_parallel_pipeline(
             .spawn(move || {
                 let mut current_squelch = i32::MIN;
                 let mut steps_since_resync: usize = 0;
+                let mut raw_cache = RawBatchCache::new(raw_sample_rate);
                 // Resync the per-channel gain target every ~64 ms at 1 Msps/ch.
                 // Long enough that p25 estimates have all updated at least
                 // once (each updates every ~16 ms), short enough to track a
                 // changing RF environment.
                 const RESYNC_STEPS: usize = 65536;
                 for msg in batch_rx.iter() {
+                    if edr_wideband_enabled {
+                        raw_cache.push(&msg);
+                    }
                     // Check for squelch update
                     let sq = sq_pending.load(Ordering::Relaxed);
                     if sq != current_squelch && sq != i32::MIN {
@@ -1055,13 +2026,28 @@ fn spawn_parallel_pipeline(
                             } else {
                                 raw
                             };
-                            if let Some(burst) = catcher.execute(sample, &msg.ts) {
-                                let _ = burst_tx.send(burst);
+                            if let Some(burst) = catcher.execute_at(sample, &msg.ts, t) {
+                                // Grab the raw wideband window for EDR-extended
+                                // bursts and any multi-slot-length burst: a
+                                // clipped EDR packet often detects as a Basic Rate
+                                // multi-slot type, and only the wideband path can
+                                // recover its DPSK payload. Short bursts skip it.
+                                let wideband = if edr_wideband_enabled
+                                    && (burst.edr_extended || burst.samples.len() >= 1000)
+                                {
+                                    raw_cache.extract(&burst.timestamp, 3_100)
+                                } else {
+                                    None
+                                };
+                                let _ = burst_tx.send(BurstMsg { burst, wideband });
                             }
                         }
                         // Emit scan bursts for advertising channels
                         if let Some(scan_burst) = catcher.take_scan_burst() {
-                            let _ = burst_tx.send(scan_burst);
+                            let _ = burst_tx.send(BurstMsg {
+                                burst: scan_burst,
+                                wideband: None,
+                            });
                         }
                     }
 
@@ -1074,13 +2060,15 @@ fn spawn_parallel_pipeline(
                     steps_since_resync += msg.batch_steps;
                     if steps_since_resync >= RESYNC_STEPS {
                         steps_since_resync = 0;
-                        let mut p25s: Vec<f32> = gains.iter()
+                        let mut p25s: Vec<f32> = gains
+                            .iter()
                             .map(|g| g.last_p25())
                             .filter(|&p| p > 1e-9)
                             .collect();
                         if p25s.len() >= 2 {
-                            p25s.sort_unstable_by(|a, b| a.partial_cmp(b)
-                                .unwrap_or(std::cmp::Ordering::Equal));
+                            p25s.sort_unstable_by(|a, b| {
+                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                            });
                             let median = p25s[p25s.len() / 2];
                             let target = median.max(CHANNEL_GAIN_TARGET);
                             for g in gains.iter_mut() {
@@ -1098,7 +2086,11 @@ fn spawn_parallel_pipeline(
     // Drop the original burst_tx so decode thread terminates when all workers finish
     drop(burst_tx);
 
-    eprintln!("pipeline: {} burst workers, {} channels", n_workers, active.len());
+    eprintln!(
+        "pipeline: {} burst workers, {} channels",
+        n_workers,
+        active.len()
+    );
 
     // Decode thread: FSK demod + BLE/BT protocol decode + output
     let decode_handle = {
@@ -1108,8 +2100,11 @@ fn spawn_parallel_pipeline(
         let aa_correlator_2m = aa_correlator_2m;
         let syndrome_map = syndrome_map;
         let mut conn_table = conn_table;
+        let mut bt_tracker = btbb::PiconetTracker::new();
+        seed_classic_uaps(&mut bt_tracker, &classic_uaps);
         let mut smp_parser = bd_protocol::smp::SmpParser::new();
         let mut pcap_writer = pcap_writer;
+        let mut burst_writer = burst_writer;
 
         std::thread::Builder::new()
             .name("decode".to_string())
@@ -1138,19 +2133,41 @@ fn spawn_parallel_pipeline(
                 #[cfg(feature = "gps")]
                 let gps_client = gps_client;
 
-                for burst in burst_rx.iter() {
+                // When the decode thread falls behind (bursts queueing faster
+                // than they decode), shed the expensive EDR wideband enrichment
+                // so Basic Rate and BLE decode keeps up and the SDR does not
+                // overflow. Under normal, sparse traffic the queue sits near
+                // empty and nothing is shed; only an EDR flood trips it.
+                const WIDEBAND_SHED_DEPTH: usize = 128;
+                let mut wideband_shed: u64 = 0;
+                while let Ok(burst_msg) = burst_rx.recv() {
+                    let burst = burst_msg.burst;
+                    record_burst(&mut burst_writer, &burst);
                     #[cfg(feature = "gps")]
                     let gps_fix = gps_client.as_ref().map(|c| c.get_fix());
                     #[cfg(not(feature = "gps"))]
                     let gps_fix: Option<bd_output::pcap::GpsFix> = None;
                     let gps_ref = gps_fix.as_ref().filter(|f| f.valid);
 
+                    let wideband = if burst_msg.wideband.is_some()
+                        && burst_rx.len() > WIDEBAND_SHED_DEPTH
+                    {
+                        wideband_shed += 1;
+                        None
+                    } else {
+                        burst_msg.wideband.as_deref()
+                    };
+
                     process_burst(
                         &burst,
+                        wideband,
+                        center_freq_mhz,
+                        raw_sample_rate,
                         &mut fsk,
                         &aa_correlator,
                         &aa_correlator_2m,
                         &syndrome_map,
+                        &mut bt_tracker,
                         &mut conn_table,
                         &mut smp_parser,
                         &mut pcap_writer,
@@ -1187,7 +2204,7 @@ fn spawn_parallel_pipeline(
                             String::new()
                         };
                         eprint!(
-                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{}\n",
+                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{} shed:{}\n",
                             elapsed,
                             stats.total_ble,
                             phy_str,
@@ -1198,6 +2215,10 @@ fn spawn_parallel_pipeline(
                             stats.total_crc,
                             conns,
                             overflows,
+                            stats.edr_attempts,
+                            stats.edr_syncs,
+                            stats.edr_crc_matches,
+                            stats.edr_best_sync_score.unwrap_or(f32::NAN),
                             stats.coded_attempts,
                             stats.coded_fsk_ok,
                             stats.fsk_reject_long,
@@ -1207,6 +2228,7 @@ fn spawn_parallel_pipeline(
                             stats.burst_1k_5k,
                             stats.burst_5k_50k,
                             stats.burst_50k_plus,
+                            wideband_shed,
                         );
 
                         last_stats = Instant::now();
@@ -1222,7 +2244,7 @@ fn spawn_parallel_pipeline(
                         String::new()
                     };
                     eprintln!(
-                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {}",
+                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} EDR: try={} sync={} crc={} best={:.3} shed={}",
                         elapsed,
                         stats.total_ble,
                         phy_str,
@@ -1232,6 +2254,11 @@ fn spawn_parallel_pipeline(
                         stats.valid_crc,
                         stats.total_crc,
                         overflows,
+                        stats.edr_attempts,
+                        stats.edr_syncs,
+                        stats.edr_crc_matches,
+                        stats.edr_best_sync_score.unwrap_or(f32::NAN),
+                        wideband_shed,
                     );
                 }
             })
@@ -1250,43 +2277,93 @@ fn format_smp_event(event: &bd_protocol::smp::SmpEvent) -> String {
         SmpEvent::PairingStarted { aa } => {
             format!(r#"{{"event":"pairing_started","aa":"0x{:08X}"}}"#, aa)
         }
-        SmpEvent::FeaturesExchanged { aa, method, security, initiator, responder } => {
+        SmpEvent::FeaturesExchanged {
+            aa,
+            method,
+            security,
+            initiator,
+            responder,
+        } => {
             format!(
                 r#"{{"event":"features_exchanged","aa":"0x{:08X}","method":"{:?}","security":"{:?}","init_io":"{}","resp_io":"{}"}}"#,
-                aa, method, security,
-                initiator.io_capability_str(), responder.io_capability_str()
+                aa,
+                method,
+                security,
+                initiator.io_capability_str(),
+                responder.io_capability_str()
             )
         }
         SmpEvent::WeakPairing { aa, reason } => {
-            format!(r#"{{"event":"weak_pairing","aa":"0x{:08X}","reason":"{}"}}"#, aa, reason.replace('"', "'"))
+            format!(
+                r#"{{"event":"weak_pairing","aa":"0x{:08X}","reason":"{}"}}"#,
+                aa,
+                reason.replace('"', "'")
+            )
         }
         SmpEvent::LtkDistributed { aa, ltk } => {
             let hex: String = ltk.iter().map(|b| format!("{:02x}", b)).collect();
-            format!(r#"{{"event":"ltk_distributed","aa":"0x{:08X}","ltk":"{}"}}"#, aa, hex)
+            format!(
+                r#"{{"event":"ltk_distributed","aa":"0x{:08X}","ltk":"{}"}}"#,
+                aa, hex
+            )
         }
         SmpEvent::IrkDistributed { aa, irk } => {
             let hex: String = irk.iter().map(|b| format!("{:02x}", b)).collect();
-            format!(r#"{{"event":"irk_distributed","aa":"0x{:08X}","irk":"{}"}}"#, aa, hex)
+            format!(
+                r#"{{"event":"irk_distributed","aa":"0x{:08X}","irk":"{}"}}"#,
+                aa, hex
+            )
         }
         SmpEvent::CsrkDistributed { aa, csrk } => {
             let hex: String = csrk.iter().map(|b| format!("{:02x}", b)).collect();
-            format!(r#"{{"event":"csrk_distributed","aa":"0x{:08X}","csrk":"{}"}}"#, aa, hex)
+            format!(
+                r#"{{"event":"csrk_distributed","aa":"0x{:08X}","csrk":"{}"}}"#,
+                aa, hex
+            )
         }
-        SmpEvent::IdentityAddress { aa, addr_type, addr } => {
-            let mac: String = addr.iter().rev().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":");
-            format!(r#"{{"event":"identity_address","aa":"0x{:08X}","addr_type":{},"addr":"{}"}}"#, aa, addr_type, mac)
+        SmpEvent::IdentityAddress {
+            aa,
+            addr_type,
+            addr,
+        } => {
+            let mac: String = addr
+                .iter()
+                .rev()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(":");
+            format!(
+                r#"{{"event":"identity_address","aa":"0x{:08X}","addr_type":{},"addr":"{}"}}"#,
+                aa, addr_type, mac
+            )
         }
         SmpEvent::PairingFailed { aa, reason } => {
-            format!(r#"{{"event":"pairing_failed","aa":"0x{:08X}","reason":{}}}"#, aa, reason)
+            format!(
+                r#"{{"event":"pairing_failed","aa":"0x{:08X}","reason":{}}}"#,
+                aa, reason
+            )
         }
-        SmpEvent::PairingConfirm { aa, from_initiator, .. } => {
-            format!(r#"{{"event":"pairing_confirm","aa":"0x{:08X}","from_initiator":{}}}"#, aa, from_initiator)
+        SmpEvent::PairingConfirm {
+            aa, from_initiator, ..
+        } => {
+            format!(
+                r#"{{"event":"pairing_confirm","aa":"0x{:08X}","from_initiator":{}}}"#,
+                aa, from_initiator
+            )
         }
-        SmpEvent::PairingRandom { aa, from_initiator, .. } => {
-            format!(r#"{{"event":"pairing_random","aa":"0x{:08X}","from_initiator":{}}}"#, aa, from_initiator)
+        SmpEvent::PairingRandom {
+            aa, from_initiator, ..
+        } => {
+            format!(
+                r#"{{"event":"pairing_random","aa":"0x{:08X}","from_initiator":{}}}"#,
+                aa, from_initiator
+            )
         }
         SmpEvent::PublicKey { aa, from_initiator } => {
-            format!(r#"{{"event":"public_key","aa":"0x{:08X}","from_initiator":{}}}"#, aa, from_initiator)
+            format!(
+                r#"{{"event":"public_key","aa":"0x{:08X}","from_initiator":{}}}"#,
+                aa, from_initiator
+            )
         }
     }
 }
@@ -1294,16 +2371,43 @@ fn format_smp_event(event: &bd_protocol::smp::SmpEvent) -> String {
 fn broadcast_batch(
     txs: &[channel::Sender<BatchMsg>],
     data: Vec<f32>,
+    raw_iq: Option<Vec<i16>>,
     batch_steps: usize,
     ts: &Timespec,
 ) {
     let arc = Arc::new(data);
+    let raw_iq = raw_iq.map(Arc::new);
     for tx in txs {
         let _ = tx.send(BatchMsg {
             data: arc.clone(),
+            raw_iq: raw_iq.clone(),
             batch_steps,
             ts: ts.clone(),
         });
+    }
+}
+
+fn channel_samples_after(start: &Timespec, samples: usize) -> Timespec {
+    const CHANNEL_SAMPLE_PERIOD_NS: u64 = 500;
+    let offset_ns = samples as u64 * CHANNEL_SAMPLE_PERIOD_NS;
+    let total_ns = start.tv_nsec + offset_ns;
+    Timespec {
+        tv_sec: start.tv_sec + total_ns / 1_000_000_000,
+        tv_nsec: total_ns % 1_000_000_000,
+    }
+}
+
+fn initial_batch_timestamp(steps: usize) -> Timespec {
+    const CHANNEL_SAMPLE_PERIOD_NS: u64 = 500;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let now_ns = now.as_secs() as u128 * 1_000_000_000 + now.subsec_nanos() as u128;
+    let duration_ns = steps.saturating_sub(1) as u128 * CHANNEL_SAMPLE_PERIOD_NS as u128;
+    let start_ns = now_ns.saturating_sub(duration_ns);
+    Timespec {
+        tv_sec: (start_ns / 1_000_000_000) as u64,
+        tv_nsec: (start_ns % 1_000_000_000) as u64,
     }
 }
 
@@ -1605,6 +2709,8 @@ pub struct LiveConfig<'a> {
     pub sidekiq_gpsdo: bool,
     pub antenna: Option<&'a str>,
     pub pcap_path: Option<&'a Path>,
+    pub burst_path: Option<&'a Path>,
+    pub burst_limit_bytes: u64,
     pub check_crc: bool,
     pub print_stats: bool,
     pub use_gpu: bool,
@@ -1615,6 +2721,7 @@ pub struct LiveConfig<'a> {
     pub hci_enabled: bool,
     pub active_scan: bool,
     pub coded_scan: bool,
+    pub classic_uaps: &'a [(u32, u8)],
     /// Aaronia-only: decimation factor (1=Full, 2=halfband DC notch, ...).
     /// Ignored by other backends.
     pub aaronia_decim: u32,
@@ -1624,10 +2731,28 @@ pub struct LiveConfig<'a> {
 /// Run live SDR capture pipeline.
 pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     let LiveConfig {
-        iface, center_freq_mhz, num_channels, gain, squelch_db,
-        hackrf_lna, hackrf_vga, antenna, pcap_path, check_crc,
-        print_stats, use_gpu, zmq_endpoint, zmq_curve_keyfile,
-        sensor_id, gpsd_enabled, hci_enabled, active_scan, coded_scan,
+        iface,
+        center_freq_mhz,
+        num_channels,
+        gain,
+        squelch_db,
+        hackrf_lna,
+        hackrf_vga,
+        antenna,
+        pcap_path,
+        burst_path,
+        burst_limit_bytes,
+        check_crc,
+        print_stats,
+        use_gpu,
+        zmq_endpoint,
+        zmq_curve_keyfile,
+        sensor_id,
+        gpsd_enabled,
+        hci_enabled,
+        active_scan,
+        coded_scan,
+        classic_uaps,
         aaronia_decim,
         sidekiq_agc,
         sidekiq_dc_corr,
@@ -1636,6 +2761,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     } = cfg;
     let sample_rate = num_channels as u32 * 1_000_000;
     let center_freq_hz = center_freq_mhz as u64 * 1_000_000;
+    let edr_wideband_enabled = std::env::var_os("BD_EDR_WIDEBAND").is_some();
 
     // Per-channel adaptive gain is enabled for halfband (decim>1) mode
     // where it consistently improves CRC by ~7-8 points (attenuate-only
@@ -1649,23 +2775,33 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         1.0 // unused when disabled, but keep type happy
     };
 
-    let (_channel_freqs, live_ch, first_live, last_live) =
+    let (channel_freqs, live_ch, first_live, last_live) =
         build_channel_map(center_freq_mhz, num_channels)?;
 
     let active_channels = (first_live..=last_live)
         .filter(|&ch| live_ch[ch] >= 0)
         .count();
+    let active_bt_channels = channel_freqs
+        .iter()
+        .filter(|&&freq| (2402..=2480).contains(&freq))
+        .count();
 
     let sdr_type = detect_sdr_type(iface);
 
     eprintln!(
-        "channels: {} FFT bins, {} BLE channels (ch {}-{}, {}-{} MHz), SDR: {}",
-        num_channels, active_channels, first_live, last_live,
-        2402 + first_live * 2, 2402 + last_live * 2, sdr_type,
+        "channels: {} FFT bins, {} Classic + {} BLE channels (ch {}-{}, {}-{} MHz), SDR: {}",
+        num_channels,
+        active_bt_channels,
+        active_channels,
+        first_live,
+        last_live,
+        2402 + first_live * 2,
+        2402 + last_live * 2,
+        sdr_type,
     );
 
     // Initialize protocol subsystems
-    let aa_correlator = AaCorrelator::new();       // LE 1M: SPS=2
+    let aa_correlator = AaCorrelator::new(); // LE 1M: SPS=2
     let aa_correlator_2m = AaCorrelator::with_sps(1); // LE 2M: SPS=1
     let syndrome_map = SyndromeMap::new(1);
     let conn_table = ConnectionTable::new();
@@ -1677,11 +2813,11 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     // Per-channel burst catchers
     // With --coded-scan, advertising channels get scan mode for continuous
     // coded PHY capture regardless of squelch.
-    let burst_catchers: Vec<Option<BurstCatcher>> = (0..40)
-        .map(|ch| {
-            if ch >= first_live && ch <= last_live && live_ch[ch] >= 0 {
-                let freq = 2402 + ch as u32 * 2;
-                let is_adv = ch == 0 || ch == 12 || ch == 39;
+    let burst_catchers: Vec<Option<BurstCatcher>> = channel_freqs
+        .iter()
+        .map(|&freq| {
+            if (2402..=2480).contains(&freq) {
+                let is_adv = matches!(freq, 2402 | 2426 | 2480);
                 if coded_scan && is_adv {
                     Some(BurstCatcher::new_scan(freq, squelch_db))
                 } else {
@@ -1707,7 +2843,9 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     if (resample_ratio - 1.0).abs() > 0.001 {
         eprintln!(
             "FSK: resampling {:.4} → {:.4} Msps/ch (ratio={:.6})",
-            actual_channel_rate / 1e6, target_channel_rate / 1e6, resample_ratio,
+            actual_channel_rate / 1e6,
+            target_channel_rate / 1e6,
+            resample_ratio,
         );
     }
 
@@ -1717,11 +2855,11 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         let file = File::create(path)
             .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
         let writer = BufWriter::new(file);
-        Some(PcapWriter::new(writer)
-            .map_err(|e| format!("failed to write PCAP header: {}", e))?)
+        Some(PcapWriter::new(writer).map_err(|e| format!("failed to write PCAP header: {}", e))?)
     } else {
         None
     };
+    let burst_writer = open_burst_writer(burst_path, burst_limit_bytes)?;
 
     let fft_scale = 1.0 / num_channels as f32;
 
@@ -1797,14 +2935,13 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
 
     // ZMQ config to pass to processing thread (created there since zmq::Socket is !Send)
     #[cfg(feature = "zmq")]
-    let zmq_config: Option<(String, Option<String>, Option<String>)> =
-        zmq_endpoint.map(|ep| {
-            (
-                ep.to_string(),
-                sensor_id.map(|s| s.to_string()),
-                zmq_curve_keyfile.map(|s| s.to_string()),
-            )
-        });
+    let zmq_config: Option<(String, Option<String>, Option<String>)> = zmq_endpoint.map(|ep| {
+        (
+            ep.to_string(),
+            sensor_id.map(|s| s.to_string()),
+            zmq_curve_keyfile.map(|s| s.to_string()),
+        )
+    });
     #[cfg(not(feature = "zmq"))]
     {
         let _ = (zmq_endpoint, zmq_curve_keyfile, sensor_id);
@@ -1823,11 +2960,12 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
             let ctrl_ep = bd_output::zmq_pub::derive_control_endpoint(ep);
             let sid = sensor_id.unwrap_or("blue-dragon").to_string();
 
-            let hb_state = Arc::new(Mutex::new(
-                bd_output::control::HeartbeatState::new(
-                    &sid, &sdr_type.to_string(), center_freq_mhz, num_channels as u32,
-                ),
-            ));
+            let hb_state = Arc::new(Mutex::new(bd_output::control::HeartbeatState::new(
+                &sid,
+                &sdr_type.to_string(),
+                center_freq_mhz,
+                num_channels as u32,
+            )));
             {
                 let mut s = hb_state.lock().unwrap_or_else(|e| e.into_inner());
                 s.gain = gain;
@@ -2089,12 +3227,27 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     #[cfg(feature = "gpu")]
     if use_gpu {
         return run_live_gpu_loop(
-            sdr, &running, num_channels, semi_len, &prototype, fft_scale,
-            channel_gain_max, channel_gain_enabled,
-            live_ch, first_live, last_live, burst_catchers,
-            fsk, aa_correlator, aa_correlator_2m, syndrome_map, conn_table,
-            pcap_writer, check_crc, print_stats,
-            gain_pending.clone(), squelch_pending.clone(),
+            sdr,
+            &running,
+            num_channels,
+            semi_len,
+            &prototype,
+            fft_scale,
+            channel_gain_max,
+            channel_gain_enabled,
+            burst_catchers,
+            fsk,
+            aa_correlator,
+            aa_correlator_2m,
+            syndrome_map,
+            conn_table,
+            classic_uaps.to_vec(),
+            pcap_writer,
+            burst_writer,
+            check_crc,
+            print_stats,
+            gain_pending.clone(),
+            squelch_pending.clone(),
             #[cfg(feature = "zmq")]
             zmq_config,
             #[cfg(feature = "zmq")]
@@ -2121,19 +3274,21 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     // Spawn parallel burst workers + decode thread
     let (batch_txs, worker_handles, decode_handle) = spawn_parallel_pipeline(
         num_channels,
+        center_freq_mhz,
+        sample_rate,
+        edr_wideband_enabled,
         1.0, // CPU path pre-scales by fft_scale, workers use 1.0
         channel_gain_max,
         channel_gain_enabled,
-        live_ch,
-        first_live,
-        last_live,
         burst_catchers,
         fsk,
         aa_correlator,
         aa_correlator_2m,
         syndrome_map,
         conn_table,
+        classic_uaps.to_vec(),
         pcap_writer,
+        burst_writer,
         check_crc,
         print_stats,
         overflow_count.clone(),
@@ -2233,7 +3388,10 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     const CPU_BATCH_STEPS: usize = 4096;
     let batch_floats = CPU_BATCH_STEPS * num_channels * 2;
     let mut batch = Vec::with_capacity(batch_floats);
+    let mut raw_batch = edr_wideband_enabled
+        .then(|| Vec::with_capacity(CPU_BATCH_STEPS * num_channels));
     let mut batch_steps: usize = 0;
+    let mut next_batch_ts: Option<Timespec> = None;
 
     for i16_buf in sdr_rx.iter() {
         let n = i16_buf.len();
@@ -2252,21 +3410,21 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                 float_tmp[j * 2 + 1] = val.im * fft_scale;
             }
             batch.extend_from_slice(&float_tmp);
+            if let Some(raw) = raw_batch.as_mut() {
+                raw.extend_from_slice(&i16_buf[offset..offset + step]);
+            }
             batch_steps += 1;
 
             if batch.len() >= batch_floats {
-                let ts = {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default();
-                    Timespec {
-                        tv_sec: now.as_secs(),
-                        tv_nsec: now.subsec_nanos() as u64,
-                    }
-                };
+                let ts = next_batch_ts
+                    .unwrap_or_else(|| initial_batch_timestamp(batch_steps));
+                next_batch_ts = Some(channel_samples_after(&ts, batch_steps));
                 broadcast_batch(
                     &batch_txs,
                     std::mem::replace(&mut batch, Vec::with_capacity(batch_floats)),
+                    raw_batch
+                        .as_mut()
+                        .map(|raw| std::mem::replace(raw, Vec::with_capacity(CPU_BATCH_STEPS * num_channels))),
                     batch_steps,
                     &ts,
                 );
@@ -2276,16 +3434,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     }
 
     if !batch.is_empty() {
-        let ts = {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            Timespec {
-                tv_sec: now.as_secs(),
-                tv_nsec: now.subsec_nanos() as u64,
-            }
-        };
-        broadcast_batch(&batch_txs, batch, batch_steps, &ts);
+        let ts = next_batch_ts.unwrap_or_else(|| initial_batch_timestamp(batch_steps));
+        broadcast_batch(&batch_txs, batch, raw_batch, batch_steps, &ts);
     }
 
     drop(batch_txs);
@@ -2310,26 +3460,24 @@ fn run_live_gpu_loop(
     fft_scale: f32,
     channel_gain_max: f32,
     channel_gain_enabled: bool,
-    live_ch: [i32; 40],
-    first_live: usize,
-    last_live: usize,
     burst_catchers: Vec<Option<BurstCatcher>>,
     fsk: FskDemod,
     aa_correlator: AaCorrelator,
     aa_correlator_2m: AaCorrelator,
     syndrome_map: SyndromeMap,
     conn_table: ConnectionTable,
+    classic_uaps: Vec<(u32, u8)>,
     pcap_writer: Option<PcapWriter<BufWriter<File>>>,
+    burst_writer: Option<FileBurstWriter>,
     check_crc: bool,
     print_stats: bool,
     gain_pending: Arc<AtomicI32>,
     squelch_pending: Arc<AtomicI32>,
-    #[cfg(feature = "zmq")]
-    zmq_config: Option<(String, Option<String>, Option<String>)>,
-    #[cfg(feature = "zmq")]
-    hb_state_for_decode: Option<Arc<Mutex<bd_output::control::HeartbeatState>>>,
-    #[cfg(feature = "gps")]
-    gps_client: Option<bd_output::gps::GpsClient>,
+    #[cfg(feature = "zmq")] zmq_config: Option<(String, Option<String>, Option<String>)>,
+    #[cfg(feature = "zmq")] hb_state_for_decode: Option<
+        Arc<Mutex<bd_output::control::HeartbeatState>>,
+    >,
+    #[cfg(feature = "gps")] gps_client: Option<bd_output::gps::GpsClient>,
 ) -> Result<(), String> {
     use std::sync::atomic::AtomicU64;
 
@@ -2338,33 +3486,37 @@ fn run_live_gpu_loop(
     let sdr = sdr;
     let max_samps = sdr.max_samps();
 
-    let gpu = bd_gpu::GpuChannelizer::new(
-        num_channels, semi_len, prototype, GPU_BATCH_SIZE,
-    )?;
+    let mut gpu = bd_gpu::GpuChannelizer::new(num_channels, semi_len, prototype, GPU_BATCH_SIZE)?;
 
     let buffer_len = gpu.buffer_len();
-    eprintln!("GPU: batch={} buffer={}KB result={}KB max_recv={}",
-        GPU_BATCH_SIZE, buffer_len / 1024,
-        (GPU_BATCH_SIZE * num_channels * 8) / 1024, max_samps);
+    eprintln!(
+        "GPU: batch={} buffer={}KB result={}KB max_recv={}",
+        GPU_BATCH_SIZE,
+        buffer_len / 1024,
+        (GPU_BATCH_SIZE * num_channels * 8) / 1024,
+        max_samps
+    );
 
     let overflow_count = Arc::new(AtomicU64::new(0));
 
     // Spawn parallel burst workers + decode thread
     let (batch_txs, worker_handles, decode_handle) = spawn_parallel_pipeline(
         num_channels,
+        0,
+        num_channels as u32 * 1_000_000,
+        false,
         fft_scale, // GPU output is raw, workers apply fft_scale
         channel_gain_max,
         channel_gain_enabled,
-        live_ch,
-        first_live,
-        last_live,
         burst_catchers,
         fsk,
         aa_correlator,
         aa_correlator_2m,
         syndrome_map,
         conn_table,
+        classic_uaps,
         pcap_writer,
+        burst_writer,
         check_crc,
         print_stats,
         overflow_count.clone(),
@@ -2422,8 +3574,14 @@ fn run_live_gpu_loop(
         })
         .expect("failed to spawn sdr-recv-gpu thread");
 
+    // The EDR wideband path needs the raw pre-channelization IQ. The GPU only
+    // consumes it for the PFB/FFT, but the same i16 buffer is right here, so tee
+    // a copy to the burst workers (exactly as the CPU path does) when the
+    // feature is on. The GPU compute is untouched.
+    let edr_wideband_enabled = std::env::var_os("BD_EDR_WIDEBAND").is_some();
     let mut pos: usize = 0;
     let mut raw_buf = gpu.raw_buffer();
+    let mut next_batch_ts: Option<Timespec> = None;
 
     for i16_buf in sdr_rx.iter() {
         // Copy i16 data into GPU raw buffer, handling partial fills
@@ -2436,17 +3594,13 @@ fn run_live_gpu_loop(
             src_pos += copy_len;
 
             if pos >= buffer_len {
+                // Capture the raw batch before submit() reborrows the GPU.
+                let raw = edr_wideband_enabled.then(|| raw_buf[..buffer_len].to_vec());
                 if let Some(result) = gpu.submit() {
-                    let ts = {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default();
-                        Timespec {
-                            tv_sec: now.as_secs(),
-                            tv_nsec: now.subsec_nanos() as u64,
-                        }
-                    };
-                    broadcast_batch(&batch_txs, result.to_vec(), GPU_BATCH_SIZE, &ts);
+                    let ts = next_batch_ts
+                        .unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
+                    next_batch_ts = Some(channel_samples_after(&ts, GPU_BATCH_SIZE));
+                    broadcast_batch(&batch_txs, result.to_vec(), raw, GPU_BATCH_SIZE, &ts);
                 }
                 pos = 0;
                 raw_buf = gpu.raw_buffer();
@@ -2458,15 +3612,18 @@ fn run_live_gpu_loop(
         for i in pos..buffer_len {
             raw_buf[i] = 0;
         }
+        let raw = edr_wideband_enabled.then(|| raw_buf[..buffer_len].to_vec());
         if let Some(result) = gpu.submit() {
-            let ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-            broadcast_batch(&batch_txs, result.to_vec(), GPU_BATCH_SIZE, &ts);
+            let ts = next_batch_ts
+                .unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
+            next_batch_ts = Some(channel_samples_after(&ts, GPU_BATCH_SIZE));
+            broadcast_batch(&batch_txs, result.to_vec(), raw, GPU_BATCH_SIZE, &ts);
         }
     }
 
     if let Some(result) = gpu.flush() {
-        let ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        broadcast_batch(&batch_txs, result.to_vec(), GPU_BATCH_SIZE, &ts);
+        let ts = next_batch_ts.unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
+        broadcast_batch(&batch_txs, result.to_vec(), None, GPU_BATCH_SIZE, &ts);
     }
 
     drop(batch_txs);
@@ -2478,6 +3635,3 @@ fn run_live_gpu_loop(
 
     Ok(())
 }
-
-
-

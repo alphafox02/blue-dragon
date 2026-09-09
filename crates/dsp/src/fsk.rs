@@ -15,6 +15,7 @@ pub struct FskResult {
     pub silence: usize,
     pub cfo: f32,
     pub deviation: f32,
+    pub resample_ratio: f64,
 }
 
 /// FSK demodulator: replaces liquid-dsp's freqdem
@@ -100,14 +101,15 @@ impl FskDemod {
             }
         }
 
-        if self.pos_points.len() < MEDIAN_SYMBOLS / 4
-            || self.neg_points.len() < MEDIAN_SYMBOLS / 4
+        if self.pos_points.len() < MEDIAN_SYMBOLS / 4 || self.neg_points.len() < MEDIAN_SYMBOLS / 4
         {
             return None;
         }
 
-        self.pos_points.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        self.neg_points.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.pos_points
+            .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.neg_points
+            .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let midpoint = (self.pos_points[self.pos_points.len() * 3 / 4]
             + self.neg_points[self.neg_points.len() / 4])
@@ -200,6 +202,7 @@ impl FskDemod {
             silence: silence_offset,
             cfo,
             deviation,
+            resample_ratio: self.resample_ratio,
         })
     }
 }
@@ -253,7 +256,12 @@ mod tests {
         // After the first sample, all values should be ~freq/PI (normalized by kf=0.5)
         let expected = freq * std::f32::consts::FRAC_1_PI;
         for &val in &result[1..] {
-            assert!((val - expected).abs() < 0.01, "got {}, expected {}", val, expected);
+            assert!(
+                (val - expected).abs() < 0.01,
+                "got {}, expected {}",
+                val,
+                expected
+            );
         }
     }
 
@@ -265,7 +273,11 @@ mod tests {
             demod[i] = 1.0;
         }
         let offset = FskDemod::silence_skip(&demod);
-        assert!(offset > 40 && offset < 55, "silence_skip returned {}", offset);
+        assert!(
+            offset > 40 && offset < 55,
+            "silence_skip returned {}",
+            offset
+        );
     }
 
     #[test]

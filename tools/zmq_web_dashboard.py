@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # Copyright 2025-2026 CEMAXECUTER LLC
-# Copyright 2025-2026 CEMAXECUTER LLC
 """
 Live web dashboard for blue-dragon ZMQ streams.
 
@@ -120,16 +119,18 @@ class DeviceDB:
         return dev_key not in self._known_keys
 
     def upsert(self, dev_key, protocol, now, name="", mfr="", identity=None,
-               mac_type="", rssi=-127, services=""):
+               mac_type="", rssi=-127, services="", observations=1,
+               first_seen=None):
+        first_seen = now if first_seen is None else first_seen
         with self.lock:
             self.conn.execute("""
                 INSERT INTO devices
                     (dev_key, protocol, first_seen, last_seen, name, mfr,
                      identity, mac_type, total_pkts, best_rssi, services)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dev_key) DO UPDATE SET
                     last_seen = MAX(excluded.last_seen, last_seen),
-                    total_pkts = total_pkts + 1,
+                    total_pkts = total_pkts + excluded.total_pkts,
                     best_rssi = MAX(excluded.best_rssi, best_rssi),
                     name = CASE WHEN excluded.name != '' THEN excluded.name
                                 ELSE name END,
@@ -138,12 +139,50 @@ class DeviceDB:
                     identity = COALESCE(excluded.identity, identity),
                     services = CASE WHEN length(excluded.services) > length(services)
                                     THEN excluded.services ELSE services END
-            """, (dev_key, protocol, now, now, name, mfr, identity, mac_type,
-                  rssi, services))
+            """, (dev_key, protocol, first_seen, now, name, mfr, identity,
+                  mac_type, observations, rssi, services))
             self._known_keys.add(dev_key)
             self._changes += 1
             if self._changes % 100 == 0:
                 self.conn.commit()
+
+    def migrate_key(self, old_key, new_key):
+        """Move a provisional identity to its verified key."""
+        if old_key == new_key:
+            return
+        with self.lock:
+            old = self.conn.execute(
+                "SELECT * FROM devices WHERE dev_key = ?", (old_key,)).fetchone()
+            if old is None:
+                return
+            new = self.conn.execute(
+                "SELECT * FROM devices WHERE dev_key = ?", (new_key,)).fetchone()
+            if new is None:
+                self.conn.execute(
+                    "UPDATE devices SET dev_key = ? WHERE dev_key = ?",
+                    (new_key, old_key))
+            else:
+                # Column order follows the devices schema above.
+                self.conn.execute("""
+                    UPDATE devices SET
+                        first_seen = MIN(first_seen, ?),
+                        last_seen = MAX(last_seen, ?),
+                        name = CASE WHEN name = '' THEN ? ELSE name END,
+                        mfr = CASE WHEN mfr = '' THEN ? ELSE mfr END,
+                        identity = COALESCE(identity, ?),
+                        mac_type = CASE WHEN mac_type = '' THEN ? ELSE mac_type END,
+                        total_pkts = total_pkts + ?,
+                        best_rssi = MAX(best_rssi, ?),
+                        services = CASE WHEN length(?) > length(services)
+                                        THEN ? ELSE services END
+                    WHERE dev_key = ?
+                """, (old[2], old[3], old[4], old[5], old[6], old[7],
+                      old[8], old[9], old[10], old[10], new_key))
+                self.conn.execute(
+                    "DELETE FROM devices WHERE dev_key = ?", (old_key,))
+            self._known_keys.discard(old_key)
+            self._known_keys.add(new_key)
+            self.conn.commit()
 
     def get_first_seen(self, dev_key):
         cur = self.conn.execute(
@@ -407,16 +446,37 @@ BREDR_BB_HDR = struct.Struct("<BbbBBBhIIIH")  # 22 bytes
 ZMQ_PKT_TYPE_BLE = 0x00
 ZMQ_PKT_TYPE_BT  = 0x01
 
-BREDR_SIGNAL_POWER_VALID = 0x0004
-BREDR_NOISE_POWER_VALID  = 0x0008
+BREDR_DEWHITENED         = 0x0001
+BREDR_SIGNAL_POWER_VALID = 0x0002
+BREDR_NOISE_POWER_VALID  = 0x0004
+BREDR_REFLAP_VALID       = 0x0010
+BREDR_PAYLOAD_PRESENT    = 0x0020
+BREDR_REFUAP_VALID       = 0x0080
+BREDR_HEC_CHECKED        = 0x0100
+BREDR_HEC_VALID          = 0x0200
+BREDR_CRC_CHECKED        = 0x0400
+BREDR_CRC_VALID          = 0x0800
+
+BREDR_PACKET_TYPES = {
+    0x0: "NULL", 0x1: "POLL", 0x2: "FHS", 0x3: "DM1",
+    0x4: "DH1", 0x5: "HV1/DH1e", 0x6: "HV2/2-DH1",
+    0x7: "HV3/3-DH1", 0x8: "DV/2-DH3", 0x9: "AUX1/3-DH3",
+    0xA: "DM3", 0xB: "DH3", 0xC: "2-DH5/EV4",
+    0xD: "3-DH5/EV5", 0xE: "DM5", 0xF: "DH5",
+}
+
+BT_PENDING_MIN_PACKETS = 3
+BT_PENDING_WINDOW_SECONDS = 5.0
 
 
 def parse_bt_packet(data):
-    """Parse a Classic BT PCAP record (pcaprec_hdr + BREDR_BB header + optional raw header)."""
+    """Parse a sensor-validated Classic BT ZMQ/PCAP record."""
     if len(data) < PCAP_REC_HDR.size + BREDR_BB_HDR.size:
         return None
 
     ts_sec, ts_usec, incl_len, orig_len = PCAP_REC_HDR.unpack_from(data, 0)
+    if incl_len < BREDR_BB_HDR.size or len(data) < PCAP_REC_HDR.size + incl_len:
+        return None
     offset = PCAP_REC_HDR.size
 
     (rf_channel, signal_power, noise_power, ac_offenses,
@@ -424,10 +484,26 @@ def parse_bt_packet(data):
      bt_header, flags) = BREDR_BB_HDR.unpack_from(data, offset)
     offset += BREDR_BB_HDR.size
 
-    # Raw FEC-encoded header bytes (7 bytes = 54 bits packed LSB-first)
-    raw_header = None
-    if len(data) >= offset + 7:
-        raw_header = data[offset:offset + 7]
+    lap &= 0xFFFFFF
+    ref_lap = ref_lap_uap & 0xFFFFFF
+    header_verified = bool(
+        flags & BREDR_HEC_CHECKED and flags & BREDR_HEC_VALID)
+    uap_verified = bool(
+        header_verified
+        and flags & BREDR_REFUAP_VALID
+        and flags & BREDR_REFLAP_VALID
+        and ref_lap == lap)
+    uap = (ref_lap_uap >> 24) & 0xFF if uap_verified else None
+
+    crc_checked = bool(flags & BREDR_CRC_CHECKED)
+    crc_valid = bool(flags & BREDR_CRC_VALID) if crc_checked else None
+    payload_end = PCAP_REC_HDR.size + incl_len
+    payload = data[offset:payload_end] if flags & BREDR_PAYLOAD_PRESENT else b""
+
+    packet_type = (bt_header >> 3) & 0x0F if header_verified else None
+    pdu_type = BREDR_PACKET_TYPES.get(packet_type, "BT")
+    payload_rate = ptt & 0x0F
+    phy = {0: "BR", 1: "EDR2", 2: "EDR3"}.get(payload_rate, "BR")
 
     mac = f"bt:{(lap >> 16) & 0xff:02x}:{(lap >> 8) & 0xff:02x}:{lap & 0xff:02x}"
 
@@ -438,135 +514,21 @@ def parse_bt_packet(data):
         "signal_power": signal_power,
         "noise_power": noise_power,
         "lap": lap,
+        "uap": uap,
+        "uap_verified": uap_verified,
         "ac_errors": ac_offenses,
         "mac": mac,
         "mac_type": "bt-lap",
-        "crc_checked": False,
-        "crc_valid": None,
+        "crc_checked": crc_checked,
+        "crc_valid": crc_valid,
         "is_adv": False,
-        "pdu_type": "BT",
+        "pdu_type": pdu_type,
+        "phy": phy,
         "fingerprint": {},
         "protocol": "BT",
-        "raw_header": raw_header,
-        "data_len": incl_len,
+        "payload": payload,
+        "data_len": len(payload),
     }
-
-
-class UAPEstimator:
-    """Estimate Classic BT UAP from accumulated packet headers.
-
-    Uses the same HEC-reversal approach as libbtbb: for each packet's
-    54-bit FEC-encoded header, try all 64 CLK1-6 whitening sequences,
-    reverse the HEC LFSR to find which UAP would produce the observed
-    HEC, and accumulate votes. The correct UAP consistently appears
-    while wrong CLK1-6 values produce random UAPs.
-    """
-
-    def __init__(self):
-        self.uap_votes = [0] * 256
-        self.packet_count = 0
-        self.converged_uap = None
-        self.confidence = 0.0
-
-    def add_header(self, raw_header):
-        """Process a 54-bit FEC-encoded header (7 bytes, LSB-first packed)."""
-        if raw_header is None or len(raw_header) < 7:
-            return
-
-        self.packet_count += 1
-
-        # Unpack 54 bits from 7 bytes
-        bits_54 = []
-        for byte_idx in range(7):
-            for bit_idx in range(8):
-                if byte_idx * 8 + bit_idx >= 54:
-                    break
-                bits_54.append((raw_header[byte_idx] >> bit_idx) & 1)
-
-        # Try all 64 CLK1-6 whitening sequences
-        # Whitening is applied AFTER FEC encoding, so we must de-whiten
-        # the 54 bits first, then FEC decode to 18 bits
-        for clk in range(64):
-            wh = self._whitening_bits(clk, 54)
-            dw54 = [bits_54[j] ^ wh[j] for j in range(54)]
-
-            # FEC decode: 1/3 majority voting -> 18 bits
-            bits_18 = []
-            for i in range(18):
-                b0 = dw54[i * 3]
-                b1 = dw54[i * 3 + 1]
-                b2 = dw54[i * 3 + 2]
-                bits_18.append(1 if (b0 + b1 + b2) >= 2 else 0)
-
-            # Pack 10-bit header payload and 8-bit HEC
-            header_10 = 0
-            for j in range(10):
-                header_10 |= bits_18[j] << j
-            hec_8 = 0
-            for j in range(8):
-                hec_8 |= bits_18[10 + j] << j
-
-            uap = self._uap_from_hec(header_10, hec_8)
-            self.uap_votes[uap] += 1
-
-        # Check convergence at thresholds
-        if self.packet_count in (5, 10, 20, 50) or self.packet_count % 50 == 0:
-            self._check_convergence()
-
-    @staticmethod
-    def _whitening_bits(clk1_6, n):
-        """Generate n bits of BT data whitening (x^7 + x^4 + 1 LFSR)."""
-        reg = 0x40 | (clk1_6 & 0x3f)  # bit 6 forced to 1
-        bits = []
-        for _ in range(n):
-            bits.append(reg & 1)
-            fb = ((reg >> 6) ^ (reg >> 3)) & 1
-            reg = (reg >> 1) | (fb << 6)
-        return bits
-
-    @staticmethod
-    def _reverse8(byte):
-        """Bit-reverse an 8-bit value."""
-        byte = ((byte & 0xF0) >> 4) | ((byte & 0x0F) << 4)
-        byte = ((byte & 0xCC) >> 2) | ((byte & 0x33) << 2)
-        byte = ((byte & 0xAA) >> 1) | ((byte & 0x55) << 1)
-        return byte & 0xFF
-
-    @staticmethod
-    def _uap_from_hec(header_10, hec):
-        """Reverse HEC LFSR to find UAP (same algorithm as libbtbb).
-
-        The BT spec initializes the HEC LFSR with reverse(UAP), so after
-        unwinding the LFSR we must bit-reverse the result to get the UAP.
-        """
-        reg = hec
-        for i in range(9, -1, -1):
-            if reg & 0x80:
-                reg ^= 0x65
-            reg = ((reg << 1) & 0xff) | (((reg >> 7) ^ ((header_10 >> i) & 1)) & 1)
-        return UAPEstimator._reverse8(reg)
-
-    def _check_convergence(self):
-        if self.packet_count < 5:
-            return
-        best_uap = max(range(256), key=lambda i: self.uap_votes[i])
-        best_count = self.uap_votes[best_uap]
-        # Expected noise per UAP: each packet adds 63 random votes
-        # spread across 256 candidates (E = packet_count * 63/256)
-        expected_noise = self.packet_count * 63.0 / 256.0
-        # The correct UAP gets packet_count deterministic votes on top of noise
-        signal = best_count - expected_noise
-        if signal > 0 and self.packet_count > 0:
-            conf = signal / self.packet_count
-            if conf >= 0.5:
-                self.converged_uap = best_uap
-                self.confidence = min(conf, 1.0)
-
-    def get_result(self):
-        """Return (uap, confidence) or (None, 0.0) if not converged."""
-        if self.converged_uap is not None:
-            return (self.converged_uap, self.confidence)
-        return (None, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1502,6 +1464,8 @@ class DashboardState:
         # Multi-sensor tracking
         self.sensors = {}  # sensor_id -> {lat, lon, last_seen, pkts}
         self.device_sensor_rssi = {}  # dev_key -> {sensor_id -> {rssi_sum, rssi_cnt, last}}
+        self.bt_identities = {}  # LAP label -> verified internal device keys
+        self.bt_pending = {}     # LAP label -> short-lived unverified observations
         self.static_positions = static_positions or {}
         self.path_loss_exp = path_loss_exp
         # Persistence and alerting (set externally after construction)
@@ -1600,6 +1564,31 @@ class DashboardState:
             fp = pkt.get("fingerprint", {})
             rssi = pkt["signal_power"]
 
+            admitted = None
+            if protocol == "BT":
+                identities = self.bt_identities.setdefault(mac, set())
+                if pkt.get("uap_verified"):
+                    dev_key = f"bt:{pkt['uap']:02x}:{mac[3:]}"
+                    if not identities and mac in self.devices:
+                        self._migrate_device_key(mac, dev_key)
+                    identities.add(dev_key)
+                    if dev_key not in self.devices:
+                        admitted = self._record_pending_bt(
+                            mac, now, rssi, pkt["crc_valid"], sensor_id)
+                        self.bt_pending.pop(mac, None)
+                elif len(identities) == 1:
+                    dev_key = next(iter(identities))
+                elif identities:
+                    # A LAP can belong to more than one device. Without a
+                    # verified UAP this packet cannot be assigned safely.
+                    return
+                elif dev_key not in self.devices:
+                    admitted = self._record_pending_bt(
+                        mac, now, rssi, pkt["crc_valid"], sensor_id)
+                    if admitted["count"] < BT_PENDING_MIN_PACKETS:
+                        return
+                    self.bt_pending.pop(mac, None)
+
             if dev_key in self.devices:
                 d = self.devices[dev_key]
                 d["pkts"] += 1
@@ -1671,31 +1660,37 @@ class DashboardState:
                 # Track resolved RPA addresses
                 if identity and "rpa_addrs" in d:
                     d["rpa_addrs"].add(mac)
-                # UAP estimation for Classic BT
-                if protocol == "BT" and "_uap_est" in d:
-                    raw_hdr = pkt.get("raw_header")
-                    if raw_hdr:
-                        d["_uap_est"].add_header(raw_hdr)
-                        uap, conf = d["_uap_est"].get_result()
-                        if uap is not None:
-                            d["uap"] = uap
-                            d["uap_conf"] = conf
+                # The sensor owns UAP recovery because it has packet timing,
+                # raw symbols, and CRC evidence. The dashboard only upgrades
+                # the accumulated LAP record after sensor verification.
+                if protocol == "BT" and pkt.get("uap_verified"):
+                    d["uap"] = pkt["uap"]
+                    d["uap_conf"] = 1.0
             else:
+                initial_count = admitted["count"] if admitted else 1
+                initial_first = admitted["first"] if admitted else now
+                initial_rssi_sum = admitted["rssi_sum"] if admitted else rssi
+                initial_rssi_min = admitted["rssi_min"] if admitted else rssi
+                initial_rssi_max = admitted["rssi_max"] if admitted else rssi
+                initial_crc_ok = admitted["crc_ok"] if admitted else (
+                    1 if pkt["crc_valid"] else 0)
+                initial_crc_bad = admitted["crc_bad"] if admitted else (
+                    1 if pkt["crc_valid"] is False else 0)
                 d = {
-                    "mac": dev_key,
+                    "mac": mac,
                     "protocol": protocol,
-                    "first": now,
+                    "first": initial_first,
                     "last": now,
                     "freq": pkt["freq_mhz"],
-                    "rssi": rssi,
-                    "rssi_min": rssi,
-                    "rssi_sum": rssi,
-                    "rssi_cnt": 1,
+                    "rssi": initial_rssi_max,
+                    "rssi_min": initial_rssi_min,
+                    "rssi_sum": initial_rssi_sum,
+                    "rssi_cnt": initial_count,
                     "type": pkt["pdu_type"],
                     "phy": pkt.get("phy", "1M"),
-                    "pkts": 1,
-                    "crc_ok": 1 if pkt["crc_valid"] else 0,
-                    "crc_bad": 1 if pkt["crc_valid"] is False else 0,
+                    "pkts": initial_count,
+                    "crc_ok": initial_crc_ok,
+                    "crc_bad": initial_crc_bad,
                     "mac_type": pkt.get("mac_type", ""),
                     "name": fp.get("name") or "",
                     "mfr": fp.get("manufacturer") or "",
@@ -1729,18 +1724,17 @@ class DashboardState:
                 if gps_info:
                     d["lat"] = round(gps_info[0], 6)
                     d["lon"] = round(gps_info[1], 6)
-                # Classic BT: set up UAP estimator
+                # Classic BT starts as a LAP-only sighting and is upgraded when
+                # a sensor supplies a verified UAP.
                 if protocol == "BT":
-                    d["_uap_est"] = UAPEstimator()
-                    d["uap"] = None
-                    d["uap_conf"] = 0.0
-                    raw_hdr = pkt.get("raw_header")
-                    if raw_hdr:
-                        d["_uap_est"].add_header(raw_hdr)
+                    d["uap"] = pkt.get("uap") if pkt.get("uap_verified") else None
+                    d["uap_conf"] = 1.0 if pkt.get("uap_verified") else 0.0
                 self.devices[dev_key] = d
 
             # Per-sensor RSSI tracking (for multilateration)
-            if sensor_id:
+            if admitted:
+                self.device_sensor_rssi[dev_key] = admitted["sensors"]
+            elif sensor_id:
                 if dev_key not in self.device_sensor_rssi:
                     self.device_sensor_rssi[dev_key] = {}
                 dsr = self.device_sensor_rssi[dev_key]
@@ -1763,6 +1757,8 @@ class DashboardState:
                     mac_type=d.get("mac_type", ""),
                     rssi=rssi,
                     services=svc_str,
+                    observations=admitted["count"] if admitted else 1,
+                    first_seen=admitted["first"] if admitted else now,
                 )
 
             # Alerting
@@ -1770,6 +1766,59 @@ class DashboardState:
                 self.alert_mgr.check(dev_key, d)
 
             self._dirty = True
+
+    def _record_pending_bt(self, mac, now, rssi, crc_valid, sensor_id):
+        pending = self.bt_pending.get(mac)
+        if pending is None or now - pending["first"] > BT_PENDING_WINDOW_SECONDS:
+            pending = {
+                "count": 0, "first": now, "last": now,
+                "rssi_sum": 0, "rssi_min": rssi, "rssi_max": rssi,
+                "crc_ok": 0, "crc_bad": 0, "sensors": {},
+            }
+            self.bt_pending[mac] = pending
+        pending["count"] += 1
+        pending["last"] = now
+        pending["rssi_sum"] += rssi
+        pending["rssi_min"] = min(pending["rssi_min"], rssi)
+        pending["rssi_max"] = max(pending["rssi_max"], rssi)
+        pending["crc_ok"] += 1 if crc_valid else 0
+        pending["crc_bad"] += 1 if crc_valid is False else 0
+        if sensor_id:
+            obs = pending["sensors"].setdefault(
+                sensor_id, {"rssi_sum": 0, "rssi_cnt": 0, "last": 0})
+            obs["rssi_sum"] += rssi
+            obs["rssi_cnt"] += 1
+            obs["last"] = now
+        return pending
+
+    def _migrate_device_key(self, old_key, new_key):
+        if old_key == new_key or old_key not in self.devices:
+            return
+        old = self.devices.pop(old_key)
+        if new_key in self.devices:
+            new = self.devices[new_key]
+            new["first"] = min(new["first"], old["first"])
+            new["last"] = max(new["last"], old["last"])
+            new["pkts"] += old["pkts"]
+            new["rssi"] = max(new["rssi"], old["rssi"])
+            new["rssi_min"] = min(new["rssi_min"], old["rssi_min"])
+            new["rssi_sum"] += old["rssi_sum"]
+            new["rssi_cnt"] += old["rssi_cnt"]
+            new["crc_ok"] += old["crc_ok"]
+            new["crc_bad"] += old["crc_bad"]
+        else:
+            self.devices[new_key] = old
+
+        old_sensors = self.device_sensor_rssi.pop(old_key, {})
+        new_sensors = self.device_sensor_rssi.setdefault(new_key, {})
+        for sensor_id, obs in old_sensors.items():
+            target = new_sensors.setdefault(
+                sensor_id, {"rssi_sum": 0, "rssi_cnt": 0, "last": 0})
+            target["rssi_sum"] += obs["rssi_sum"]
+            target["rssi_cnt"] += obs["rssi_cnt"]
+            target["last"] = max(target["last"], obs["last"])
+        if self.db:
+            self.db.migrate_key(old_key, new_key)
 
     def get_stats(self):
         with self.lock:
@@ -1794,7 +1843,7 @@ class DashboardState:
         with self.lock:
             self._dirty = False
             devs = []
-            for d in self.devices.values():
+            for dev_key, d in self.devices.items():
                 # Add computed avg RSSI for the JSON output
                 dd = dict(d)
                 dd["rssi_avg"] = round(d["rssi_sum"] / d["rssi_cnt"]) if d["rssi_cnt"] else d["rssi"]
@@ -1806,7 +1855,6 @@ class DashboardState:
                 else:
                     dd["est_dist"] = None
                 # Multilateration
-                dev_key = d["mac"]
                 dd["est_lat"] = None
                 dd["est_lon"] = None
                 dd["est_unc"] = None
@@ -1840,7 +1888,6 @@ class DashboardState:
                 # Don't send internal accumulators or non-serializable objects
                 del dd["rssi_sum"]
                 del dd["rssi_cnt"]
-                dd.pop("_uap_est", None)
                 devs.append(dd)
             devs.sort(key=lambda x: x["last"], reverse=True)
             return devs
@@ -3243,7 +3290,7 @@ function protoBadge(proto) {
 }
 
 function btMacLabel(d) {
-  // Classic BT: show LAP, and UAP if converged
+  // Classic BT: show LAP, and UAP after sensor verification
   if (d.uap != null) {
     const uap = ('0'+d.uap.toString(16)).slice(-2);
     return d.mac.replace('bt:', 'bt:'+uap+':');
