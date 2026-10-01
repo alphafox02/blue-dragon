@@ -2422,6 +2422,7 @@ enum SdrType {
     Aaronia,
     Rfnm,
     Sidekiq,
+    Espdr,
 }
 
 impl std::fmt::Display for SdrType {
@@ -2435,6 +2436,7 @@ impl std::fmt::Display for SdrType {
             SdrType::Aaronia => write!(f, "aaronia"),
             SdrType::Rfnm => write!(f, "rfnm"),
             SdrType::Sidekiq => write!(f, "sidekiq"),
+            SdrType::Espdr => write!(f, "espdr"),
         }
     }
 }
@@ -2457,6 +2459,8 @@ fn detect_sdr_type(iface: &str) -> SdrType {
         SdrType::Rfnm
     } else if iface.starts_with("sidekiq") {
         SdrType::Sidekiq
+    } else if iface.starts_with("espdr") {
+        SdrType::Espdr
     } else {
         SdrType::Usrp // default
     }
@@ -2478,6 +2482,8 @@ enum SdrHandle {
     Rfnm(bd_sdr::rfnm::RfnmHandle),
     #[cfg(feature = "sidekiq")]
     Sidekiq(bd_sdr::sidekiq::SidekiqHandle),
+    #[cfg(feature = "espdr")]
+    Espdr(bd_sdr::espdr::EspdrHandle),
     Vita49(bd_sdr::vita49::Vita49Handle),
 }
 
@@ -2502,6 +2508,8 @@ impl SdrHandle {
             SdrHandle::Rfnm(h) => h.recv_into_i16(buf),
             #[cfg(feature = "sidekiq")]
             SdrHandle::Sidekiq(h) => h.recv_into_i16(buf),
+            #[cfg(feature = "espdr")]
+            SdrHandle::Espdr(h) => h.recv_into_i16(buf),
             SdrHandle::Vita49(h) => h.recv_into_i16(buf),
         }
     }
@@ -2522,6 +2530,8 @@ impl SdrHandle {
             SdrHandle::Rfnm(h) => h.max_samps(),
             #[cfg(feature = "sidekiq")]
             SdrHandle::Sidekiq(h) => h.max_samps(),
+            #[cfg(feature = "espdr")]
+            SdrHandle::Espdr(h) => h.max_samps(),
             SdrHandle::Vita49(h) => h.max_samps(),
         }
     }
@@ -2542,6 +2552,8 @@ impl SdrHandle {
             SdrHandle::Rfnm(h) => h.overflow_count(),
             #[cfg(feature = "sidekiq")]
             SdrHandle::Sidekiq(h) => h.overflow_count(),
+            #[cfg(feature = "espdr")]
+            SdrHandle::Espdr(h) => h.overflow_count(),
             SdrHandle::Vita49(h) => h.overflow_count(),
         }
     }
@@ -2604,6 +2616,8 @@ impl SdrHandle {
             SdrHandle::Rfnm(h) => h.set_gain(gain),
             #[cfg(feature = "sidekiq")]
             SdrHandle::Sidekiq(h) => h.set_gain(gain),
+            #[cfg(feature = "espdr")]
+            SdrHandle::Espdr(h) => h.set_gain(gain as i32),
             SdrHandle::Vita49(h) => h.set_gain(gain),
         }
     }
@@ -2682,6 +2696,11 @@ fn open_sdr_handle(
                 iface, sample_rate, center_freq_hz, gain, antenna, extras,
             )?;
             Ok(SdrHandle::Sidekiq(h))
+        }
+        #[cfg(feature = "espdr")]
+        SdrType::Espdr => {
+            let h = bd_sdr::espdr::EspdrHandle::open(iface, sample_rate, center_freq_hz, gain as i32)?;
+            Ok(SdrHandle::Espdr(h))
         }
         #[allow(unreachable_patterns)]
         _ => Err(format!(

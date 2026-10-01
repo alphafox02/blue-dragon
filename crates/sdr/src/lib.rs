@@ -24,6 +24,9 @@ pub mod rfnm;
 #[cfg(feature = "sidekiq")]
 pub mod sidekiq;
 
+#[cfg(feature = "espdr")]
+pub mod espdr;
+
 #[cfg(feature = "whad")]
 pub mod whad;
 #[cfg(feature = "whad")]
