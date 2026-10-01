@@ -315,14 +315,18 @@ without channelization sends whole-window bursts, and firmware without
 streaming falls back to 1 ms snapshots automatically (`BD_ESPDR_SNAPSHOT=1`
 forces that mode).
 
-Load the firmware into the ESP's RAM (nothing is written to flash; a power
-cycle restores the board), then point blue-dragon at it:
+Load the firmware into the ESPs' RAM (nothing is written to flash; a power
+cycle restores a board), then point blue-dragon at them. The fork's
+releases carry a prebuilt `iq-source.bin`, and its loader handles every
+attached ESP32-S3 at once and checks each one answers:
 
     git clone https://github.com/alphafox02/eSpDR && cd eSpDR
-    . $IDF_PATH/export.sh            # ESP-IDF v5.5.3 or later
-    make -C esp32s3
-    esptool --chip esp32s3 --port /dev/ttyACM0 --before default-reset \
-            --after no-reset --no-stub load-ram esp32s3/build/iq-source.bin
+    pip install esptool pyserial numpy
+    # iq-source.bin from https://github.com/alphafox02/eSpDR/releases
+    python3 usb/load.py --image iq-source.bin
+
+To build the image instead: `. $IDF_PATH/export.sh` (ESP-IDF v5.5.3 or
+later), `make -C esp32s3`, then `python3 usb/load.py`.
 
     cargo build --release --features espdr
     blue-dragon -l -i espdr0 -C 16 -c 2426 -g 28 --check-crc --stats
