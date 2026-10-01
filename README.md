@@ -364,13 +364,15 @@ no longer came through while one 7 MHz inside still did, and the noise
 floor dropped. The register mapping and bandwidth calibration came from the
 [ESP-SDR](https://github.com/ESPARGOS/esp-sdr) project.
 
-**Tiled.** Each burst is placed once at the frequency it came from. Five
-ESPs on one USB hub, four on their PCB antennas, received 894 BLE
+**Tiled.** Each burst is placed once at the frequency it came from. The five
+LOs are staggered by half a MHz so the integer-MHz Bluetooth channels fall
+inside a tile rather than on its boundary. Five ESPs on one USB hub, four on
+their PCB antennas, received 894 BLE
 advertising packets with a valid CRC in 25 s across channels 37, 38 and 39,
 and Classic packets at their true channels (15,000 in 38 s during an
-`l2ping` flood, with the link's UAP recovered). The four Classic channels
-on the boundaries between windows (2417, 2433, 2449, 2465 MHz at `-c 2441`)
-are not received.
+`l2ping` flood, with the link's UAP recovered). A 29 s run with the staggered
+LOs received 5,968 Classic packets and all four former boundary channels
+(2417, 2433, 2449 and 2465 MHz).
 
 **Folded.** With the filter open each ESP hears about 80 MHz around its LO
 folded into its window (flat to about 25 MHz from the LO, 5 dB down at 39,
