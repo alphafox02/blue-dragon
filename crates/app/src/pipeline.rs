@@ -631,6 +631,7 @@ pub fn run_burst_file(
             &mut stats,
         );
     }
+    flush_held_ble(&mut conn_table, &mut pcap_writer, #[cfg(feature = "zmq")] &zmq_pub, &mut stats);
 
     if print_stats {
         eprintln!(
@@ -1414,6 +1415,10 @@ fn process_burst(
     ) {
         let demod_ts = channel_samples_after(&burst_ts, burst.edr_lead_samples);
         bt_pkt.timestamp = bt_sync_timestamp(&demod_ts, &fsk_result, bt_pkt.sync_offset);
+        if bt_tracker.is_fold_copy(&bt_pkt) {
+            stats.bt_fold_copies += 1;
+            return;
+        }
         // Recover UAP (and full BD_ADDR from FHS) across packets/channels.
         let mut announce = btbb::enrich(&mut bt_pkt, bt_tracker);
         let offset_hz = (burst.freq as f64 - center_freq_mhz as f64) * 1_000_000.0;
@@ -1521,6 +1526,28 @@ fn process_burst(
         p.rssi_db = rssi;
         p.noise_db = noise;
 
+        // A receiver that aliases hands the decoders the same packet at
+        // several channels (see bd_protocol::fold); only the copy dewhitened
+        // for its own channel passes the CRC. A failing copy of a packet
+        // already decoded is dropped; a failing packet seen first is held
+        // briefly in case its passing copy is still to come.
+        let failed = p.crc_checked && !p.crc_valid;
+        let copy = conn_table.is_fold_copy(&p);
+        if !failed {
+            stats.ble_fold_copies += conn_table.drop_held_copies_of(&p) as u64;
+        }
+        for held in conn_table.release_held(Some(&p)) {
+            emit_ble(&held, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, gps_fix, stats);
+        }
+        if failed {
+            if copy {
+                stats.ble_fold_copies += 1;
+            } else {
+                conn_table.hold_failed(p);
+            }
+            return;
+        }
+
         if p.aa == ble::BLE_ADV_AA && p.crc_valid {
             conn_table.parse_connect_ind(&p, burst_ts.tv_sec);
         }
@@ -1590,32 +1617,55 @@ fn process_burst(
             }
         }
 
-        if p.crc_checked {
-            stats.total_crc += 1;
-            if p.crc_valid {
-                stats.valid_crc += 1;
-            }
-        }
+        emit_ble(&p, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, gps_fix, stats);
+    }
+}
 
-        match p.phy {
-            ble::BlePhy::Phy2M => stats.total_ble_2m += 1,
-            ble::BlePhy::PhyCoded => stats.total_ble_coded += 1,
-            _ => {}
+/// Counts a BLE packet and writes it out.
+fn emit_ble(
+    p: &ble::BlePacket,
+    pcap_writer: &mut Option<PcapWriter<BufWriter<File>>>,
+    #[cfg(feature = "zmq")] zmq_pub: &Option<bd_output::zmq_pub::ZmqPublisher>,
+    gps_fix: Option<&bd_output::pcap::GpsFix>,
+    stats: &mut PipelineStats,
+) {
+    if p.crc_checked {
+        stats.total_crc += 1;
+        if p.crc_valid {
+            stats.valid_crc += 1;
         }
+    }
 
-        stats.total_ble += 1;
-        if let Some(ref mut writer) = pcap_writer {
-            if let Err(e) = writer.write_ble(&p, gps_fix) {
-                if stats.pcap_errors == 0 {
-                    eprintln!("PCAP write error: {}", e);
-                }
-                stats.pcap_errors += 1;
+    match p.phy {
+        ble::BlePhy::Phy2M => stats.total_ble_2m += 1,
+        ble::BlePhy::PhyCoded => stats.total_ble_coded += 1,
+        _ => {}
+    }
+
+    stats.total_ble += 1;
+    if let Some(ref mut writer) = pcap_writer {
+        if let Err(e) = writer.write_ble(p, gps_fix) {
+            if stats.pcap_errors == 0 {
+                eprintln!("PCAP write error: {}", e);
             }
+            stats.pcap_errors += 1;
         }
-        #[cfg(feature = "zmq")]
-        if let Some(ref pub_socket) = zmq_pub {
-            pub_socket.send_ble(&p, gps_fix);
-        }
+    }
+    #[cfg(feature = "zmq")]
+    if let Some(ref pub_socket) = zmq_pub {
+        pub_socket.send_ble(p, gps_fix);
+    }
+}
+
+/// Writes out the BLE packets still held back at the end of a stream.
+fn flush_held_ble(
+    conn_table: &mut ConnectionTable,
+    pcap_writer: &mut Option<PcapWriter<BufWriter<File>>>,
+    #[cfg(feature = "zmq")] zmq_pub: &Option<bd_output::zmq_pub::ZmqPublisher>,
+    stats: &mut PipelineStats,
+) {
+    for held in conn_table.release_held(None) {
+        emit_ble(&held, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, None, stats);
     }
 }
 
@@ -1646,6 +1696,11 @@ struct PipelineStats {
     burst_5k_50k: u64,
     burst_50k_plus: u64,
     pcap_errors: u64,
+    /// Classic packets dropped as the same transmission folded onto another
+    /// channel (see `PiconetTracker::is_fold_copy`).
+    bt_fold_copies: u64,
+    /// The same for BLE packets whose CRC failed.
+    ble_fold_copies: u64,
 }
 
 impl PipelineStats {
@@ -1672,6 +1727,8 @@ impl PipelineStats {
             burst_5k_50k: 0,
             burst_50k_plus: 0,
             pcap_errors: 0,
+            bt_fold_copies: 0,
+            ble_fold_copies: 0,
         }
     }
 
@@ -2234,6 +2291,13 @@ fn spawn_parallel_pipeline(
                         last_stats = Instant::now();
                     }
                 }
+                flush_held_ble(
+                    &mut conn_table,
+                    &mut pcap_writer,
+                    #[cfg(feature = "zmq")]
+                    &zmq_pub,
+                    &mut stats,
+                );
 
                 if print_stats {
                     let elapsed = stats_start.elapsed().as_secs_f64();
@@ -2243,8 +2307,16 @@ fn spawn_parallel_pipeline(
                     } else {
                         String::new()
                     };
+                    let fold_str = if stats.bt_fold_copies + stats.ble_fold_copies > 0 {
+                        format!(
+                            " folded copies dropped: BT {} BLE {}",
+                            stats.bt_fold_copies, stats.ble_fold_copies
+                        )
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} EDR: try={} sync={} crc={} best={:.3} shed={}",
+                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} EDR: try={} sync={} crc={} best={:.3} shed={}{}",
                         elapsed,
                         stats.total_ble,
                         phy_str,
@@ -2259,6 +2331,7 @@ fn spawn_parallel_pipeline(
                         stats.edr_crc_matches,
                         stats.edr_best_sync_score.unwrap_or(f32::NAN),
                         wideband_shed,
+                        fold_str,
                     );
                 }
             })

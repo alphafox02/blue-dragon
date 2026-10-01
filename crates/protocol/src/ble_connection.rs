@@ -122,9 +122,16 @@ pub fn predict_channels(
     predictions
 }
 
+/// How close in time two BLE decodes must be to be one transmission.
+const FOLD_WINDOW_NS: i64 = 20_000;
+
 /// Connection table: tracks active BLE connections from CONNECT_IND PDUs
 pub struct ConnectionTable {
     slots: Vec<BleConnection>,
+    /// Recent packets, for `is_fold_copy`, and packets whose CRC failed held
+    /// back in case a copy that passes is still to come.
+    fold: crate::fold::FoldMemory,
+    held: crate::fold::Held<BlePacket>,
 }
 
 impl ConnectionTable {
@@ -133,7 +140,37 @@ impl ConnectionTable {
         for _ in 0..BLE_MAX_CONNECTIONS {
             slots.push(BleConnection::default());
         }
-        Self { slots }
+        Self { slots, fold: crate::fold::FoldMemory::new(), held: crate::fold::Held::new() }
+    }
+
+    /// Holds a packet whose CRC failed for a short while (see `crate::fold`).
+    pub fn hold_failed(&mut self, pkt: BlePacket) {
+        let (aa, freq, ts) = (pkt.aa, pkt.freq, pkt.timestamp.clone());
+        self.held.hold(aa, freq, &ts, pkt);
+    }
+
+    /// Drops held packets that are copies of `pkt` at another fold; returns
+    /// how many.
+    pub fn drop_held_copies_of(&mut self, pkt: &BlePacket) -> usize {
+        self.held.drop_copies_of(pkt.aa, pkt.freq, &pkt.timestamp, FOLD_WINDOW_NS)
+    }
+
+    /// Held packets whose wait is over, given packets seen up to `pkt`; all
+    /// of them with `None` (at the end of a stream).
+    pub fn release_held(&mut self, pkt: Option<&BlePacket>) -> Vec<BlePacket> {
+        match pkt {
+            Some(p) => self.held.release(&p.timestamp),
+            None => self.held.release_all(),
+        }
+    }
+
+    /// Records `pkt` and returns true if it is a copy, through a receiver
+    /// that aliases, of a packet with the same access address already
+    /// decoded on a channel a multiple of 16 MHz away (see `crate::fold`).
+    /// Only the copy dewhitened for the channel it was sent on passes its
+    /// CRC, so callers drop copies that fail theirs.
+    pub fn is_fold_copy(&mut self, pkt: &BlePacket) -> bool {
+        self.fold.seen(pkt.aa, pkt.freq, &pkt.timestamp, FOLD_WINDOW_NS)
     }
 
     /// Count active connections
