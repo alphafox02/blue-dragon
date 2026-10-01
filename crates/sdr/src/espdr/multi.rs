@@ -19,11 +19,28 @@
 //!
 //! Each board counts samples on its own crystal, so board time is mapped to
 //! host time: a record cannot arrive before the samples in it were taken, so
-//! the earliest arrival seen relative to its last sample tracks when the
-//! board's count began (within about a millisecond of USB scheduling), and
-//! that estimate is allowed to creep later at 50 ppm to follow a slower
-//! crystal. The timeline runs `DELAY` behind real time so bursts still queued
-//! on an ESP arrive before their place is emitted.
+//! the earliest arrivals relative to their last samples show when the
+//! board's count began (within about a millisecond of USB scheduling). That
+//! estimate is steered smoothly, with the crystals' drift, rather than
+//! snapped to each new earliest arrival: a jump would move every burst after
+//! it, and Classic Bluetooth's slot timing would not survive it. The
+//! timeline runs `DELAY` behind real time so bursts still queued on an ESP
+//! arrive before their place is emitted.
+//!
+//! A millisecond is too coarse for Classic Bluetooth, whose address and
+//! clock recovery compare packets slot by slot (625 us), and consecutive
+//! packets come from different boards. So every board also sends one shared
+//! position, where BLE advertising channel 38 folds: the same bursts arrive
+//! from every board. Their demodulated content gives each board's offset
+//! from a reference board to a fraction of a microsecond; once measured, a
+//! board's samples are mapped onto the reference's by that offset, tracked
+//! with its drift (the crystals differ by tens of ppm). Only one copy of each
+//! shared burst is kept.
+//!
+//! The output timeline is the reference board's own sample count, scaled to
+//! the output rate, so bursts keep exactly the spacing they were received
+//! with, as they would from a single receiver. Host time only paces the
+//! output.
 
 use super::*;
 use num_complex::Complex32;
@@ -40,8 +57,17 @@ const FACTOR: usize = 5;
 const HEARING_MHZ: i64 = 40;
 /// How far the output timeline runs behind real time.
 const DELAY: f64 = 0.4;
-/// How fast a board's start estimate may move later, in seconds per second.
-const DRIFT_ALLOWANCE: f64 = 50e-6;
+/// Steering of a board's start estimate: for how long after its first
+/// record it may jump to the earliest arrival seen, how often it is steered
+/// after that (seconds), over how long a correction is spread, the share of
+/// the error corrected and learned as drift each time, and the fastest it
+/// may move (s/s). Steering only ever changes the estimate's rate.
+const SETTLE: f64 = 1.5;
+const STEER_EVERY: f64 = 0.5;
+const STEER_SPREAD: f64 = 2.0;
+const STEER_GAIN: f64 = 0.1;
+const STEER_DRIFT_GAIN: f64 = 0.01;
+const STEER_MAX_RATE: f64 = 100e-6;
 /// Interpolation taps per output phase, for a 4 Msps channel and for a
 /// 16 Msps window.
 const NARROW_TAPS_PER_PHASE: usize = 14;
@@ -50,6 +76,30 @@ const WIDE_TAPS_PER_PHASE: usize = 48;
 const MULTI_CHUNK_PAIRS: usize = 1 << 18;
 /// Complex samples in the background noise table.
 const NOISE_PAIRS: usize = 1 << 18;
+/// The frequency whose fold position every board shares for alignment: BLE
+/// advertising channel 38, busy wherever there is BLE.
+const SYNC_MHZ: i64 = 2426;
+/// How far apart (seconds) a board's copy of a shared burst may be from the
+/// reference's, while its offset is being found and once it is. Content
+/// alone does not settle it at first: an advertiser repeats the same packet
+/// every advertising interval, so a copy can match an earlier or later
+/// broadcast. Offsets are therefore only taken once several agree.
+const SYNC_WINDOW: f64 = 30e-3;
+const SYNC_WINDOW_LOCKED: f64 = 0.3e-3;
+/// Agreeing offsets (within SYNC_AGREE seconds) needed to lock a board on,
+/// and by how many the winner must lead any other offset: a repeated
+/// advertisement confirms an alias as often as the truth, and only other
+/// packets tip the balance.
+const SYNC_AGREEING: usize = 4;
+const SYNC_LEAD: usize = 3;
+const SYNC_AGREE: f64 = 80e-6;
+/// Matches after which a board counts as aligned.
+const SYNC_ALIGNED_AFTER: u32 = 10;
+/// Content lags (4 Msps samples) searched between two copies' records, which
+/// start where each board's detector happened to open them.
+const SYNC_MAX_LAG: i64 = 160;
+/// Correlation of the demodulated copies needed to call them one burst.
+const SYNC_MIN_CORRELATION: f32 = 0.5;
 
 /// The serial ports to use for `iface` at `sample_rate`, or None for a
 /// single-board interface. `espdr` takes every attached ESP; a comma list
@@ -102,12 +152,26 @@ fn board_gains(count: usize, gain: i32) -> Result<Vec<u16>, String> {
 
 /// Channel positions (firmware mask, bit k + 8 for offset k) for board
 /// `index` of `count`: positions dealt round, so neighbouring positions go
-/// to different boards.
-fn position_mask(index: usize, count: usize) -> u16 {
+/// to different boards, plus the shared position `sync` (offset k) if any.
+fn position_mask(index: usize, count: usize, sync: Option<i32>) -> u16 {
     if count == 1 {
         return 0;
     }
-    (0..16).filter(|bit| bit % count == index).fold(0, |m, bit| m | 1 << bit)
+    let own = (0..16).filter(|bit| bit % count == index).fold(0u16, |m, bit| m | 1 << bit);
+    own | sync.map_or(0, |k| 1 << (k + 8))
+}
+
+/// The channel offset k (LO-minus-RF, MHz) at which `mhz` appears for an LO
+/// of `lo_mhz`, if the firmware can report it (-7..7).
+fn fold_position(mhz: i64, lo_mhz: i64) -> Option<i32> {
+    let rf = (mhz - lo_mhz + 8).rem_euclid(16) - 8; // RF-minus-LO, -8..7
+    let k = -rf as i32;
+    (-7..=7).contains(&k).then_some(k)
+}
+
+/// The board whose own positions include offset `k`.
+fn owner(k: i32, count: usize) -> usize {
+    (k + 8) as usize % count
 }
 
 pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<EspdrHandle, String> {
@@ -120,11 +184,16 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
     let mut board_gain_tx = Vec::with_capacity(count);
     let mut threads = Vec::with_capacity(count);
     let mut lo_hz = center_freq as u32;
+    // Whole-window bursts cannot be shared by position, nor aligned by one.
+    let sync = if channelize && count > 1 {
+        fold_position(SYNC_MHZ, (center_freq as i64 + 500_000) / 1_000_000)
+    } else {
+        None
+    };
     for (index, path) in paths.iter().enumerate() {
         let (mut link, tuned) = open_board(path, 1, 20, gains[index], center_freq as u32)?;
         lo_hz = tuned;
-        // Whole-window bursts cannot be shared by position.
-        let mask = if channelize { position_mask(index, count) } else { 0 };
+        let mask = if channelize { position_mask(index, count, sync) } else { 0 };
         if !link.start_stream_masked(stream_arg, mask)? {
             return Err(format!("eSpDR: the ESP at {} cannot stream; load the current firmware", path));
         }
@@ -175,6 +244,10 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
             .name("espdr-merge".to_string())
             .spawn(move || {
                 let mut merger = Merger::new(count, t0, tx);
+                merger.sync = sync.map(|k| (k, owner(k, count)));
+                if let Some((_, reference)) = merger.sync {
+                    merger.reference = Some(reference);
+                }
                 merger.run(&event_rx, &gain_rx, &board_gain_tx, &running, &overflow);
                 running.store(false, Ordering::Relaxed);
                 drop(event_rx); // unblocks boards waiting to hand over a burst
@@ -278,6 +351,10 @@ struct Shaped {
     /// Board pair (fractional) that output sample 0 corresponds to.
     first: f64,
     samples: Vec<Complex32>,
+    /// A channelized burst's offset (LO-minus-RF, MHz), and its channel at
+    /// 4 Msps (output j at output sample `NARROW_DELAY + 20 j` of `samples`).
+    offset: Option<i32>,
+    channel: Option<Vec<Complex32>>,
 }
 
 /// Interpolates bursts to the output rate and repeats them at each
@@ -339,6 +416,8 @@ impl Shaper {
         Shaped {
             first: start as f64 - 2.5 - delay * step,
             samples: self.interpolate(&x, &self.narrow_taps, &Self::folds(-offset as i64)),
+            offset: Some(offset),
+            channel: Some(x),
         }
     }
 
@@ -352,6 +431,8 @@ impl Shaper {
         Shaped {
             first: start as f64 - delay / FACTOR as f64,
             samples: self.interpolate(&x, &self.wide_taps, &Self::folds(0)),
+            offset: None,
+            channel: None,
         }
     }
 
@@ -391,6 +472,50 @@ impl Shaper {
         }
         out
     }
+}
+
+/// The lag (4 Msps samples, fractional) at which `other` holds the same
+/// signal as `reference`: `other[j + lag]` is `reference[j]`. Found by
+/// correlating their instantaneous frequency, which the two receivers'
+/// differing phase, gain and small frequency offset do not disturb; None
+/// unless the correlation shows them to be one burst.
+fn content_lag(reference: &[Complex32], other: &[Complex32]) -> Option<f64> {
+    let demod = |x: &[Complex32]| -> Vec<f32> {
+        let d: Vec<f32> = x.windows(2).map(|w| (w[1] * w[0].conj()).arg()).collect();
+        let mean = d.iter().sum::<f32>() / d.len().max(1) as f32;
+        d.into_iter().map(|v| v - mean).collect()
+    };
+    let (a, b) = (demod(reference), demod(other));
+    let score = |lag: i64| -> f32 {
+        let (mut ab, mut aa, mut bb) = (0.0f32, 0.0f32, 0.0f32);
+        let mut n = 0;
+        for (j, &x) in a.iter().enumerate() {
+            let k = j as i64 + lag;
+            if k < 0 || k >= b.len() as i64 {
+                continue;
+            }
+            let y = b[k as usize];
+            ab += x * y;
+            aa += x * x;
+            bb += y * y;
+            n += 1;
+        }
+        if n < 200 || aa <= 0.0 || bb <= 0.0 {
+            return 0.0;
+        }
+        ab / (aa * bb).sqrt()
+    };
+    let scores: Vec<(i64, f32)> = (-SYNC_MAX_LAG..=SYNC_MAX_LAG).map(|l| (l, score(l))).collect();
+    let &(best, peak) = scores.iter().max_by(|x, y| x.1.total_cmp(&y.1))?;
+    if peak < SYNC_MIN_CORRELATION {
+        return None;
+    }
+    // Refine between samples with a parabola through the peak.
+    let at = |l: i64| scores.iter().find(|s| s.0 == l).map_or(0.0, |s| s.1);
+    let (l, c, r) = (at(best - 1), peak, at(best + 1));
+    let curve = l - 2.0 * c + r;
+    let shift = if curve < 0.0 { (0.5 * (l - r) / curve).clamp(-0.5, 0.5) } else { 0.0 };
+    Some(best as f64 + shift as f64)
 }
 
 /// Kaiser-windowed low-pass of `ratio * per_phase` taps for interpolating
@@ -435,19 +560,43 @@ fn polyphase(taps: Vec<f64>, ratio: usize) -> Vec<Vec<f32>> {
 }
 
 struct Board {
-    /// Host time (seconds since start) at which the board's pair 0 was taken.
+    /// Host time (seconds since start) at which the board's pair 0 was taken,
+    /// as estimated at host time `steered`; the rate it moves at until the
+    /// next steering (s/s), and the crystals' drift learned so far.
     start: Option<f64>,
-    last_seen: f64,
+    steered: f64,
+    rate: f64,
+    drift: f64,
+    /// Host time of the board's first record, and the earliest start shown
+    /// by arrivals since `window` (host time).
+    first_seen: f64,
+    earliest: f64,
+    window: f64,
     /// Background noise per component, in output units.
     sigma: f32,
     /// Bursts dropped and blocks skipped on the ESP, from its last status.
     lost: u64,
+    /// Once measured against the reference board: the reference's pair
+    /// count less this board's (pairs) at this board's pair `anchor`, how
+    /// that changes per pair (the crystals' drift), the anchor, and how many
+    /// shared bursts it has been measured from.
+    relative: Option<(f64, f64, f64)>,
+    matches: u32,
+    /// While unlocked, the offsets (pairs) measured so far, each with the
+    /// reference burst (its output sample) it was measured against.
+    candidates: Vec<(f64, i64)>,
 }
 
 /// A burst placed on the output timeline.
 struct Placed {
     at: i64,
     samples: Vec<Complex32>,
+    board: usize,
+    /// The board pair (fractional) of its output sample 0.
+    first: f64,
+    /// For a burst at the shared position, its channel at 4 Msps (see
+    /// `Shaped::channel`), for alignment.
+    sync: Option<Vec<Complex32>>,
 }
 
 struct Merger {
@@ -463,12 +612,31 @@ struct Merger {
     noise_sigma: f32,
     noise_pos: usize,
     late: u64,
+    /// The shared position (offset k) and the reference board, if aligning.
+    sync: Option<(i32, usize)>,
+    /// The board whose sample count is the output timeline (the sync
+    /// reference, or the only board), and the output sample of its pair 0.
+    reference: Option<usize>,
+    origin: Option<f64>,
 }
 
 impl Merger {
     fn new(count: usize, t0: Instant, tx: Sender<Vec<i16>>) -> Self {
         let boards = (0..count)
-            .map(|_| Board { start: None, last_seen: 0.0, sigma: 4.0 * SAMPLE_SCALE as f32, lost: 0 })
+            .map(|_| Board {
+                start: None,
+                steered: 0.0,
+                rate: 0.0,
+                drift: 0.0,
+                first_seen: 0.0,
+                earliest: f64::INFINITY,
+                window: 0.0,
+                sigma: 4.0 * SAMPLE_SCALE as f32,
+                lost: 0,
+                relative: None,
+                matches: 0,
+                candidates: Vec::new(),
+            })
             .collect();
         let mut state = 0x2545_F491u32;
         let mut uniform = move || {
@@ -496,6 +664,9 @@ impl Merger {
             noise_sigma: -1.0,
             noise_pos: 0,
             late: 0,
+            sync: None,
+            reference: (count == 1).then_some(0),
+            origin: None,
         }
     }
 
@@ -524,28 +695,77 @@ impl Merger {
             let lost: u64 = self.boards.iter().map(|b| b.lost).sum();
             overflow.store(lost + self.late, Ordering::Relaxed);
             let now = self.t0.elapsed().as_secs_f64();
-            let target = ((now - DELAY) * self.rate) as i64;
+            let target = match (self.reference, self.origin) {
+                // The reference's pair DELAY ago, on the timeline.
+                (Some(r), Some(origin)) if self.boards[r].start.is_some() => {
+                    (origin + (now - DELAY - self.own_start(r, now)) * BOARD_RATE * FACTOR as f64) as i64
+                }
+                _ => ((now - DELAY) * self.rate) as i64,
+            };
             if target - self.emitted >= MULTI_CHUNK_PAIRS as i64 && !self.emit(MULTI_CHUNK_PAIRS, running) {
                 return;
             }
         }
     }
 
-    /// Updates the board's start estimate from a record's arrival.
+    /// Updates the board's start estimate from a record's arrival (host
+    /// time `seen`, last pair `last`).
     fn track(&mut self, board: usize, seen: Instant, last: u64) {
         let seen = seen.duration_since(self.t0).as_secs_f64();
         let b = &mut self.boards[board];
         let candidate = seen - last as f64 / BOARD_RATE;
-        b.start = Some(match b.start {
-            None => candidate,
-            Some(s) => (s + DRIFT_ALLOWANCE * (seen - b.last_seen)).min(candidate),
-        });
-        b.last_seen = seen;
+        let Some(start) = b.start else {
+            b.start = Some(candidate);
+            b.steered = seen;
+            b.first_seen = seen;
+            b.window = seen;
+            b.earliest = f64::INFINITY;
+            return;
+        };
+        b.earliest = b.earliest.min(candidate);
+        if seen - b.window < STEER_EVERY {
+            return;
+        }
+        let now = start + b.rate * (seen - b.steered);
+        let error = b.earliest - now;
+        if seen - b.first_seen < SETTLE {
+            b.start = Some(now.min(b.earliest));
+        } else {
+            // Carry on from where the estimate is (no jump) and correct by
+            // moving at a slightly different rate for a while.
+            b.drift += STEER_DRIFT_GAIN * error / (seen - b.steered);
+            b.start = Some(now);
+            b.rate = (b.drift + STEER_GAIN * error / STEER_SPREAD).clamp(-STEER_MAX_RATE, STEER_MAX_RATE);
+        }
+        b.steered = seen;
+        b.window = seen;
+        b.earliest = f64::INFINITY;
+    }
+
+    /// A board's own start estimate at host time `now`.
+    fn own_start(&self, board: usize, now: f64) -> f64 {
+        let b = &self.boards[board];
+        b.start.map_or(0.0, |s| s + b.rate * (now - b.steered))
     }
 
     fn take(&mut self, event: Event) {
         match event {
-            Event::Restart { board } => self.boards[board].start = None,
+            Event::Restart { board } => {
+                // Its count starts again; so does its alignment (everyone's,
+                // and the timeline's origin, if it is the reference).
+                self.boards[board].start = None;
+                let all = self.reference == Some(board);
+                if all {
+                    self.origin = None;
+                }
+                for (i, b) in self.boards.iter_mut().enumerate() {
+                    if all || i == board {
+                        b.relative = None;
+                        b.matches = 0;
+                        b.candidates.clear();
+                    }
+                }
+            }
             Event::Status { board, seen, at, words } => {
                 self.track(board, seen, at);
                 let b = &mut self.boards[board];
@@ -557,14 +777,174 @@ impl Merger {
             }
             Event::Burst { board, seen, last, burst } => {
                 self.track(board, seen, last);
-                let start = self.boards[board].start.unwrap_or(0.0);
-                let at = (start * self.rate + burst.first * FACTOR as f64).round() as i64;
+                let now = seen.duration_since(self.t0).as_secs_f64();
+                let at = self.position(board, burst.first, now);
                 if at + burst.samples.len() as i64 <= self.emitted {
                     self.late += 1;
                     return;
                 }
-                self.placed.push(Placed { at, samples: burst.samples });
+                let sync = match (self.sync, burst.offset, burst.channel) {
+                    (Some((k, _)), Some(o), Some(channel)) if o == k => Some(channel),
+                    _ => None,
+                };
+                if let Some(channel) = &sync {
+                    if self.align(board, at, burst.first, channel, now) {
+                        return; // another board's copy of a burst already placed
+                    }
+                }
+                self.placed.push(Placed { at, samples: burst.samples, board, first: burst.first, sync });
             }
+        }
+    }
+
+    /// Aligns boards on a burst at the shared position, from `board` placed
+    /// at output sample `at`, with its channel at 4 Msps. A copy from the
+    /// reference board measures the other boards' copies already placed,
+    /// and replaces those of locked boards; another board's copy is measured
+    /// against the reference's, and dropped (true) if its board is locked.
+    fn align(&mut self, board: usize, at: i64, first: f64, channel: &[Complex32], now: f64) -> bool {
+        let Some((_, reference)) = self.sync else { return false };
+        let rate = self.rate;
+        let window = |b: &Board| {
+            (if b.relative.is_some() { SYNC_WINDOW_LOCKED } else { SYNC_WINDOW } * rate) as i64
+        };
+        // Output samples by which `other` (placed at `other_at`) runs ahead
+        // of the reference copy, if the two hold the same packet.
+        let offset = |window: i64, reference_at: i64, reference: &[Complex32], other_at: i64, other: &[Complex32]| {
+            if (other_at - reference_at).abs() > window {
+                return None;
+            }
+            let lag = content_lag(reference, other)?;
+            let delta = (other_at - reference_at) as f64 + (4 * FACTOR) as f64 * lag;
+            (delta.abs() <= window as f64).then_some(delta)
+        };
+        if board == reference {
+            let mut measured = Vec::new();
+            let boards = &self.boards;
+            self.placed.retain(|p| match &p.sync {
+                Some(other) if p.board != reference => {
+                    match offset(window(&boards[p.board]), at, channel, p.at, other) {
+                        Some(delta) => {
+                            measured.push((p.board, p.first, vec![(delta, at)]));
+                            boards[p.board].relative.is_none() // keep copies until locked
+                        }
+                        None => true,
+                    }
+                }
+                _ => true,
+            });
+            for (b, first, matches) in measured {
+                self.measure(b, first, &matches, now);
+            }
+            false
+        } else {
+            let w = window(&self.boards[board]);
+            let matches: Vec<(f64, i64)> = self
+                .placed
+                .iter()
+                .filter(|p| p.board == reference)
+                .filter_map(|p| Some((offset(w, p.at, p.sync.as_deref()?, at, channel)?, p.at)))
+                .collect();
+            if matches.is_empty() {
+                return false;
+            }
+            let locked = self.boards[board].relative.is_some();
+            self.measure(board, first, &matches, now);
+            locked
+        }
+    }
+
+    /// Takes in the offsets measured for a copy from `board` whose output 0
+    /// is its pair `first` (output samples by which it runs ahead of each
+    /// reference burst it matched), at host time `now`. A locked board is
+    /// corrected by the nearest. Otherwise they are candidates, and the board
+    /// locks on once one offset is confirmed by at least SYNC_AGREEING
+    /// different reference bursts and by SYNC_LEAD more than any other
+    /// (repeats of one advertisement also match whole advertising intervals
+    /// off; only other packets settle which).
+    fn measure(&mut self, board: usize, first: f64, matches: &[(f64, i64)], now: f64) {
+        if self.boards[board].relative.is_some() {
+            if let Some(&(delta, _)) = matches.iter().min_by(|a, b| a.0.abs().total_cmp(&b.0.abs())) {
+                self.adjust(board, first, delta);
+            }
+            return;
+        }
+        // The offset (pairs) between the board's samples and the
+        // reference's by the coarse host-time mapping, less what was
+        // measured.
+        let base = self.reference_pair(board, first, now) - first;
+        let agree = SYNC_AGREE * BOARD_RATE;
+        let b = &mut self.boards[board];
+        for &(delta, reference_at) in matches {
+            b.candidates.push((base - delta / FACTOR as f64, reference_at));
+        }
+        // Each distinct offset, with how many reference bursts confirm it.
+        let mut clusters: Vec<(usize, Vec<f64>)> = Vec::new();
+        for &(c, _) in &b.candidates {
+            let cluster: Vec<&(f64, i64)> = b.candidates.iter().filter(|d| (d.0 - c).abs() <= agree).collect();
+            let mut bursts: Vec<i64> = cluster.iter().map(|d| d.1).collect();
+            bursts.sort_unstable();
+            bursts.dedup();
+            clusters.push((bursts.len(), cluster.iter().map(|d| d.0).collect()));
+        }
+        clusters.sort_by(|x, y| y.0.cmp(&x.0));
+        let best = clusters.first().cloned();
+        let centre = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let rival = best.as_ref().and_then(|(_, top)| {
+            clusters
+                .iter()
+                .find(|(_, v)| (centre(v) - centre(top)).abs() > agree)
+                .map(|(support, _)| *support)
+        });
+        let best = best.filter(|(support, _)| *support >= SYNC_AGREEING && *support >= rival.unwrap_or(0) + SYNC_LEAD);
+        if let Some((_, mut values)) = best {
+            values.sort_by(f64::total_cmp);
+            b.relative = Some((values[values.len() / 2], 0.0, first));
+            b.matches = SYNC_AGREEING as u32;
+            b.candidates.clear();
+        } else if b.candidates.len() > 256 {
+            b.candidates.drain(..64);
+        }
+    }
+
+    /// The reference board's pair (fractional) taken at the same moment as
+    /// `board`'s pair `p`: by the measured offset once locked, else by the
+    /// boards' host-time estimates at host time `now`.
+    fn reference_pair(&self, board: usize, p: f64, now: f64) -> f64 {
+        let Some(r) = self.reference else { return p };
+        if board == r {
+            return p;
+        }
+        match self.boards[board].relative {
+            Some((offset, drift, anchor)) => p + offset + drift * (p - anchor),
+            None => p + (self.own_start(board, now) - self.own_start(r, now)) * BOARD_RATE,
+        }
+    }
+
+    /// The output sample at which `board`'s pair `p` goes: on the reference
+    /// board's timeline once there is one, else by host time.
+    fn position(&mut self, board: usize, p: f64, now: f64) -> i64 {
+        if let Some(r) = self.reference.filter(|&r| self.boards[r].start.is_some()) {
+            let start = self.own_start(r, now);
+            let origin = *self.origin.get_or_insert(start * self.rate);
+            return (origin + self.reference_pair(board, p, now) * FACTOR as f64).round() as i64;
+        }
+        (self.own_start(board, now) * self.rate + p * FACTOR as f64).round() as i64
+    }
+
+    /// Corrects a locked board's offset and drift by a measured error
+    /// (output samples ahead of the reference) on a copy whose output 0 is
+    /// its pair `first`; each measurement is good to a fraction of a
+    /// microsecond.
+    fn adjust(&mut self, board: usize, first: f64, delta: f64) {
+        let error = delta / FACTOR as f64; // pairs
+        let b = &mut self.boards[board];
+        if let Some((offset, drift, anchor)) = b.relative {
+            let gain = if b.matches < SYNC_ALIGNED_AFTER { 0.5 } else { 0.3 };
+            let current = offset + drift * (first - anchor);
+            let span = (first - anchor).max(0.1 * BOARD_RATE);
+            b.relative = Some((current - gain * error, drift - 0.05 * error / span, first));
+            b.matches += 1;
         }
     }
 
@@ -623,8 +1003,8 @@ mod tests {
 
     #[test]
     fn positions_are_dealt_round() {
-        assert_eq!(position_mask(0, 1), 0);
-        let masks: Vec<u16> = (0..5).map(|i| position_mask(i, 5)).collect();
+        assert_eq!(position_mask(0, 1, None), 0);
+        let masks: Vec<u16> = (0..5).map(|i| position_mask(i, 5, None)).collect();
         assert_eq!(masks.iter().fold(0, |a, m| a | m), 0xFFFF);
         assert!(masks.iter().all(|m| m.count_ones() >= 3));
         // The advertising channels around 2441 MHz (offsets k = 7, -1, -7)
@@ -688,13 +1068,13 @@ mod tests {
         // Board 1's pair 0 was taken at 1 ms; a burst whose output 0 is
         // board pair 160 then starts at 1 ms + 10 us = output 80800.
         m.boards[1].start = Some(0.001);
-        m.boards[1].last_seen = 1.0; // no time for the estimate to creep
+        m.boards[1].window = 1.0; // not due to be steered at the arrival below
         let samples = vec![Complex32::new(1000.0, 0.0); 100];
         m.take(Event::Burst {
             board: 1,
             seen: t0 + Duration::from_secs(1),
             last: 0,
-            burst: Shaped { first: 160.0, samples },
+            burst: Shaped { first: 160.0, samples, offset: None, channel: None },
         });
         assert!(m.emit(1 << 17, &AtomicBool::new(true)));
         let out = rx.try_recv().unwrap();
@@ -703,5 +1083,203 @@ mod tests {
         assert_eq!(out[2 * 80899], 1000);
         assert_eq!(out[2 * 80900], 0);
         assert!(m.placed.is_empty());
+    }
+
+    #[test]
+    fn adv38_folds_to_a_shared_position() {
+        assert_eq!(fold_position(2426, 2441), Some(-1));
+        assert_eq!(fold_position(2402, 2441), Some(7));
+        assert_eq!(fold_position(2480, 2441), Some(-7));
+        assert_eq!(fold_position(2426, 2426), Some(0));
+        assert_eq!(fold_position(2434, 2426), None); // 8 MHz up: not reported
+        let masks: Vec<u16> = (0..5).map(|i| position_mask(i, 5, Some(-1))).collect();
+        assert!(masks.iter().all(|m| m >> 7 & 1 == 1));
+        assert_eq!(owner(-1, 5), 2);
+    }
+
+    /// A GFSK-like burst: random bits at 1 Mbit/s, 4 samples per bit,
+    /// +-250 kHz, with a phase and frequency offset, `pad` samples of noise
+    /// first, and a little noise throughout.
+    fn burst(bits: &[u8], pad: usize, phase: f32, cfo_hz: f32, seed: u32) -> Vec<Complex32> {
+        let mut state = seed;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32 - 0.5) * 20.0
+        };
+        let mut out = Vec::new();
+        for _ in 0..pad {
+            out.push(Complex32::new(noise(), noise()));
+        }
+        let mut ph = phase;
+        for &bit in bits {
+            for _ in 0..4 {
+                let f = if bit == 1 { 250e3 } else { -250e3 } + cfo_hz;
+                ph += 2.0 * std::f32::consts::PI * f / 4e6;
+                out.push(Complex32::new(1000.0 * ph.cos() + noise(), 1000.0 * ph.sin() + noise()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn copies_are_recognised_by_content() {
+        let mut state = 7u32;
+        let bits: Vec<u8> = (0..400)
+            .map(|_| {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                (state >> 16) as u8 & 1
+            })
+            .collect();
+        let reference = burst(&bits, 40, 0.3, 1000.0, 1);
+        // The same packet opened 23 samples later by another receiver.
+        let other = burst(&bits, 63, 2.0, -3000.0, 2);
+        let lag = content_lag(&reference, &other).unwrap();
+        assert!((lag - 23.0).abs() < 0.3, "lag {}", lag);
+        // A different packet is not taken for a copy.
+        let different: Vec<u8> = bits.iter().rev().copied().collect();
+        assert!(content_lag(&reference, &burst(&different, 40, 0.0, 0.0, 3)).is_none());
+    }
+
+    #[test]
+    fn boards_are_pulled_onto_the_reference() {
+        let (tx, _rx) = bounded::<Vec<i16>>(16);
+        let t0 = Instant::now();
+        let mut m = Merger::new(3, t0, tx);
+        m.sync = Some((-1, 0));
+        m.reference = Some(0);
+        for b in &mut m.boards {
+            b.start = Some(1.0);
+            b.window = 2.0; // not due to be steered at the arrivals below
+        }
+        // Board 2's clock reads 4 ms late: its copies land 320000 samples
+        // after the reference's. Each copy is a different packet.
+        m.boards[2].start = Some(1.004);
+        let mut state = 99u32;
+        for n in 0..30 {
+            let bits: Vec<u8> = (0..300)
+                .map(|_| {
+                    state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                    (state >> 16) as u8 & 1
+                })
+                .collect();
+            let first = 1_000_000.0 * (n + 1) as f64;
+            let seen = t0 + Duration::from_secs(2);
+            let copy = |pad: usize, seed: u32| Shaped {
+                first: first - 4.0 * pad as f64, // opened `pad` channel samples (4 board pairs each) early
+                samples: vec![Complex32::new(1.0, 0.0); 4000],
+                offset: Some(-1),
+                channel: Some(burst(&bits, pad, seed as f32, 500.0 * seed as f32, seed)),
+            };
+            m.take(Event::Burst { board: 0, seen, last: 0, burst: copy(40, 1) });
+            m.take(Event::Burst { board: 2, seen, last: 0, burst: copy(40 + (n % 7) as usize, 2) });
+        }
+        // Aligned to well under a microsecond, and only the reference's
+        // copies kept once locked on (the first few are kept from both).
+        // The same burst carries the same pair number on both boards, so
+        // board 2's samples must map onto the reference's own.
+        let offset = m.reference_pair(2, 1e7, 2.0) - 1e7;
+        assert!(offset.abs() < 8.0, "offset {} pairs", offset);
+        assert!(m.boards[2].matches >= SYNC_ALIGNED_AFTER);
+        assert_eq!(m.placed.iter().filter(|p| p.board == 0).count(), 30);
+        assert!(m.placed.iter().filter(|p| p.board == 2).count() <= SYNC_AGREEING);
+    }
+
+    #[test]
+    fn repeated_advertisements_do_not_mislead() {
+        // One advertiser repeats the same packet every 20 ms; board 2 reads
+        // 13 ms late, so its copies sit nearer the next broadcast (7 ms)
+        // than their own. Other advertisers' packets now and then settle it.
+        let (tx, _rx) = bounded::<Vec<i16>>(16);
+        let t0 = Instant::now();
+        let mut m = Merger::new(3, t0, tx);
+        m.sync = Some((-1, 0));
+        m.reference = Some(0);
+        for b in &mut m.boards {
+            b.start = Some(1.0);
+            b.window = 2.0; // not due to be steered at the arrivals below
+        }
+        m.boards[2].start = Some(1.013);
+        let seen = t0 + Duration::from_secs(2);
+        let mut state = 5u32;
+        let mut bits = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                    (state >> 16) as u8 & 1
+                })
+                .collect()
+        };
+        let beacon = bits(300);
+        let copy = |first: f64, b: &[u8], seed: u32| Shaped {
+            first,
+            samples: vec![Complex32::new(1.0, 0.0); 4000],
+            offset: Some(-1),
+            channel: Some(burst(b, 40, seed as f32, 0.0, seed)),
+        };
+        for n in 0..40 {
+            let first = 320_000.0 * (n + 1) as f64; // every 20 ms
+            let content = if n % 5 == 4 { bits(300) } else { beacon.clone() };
+            // Either copy may arrive first.
+            let (a, b) = (copy(first, &content, 1), copy(first, &content, 2));
+            if n % 2 == 0 {
+                m.take(Event::Burst { board: 0, seen, last: 0, burst: a });
+                m.take(Event::Burst { board: 2, seen, last: 0, burst: b });
+            } else {
+                m.take(Event::Burst { board: 2, seen, last: 0, burst: b });
+                m.take(Event::Burst { board: 0, seen, last: 0, burst: a });
+            }
+        }
+        let offset = m.reference_pair(2, 1e7, 2.0) - 1e7;
+        assert!(offset.abs() < 16.0, "offset {} pairs", offset);
+    }
+
+    #[test]
+    fn start_estimate_is_steered_not_snapped() {
+        let (tx, _rx) = bounded::<Vec<i16>>(16);
+        let t0 = Instant::now();
+        let mut m = Merger::new(1, t0, tx);
+        // The board's count began at 0.5 s; records arrive 2-12 ms after
+        // their last sample, and now and then one arrives after only 1 ms.
+        let mut state = 3u32;
+        let mut last_start = None;
+        let mut biggest_step: f64 = 0.0;
+        for n in 0..2000u64 {
+            let t = 0.5 + 0.01 * n as f64; // a record every 10 ms
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            let latency = if n % 97 == 0 { 0.001 } else { 0.002 + 0.01 * ((state >> 16) as f64 / 65536.0) };
+            let last = ((t - 0.5) * BOARD_RATE) as u64;
+            m.track(0, t0 + Duration::from_secs_f64(t + latency), last);
+            let start = m.own_start(0, t);
+            if t > 3.0 {
+                if let Some(prev) = last_start {
+                    biggest_step = biggest_step.max((start - prev as f64).abs());
+                }
+            }
+            last_start = Some(start);
+        }
+        // Within the latency floor of the truth, and never a jump: between
+        // records 10 ms apart it moves by no more than the fastest rate
+        // allows over that time and the arrival jitter (a few us), where a
+        // snapped estimate would move by milliseconds.
+        let start = last_start.unwrap();
+        assert!(start > 0.5 && start < 0.5 + 0.003, "start {}", start);
+        assert!(biggest_step < 3e-6, "step {}", biggest_step);
+    }
+
+    #[test]
+    fn timeline_follows_the_reference_count_not_host_time() {
+        let (tx, _rx) = bounded::<Vec<i16>>(16);
+        let t0 = Instant::now();
+        let mut m = Merger::new(1, t0, tx);
+        m.boards[0].start = Some(0.5);
+        let first = m.position(0, 1_000_000.0, 1.0);
+        // However the host-time estimate moves afterwards, bursts keep the
+        // spacing of the board's own count.
+        m.boards[0].start = Some(0.503);
+        m.boards[0].rate = 80e-6;
+        let second = m.position(0, 9_000_000.0, 9.0);
+        assert_eq!(second - first, 8_000_000 * FACTOR as i64);
     }
 }

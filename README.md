@@ -355,8 +355,16 @@ At 2441 MHz all three advertising channels are heard (they fold to
 different positions); five ESPs on one USB hub, four on their PCB antennas,
 received 815 advertising packets with a valid CRC in 28 s (301 on channel
 37, 353 on 38, 161 on 39). `BD_ESPDR_GAINS` sets each board's gain in board
-order; with a single antenna feeding every board through a splitter they
-would all hear the same signal. Classic BR/EDR packets decode at every
+order: about 52 for a board on its PCB antenna, about 40 for one with an
+external antenna (it clips at 52); with a single antenna feeding every board
+through a splitter they would all hear the same signal.
+
+Every board also sends the bursts at one shared position (where channel 38
+folds), so each board's sample clock is measured against a reference board's
+from the same packets, to a fraction of a microsecond, and followed as the
+crystals drift. The output timeline is the reference board's own sample
+count, so packets from all the boards keep the slot timing a single receiver
+would give them, which Classic address recovery depends on. Classic BR/EDR packets decode at every
 folded frequency, since their whitening does not depend on the channel; a
 piconet sends on one channel at a time, so the repeats are dropped and each
 packet is reported once, though its reported channel may be any of the
