@@ -68,6 +68,8 @@ const STREAM_END: u16 = 3;
 const STREAM_NARROW: u16 = 4;
 const STREAM_REJECT_WIDEBAND: u16 = 1;
 const STREAM_CHANNELIZE: u16 = 2;
+const STREAM_STATUS_USB_SOF: u32 = 0x8000;
+const STREAM_STATUS_USB_FRAME: u32 = 0x07FF;
 const STATUS_WORDS: usize = 8;
 /// Largest stretch of noise inserted for one gap (0.1 s at 16 Msps); a longer
 /// gap only happens across a restart, and its time is skipped.
@@ -234,7 +236,7 @@ enum Record {
     /// One channel of a burst at 4 Msps, mixed down by `offset` MHz
     /// (LO-minus-RF orientation, like the pairs).
     Narrow { start: u64, offset: i32, pairs: Vec<u32> },
-    Status { start: u64, words: [u32; STATUS_WORDS] },
+    Status { start: u64, usb_frame: Option<u16>, words: [u32; STATUS_WORDS] },
     End,
 }
 
@@ -309,7 +311,9 @@ impl EspLink {
                 if sum != u32::from_le_bytes(check) {
                     return Err("eSpDR: stream status check failed".to_string());
                 }
-                Ok(Record::Status { start, words })
+                let usb_frame = (flags & STREAM_STATUS_USB_SOF != 0)
+                    .then_some((flags & STREAM_STATUS_USB_FRAME) as u16);
+                Ok(Record::Status { start, usb_frame, words })
             }
             STREAM_END => {
                 self.read_exact(&mut check)?;
@@ -633,7 +637,7 @@ fn stream_loop(
                     return;
                 }
             }
-            Ok(Record::Status { start, words }) => {
+            Ok(Record::Status { start, usb_frame: _, words }) => {
                 let floor = f32::from_bits(words[0]);
                 if floor > 0.0 {
                     timeline.sigma = (floor / 2.0).sqrt() * SAMPLE_SCALE as f32;
