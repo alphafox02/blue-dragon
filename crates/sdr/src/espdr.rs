@@ -28,6 +28,14 @@
 //!
 //! Interface strings: `espdr` or `espdr0` (first ESP32-S3 USB serial port),
 //! `espdrN` (the Nth, sorted by serial path), or `espdr:/dev/ttyACM0`.
+//!
+//! An ESP at 16 Msps hears about 80 MHz around its LO folded into its 16 MHz
+//! window (the 80 Msps capture is decimated without filtering), so `-C 80`
+//! with `-i espdr` (every attached ESP) or a comma list (`espdr0,espdr2`)
+//! receives the whole folded band and lets the decoders sort out where each
+//! burst came from (see `multi`).
+
+mod multi;
 
 use crossbeam::channel::{bounded, Receiver, Sender, TrySendError};
 use std::io::{Read, Write};
@@ -223,6 +231,15 @@ impl EspLink {
     /// Starts burst streaming. Ok(false) if the firmware cannot stream (no
     /// command, or not at this sample rate).
     fn start_stream(&mut self, arg: u16) -> Result<bool, String> {
+        self.start_stream_masked(arg, 0)
+    }
+
+    /// Starts burst streaming of only the channel positions in `mask` (bit
+    /// k + 8 for offset k; 0 for all), passed as the argument's high half.
+    fn start_stream_masked(&mut self, arg: u16, mask: u16) -> Result<bool, String> {
+        if mask != 0 {
+            self.command(ESP_ARG_HIGH, mask)?;
+        }
         match self.request(ESP_STREAM, arg)? {
             (0, _) => Ok(true),
             (CTL_UNKNOWN_OP, _) | (CTL_NOT_READY, _) => Ok(false),
@@ -475,6 +492,53 @@ fn convert_snapshot(words: &[u32], rng: &mut u32) -> Vec<i16> {
     out
 }
 
+/// The ESP_STREAM argument from the environment, with whether it asks for
+/// channelized bursts and Wi-Fi rejection.
+fn stream_arg() -> (u16, bool, bool) {
+    let reject = std::env::var_os("BD_ESPDR_KEEP_WIDEBAND").is_none();
+    let channelize = std::env::var_os("BD_ESPDR_WIDE").is_none();
+    let arg = if reject { STREAM_REJECT_WIDEBAND } else { 0 }
+        | if channelize { STREAM_CHANNELIZE } else { 0 };
+    (arg, channelize, reject)
+}
+
+/// Opens the ESP at `path`, checks its firmware and tunes it. Returns the
+/// link and the LO actually tuned, in Hz.
+fn open_board(path: &str, rate_sel: u16, width: u16, gain_sel: u16, lo_hz: u32) -> Result<(EspLink, u32), String> {
+    let mut link = EspLink::open(path)?;
+    let id = link.handshake()?;
+    if id != CTL_ESP_FIRMWARE_ID {
+        return Err(format!("eSpDR: unexpected firmware id {:#010x} on {}", id, path));
+    }
+    if link.command(CTL_STATUS, ESP_STAT_RADIO)? != 0 {
+        return Err(format!("eSpDR: radio initialisation failed on the ESP at {}", path));
+    }
+    link.command(ESP_SET_RATE, rate_sel)?;
+    link.command(ESP_SET_WIDTH, width)?;
+    link.command(ESP_SET_GAIN, gain_sel)?;
+    let tuned = link.command32(ESP_SET_LO, lo_hz)?;
+    Ok((link, tuned))
+}
+
+/// Serial ports of the attached ESP32-S3 boards, sorted by path.
+fn esp_ports() -> Vec<String> {
+    let mut ports: Vec<String> = match std::fs::read_dir("/dev/serial/by-id") {
+        Ok(dir) => dir
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("usb-Espressif_USB_JTAG_serial_debug_unit"))
+            })
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    ports.sort();
+    ports
+}
+
 /// Finds the serial port for an interface string.
 fn resolve_port(iface: &str) -> Result<String, String> {
     if let Some(path) = iface.strip_prefix("espdr:") {
@@ -486,18 +550,7 @@ fn resolve_port(iface: &str) -> Result<String, String> {
             .parse()
             .map_err(|_| format!("invalid eSpDR interface: '{}'", iface))?,
     };
-    let mut ports: Vec<String> = std::fs::read_dir("/dev/serial/by-id")
-        .map_err(|_| "eSpDR: no USB serial devices found".to_string())?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("usb-Espressif_USB_JTAG_serial_debug_unit"))
-        })
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    ports.sort();
+    let ports = esp_ports();
     ports.get(index).cloned().ok_or_else(|| {
         format!(
             "eSpDR: no ESP32-S3 USB serial port #{} ({} found)",
@@ -622,6 +675,9 @@ impl EspdrHandle {
     /// `sample_rate` must be 16 or 80 Msps; `gain` is the ESP gain-table
     /// selector (0..127, not dB; about 24..30 suits a nearby antenna).
     pub fn open(iface: &str, sample_rate: u32, center_freq: u64, gain: i32) -> Result<Self, String> {
+        if let Some(paths) = multi::boards_for(iface, sample_rate)? {
+            return multi::open(&paths, center_freq, gain);
+        }
         let (rate_sel, width) = match sample_rate {
             16_000_000 => (1u16, 20u16),
             80_000_000 => (0u16, 40u16),
@@ -633,24 +689,9 @@ impl EspdrHandle {
             }
         };
         let path = resolve_port(iface)?;
-        let mut link = EspLink::open(&path)?;
-
-        let id = link.handshake()?;
-        if id != CTL_ESP_FIRMWARE_ID {
-            return Err(format!("eSpDR: unexpected firmware id {:#010x} on {}", id, path));
-        }
-        if link.command(CTL_STATUS, ESP_STAT_RADIO)? != 0 {
-            return Err("eSpDR: radio initialisation failed on the ESP".to_string());
-        }
-        link.command(ESP_SET_RATE, rate_sel)?;
-        link.command(ESP_SET_WIDTH, width)?;
         let gain_sel = gain.clamp(0, 127) as u16;
-        link.command(ESP_SET_GAIN, gain_sel)?;
-        let lo_hz = link.command32(ESP_SET_LO, center_freq as u32)?;
-        let reject = std::env::var_os("BD_ESPDR_KEEP_WIDEBAND").is_none();
-        let channelize = std::env::var_os("BD_ESPDR_WIDE").is_none();
-        let stream_arg = if reject { STREAM_REJECT_WIDEBAND } else { 0 }
-            | if channelize { STREAM_CHANNELIZE } else { 0 };
+        let (mut link, lo_hz) = open_board(&path, rate_sel, width, gain_sel, center_freq as u32)?;
+        let (stream_arg, channelize, reject) = stream_arg();
         let force_snapshot = std::env::var_os("BD_ESPDR_SNAPSHOT").is_some();
         let streaming = !force_snapshot && link.start_stream(stream_arg)?;
         if !streaming {
@@ -758,6 +799,10 @@ impl EspdrHandle {
 impl Drop for EspdrHandle {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        // Close the channel first, so a thread blocked handing over a chunk
+        // sees the pipeline has gone instead of waiting for it.
+        let (_, closed) = bounded(1);
+        drop(std::mem::replace(&mut self.rx, closed));
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
