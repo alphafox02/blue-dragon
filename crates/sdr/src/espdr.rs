@@ -529,7 +529,12 @@ fn open_board(
     filter: u16,
 ) -> Result<(EspLink, u32), String> {
     let mut link = EspLink::open(path)?;
-    let id = link.handshake()?;
+    let id = link.handshake().map_err(|e| {
+        format!(
+            "{} (the ESP at {} did not answer: load the firmware into its RAM again, or power-cycle it)",
+            e, path
+        )
+    })?;
     if id != CTL_ESP_FIRMWARE_ID {
         return Err(format!("eSpDR: unexpected firmware id {:#010x} on {}", id, path));
     }

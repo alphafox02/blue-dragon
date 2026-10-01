@@ -250,17 +250,35 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
     } else {
         None
     };
+    // Set every board up before any starts streaming, and start them all
+    // before any is handed to a thread, so that a board that fails leaves
+    // none of the others streaming with no one to read or stop it.
+    let mut boards = Vec::with_capacity(count);
     for (index, path) in paths.iter().enumerate() {
         let offset = if folded { 0 } else { tile_offset_half_mhz(index, count) };
         let lo = (center_freq as i64 + offset * HALF_MHZ_HZ) as u32;
-        let (mut link, tuned) = open_board(path, 1, 20, gains[index], lo, filter)?;
+        let (link, tuned) = open_board(path, 1, 20, gains[index], lo, filter)?;
         if offset == 0 {
             lo_hz = tuned;
         }
         let mask = if folded && channelize { position_mask(index, count, sync) } else { 0 };
-        if !link.start_stream_masked(stream_arg, mask)? {
-            return Err(format!("eSpDR: the ESP at {} cannot stream; load the current firmware", path));
+        boards.push((index, path, link, offset, mask, tuned));
+    }
+    for started in 0..boards.len() {
+        let (_, path, link, _, mask, _) = &mut boards[started];
+        let failure = match link.start_stream_masked(stream_arg, *mask) {
+            Ok(true) => None,
+            Ok(false) => Some(format!("eSpDR: the ESP at {} cannot stream; load the current firmware", path)),
+            Err(e) => Some(e),
+        };
+        if let Some(e) = failure {
+            for (_, _, link, _, _, _) in &mut boards[..started] {
+                link.stop_stream();
+            }
+            return Err(e);
         }
+    }
+    for (index, path, link, offset, mask, tuned) in boards {
         eprintln!(
             "eSpDR: board {} {} LO {:.6} MHz, gain selector {}, channel positions {:#06x}",
             index,
