@@ -356,9 +356,14 @@ different positions); five ESPs on one USB hub, four on their PCB antennas,
 received 815 advertising packets with a valid CRC in 28 s (301 on channel
 37, 353 on 38, 161 on 39). `BD_ESPDR_GAINS` sets each board's gain in board
 order; with a single antenna feeding every board through a splitter they
-would all hear the same signal. Classic BR/EDR packets decode the same way,
-but their whitening does not depend on the channel, so each appears at every
-folded frequency.
+would all hear the same signal. Classic BR/EDR packets decode at every
+folded frequency, since their whitening does not depend on the channel; a
+piconet sends on one channel at a time, so the repeats are dropped and each
+packet is reported once, though its reported channel may be any of the
+folds. A BLE packet that fails its CRC is likewise dropped when a copy at
+another fold passes (failing packets are held about 30 ms for this). With
+an `l2ping` flood between two Classic devices, five ESPs reported about
+10,000 distinct Classic packets in 37 s alongside the BLE advertising.
 
 ### Feature Flags
 

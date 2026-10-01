@@ -853,16 +853,31 @@ impl Piconet {
     }
 }
 
+/// How close in time two Classic decodes must be to be one transmission
+/// (they share the sync word's timing).
+const FOLD_WINDOW_NS: i64 = 10_000;
+
 #[derive(Default)]
 pub struct PiconetTracker {
     map: HashMap<u32, Piconet>,
+    /// Recent packets, for `is_fold_copy`.
+    fold: crate::fold::FoldMemory,
 }
 
 impl PiconetTracker {
     pub fn new() -> Self {
         PiconetTracker {
             map: HashMap::new(),
+            fold: crate::fold::FoldMemory::new(),
         }
+    }
+
+    /// True if `pkt` repeats a packet already seen within a few
+    /// microseconds on a channel a multiple of 16 MHz away: the same
+    /// transmission through a receiver that aliases (see `crate::fold`). The
+    /// first decode is kept; its channel may be any of the folds.
+    pub fn is_fold_copy(&mut self, pkt: &ClassicBtPacket) -> bool {
+        self.fold.seen(pkt.lap, pkt.freq, &pkt.timestamp, FOLD_WINDOW_NS)
     }
 
     /// Feed one header for a LAP. Returns the UAP once only one value is left
