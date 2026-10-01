@@ -3,21 +3,24 @@
 //! ESP32-S3 receiver using the eSpDR radio firmware, over the ESP's own
 //! USB Serial/JTAG port (no FPGA link).
 //!
-//! The ESP must be running the eSpDR firmware with the one-shot snapshot
-//! command, loaded into RAM with `esptool load-ram`. The firmware fills a
-//! 16384-pair ring from the radio's sample-dump engine and sends it over
-//! USB; this backend requests snapshots in a loop and turns them into the
-//! interleaved int16 stream the pipeline expects:
+//! The ESP must run the eSpDR firmware with the USB modes of the
+//! alphafox02/eSpDR fork, loaded into RAM with `esptool load-ram`. USB Full
+//! Speed carries far less than the radio produces, so the firmware sends
+//! only part of it, in one of two ways:
 //!
-//! * eSpDR's I + jQ uses the LO-minus-RF convention, so samples are
-//!   conjugated to the usual RF-minus-LO orientation;
-//! * the 10-bit values are scaled by 64 toward int16 full scale;
-//! * the time between snapshots is filled with noise at the measured floor,
-//!   so a burst detector resets at every seam.
+//! * stream (preferred): the ESP watches a 16 MHz window continuously and
+//!   sends each burst above the noise floor, timestamped in samples. The
+//!   backend places bursts on a true timeline and fills the gaps with noise
+//!   at the reported floor. Bursts whose envelope fluctuates like OFDM
+//!   (Wi-Fi) are dropped on the ESP unless `BD_ESPDR_KEEP_WIDEBAND` is set.
+//! * snapshot (fallback, for firmware without streaming, at 80 Msps, or with
+//!   `BD_ESPDR_SNAPSHOT` set): the
+//!   ESP sends about 1 ms of samples per request, and snapshots are joined
+//!   with short noise gaps, so sample time runs faster than wall-clock time.
 //!
-//! USB bandwidth limits this to roughly 1 ms of samples per ~0.1 s, so the
-//! stream is a low-duty-cycle sampling of the band, and sample time runs
-//! faster than wall-clock time.
+//! Either way, eSpDR's I + jQ uses the LO-minus-RF convention, so samples
+//! are conjugated to the usual RF-minus-LO orientation, and the 10-bit
+//! values are scaled by 64 toward int16 full scale.
 //!
 //! Interface strings: `espdr` or `espdr0` (first ESP32-S3 USB serial port),
 //! `espdrN` (the Nth, sorted by serial path), or `espdr:/dev/ttyACM0`.
@@ -39,10 +42,23 @@ const ESP_SET_RATE: u8 = 21;
 const ESP_SET_WIDTH: u8 = 22;
 const ESP_SET_GAIN: u8 = 24;
 const ESP_SNAPSHOT: u8 = 40;
+const ESP_STREAM: u8 = 41;
 const ESP_STAT_RADIO: u16 = 13;
 const CTL_UNKNOWN_OP: u8 = 1;
+const CTL_NOT_READY: u8 = 4;
 const CTL_ESP_FIRMWARE_ID: u32 = 0x4951_5305;
 const SNAP_MAGIC: u32 = 0x5041_4E53;
+const STREAM_MAGIC: u32 = 0x5453_5242;
+const STREAM_BURST: u16 = 1;
+const STREAM_STATUS: u16 = 2;
+const STREAM_END: u16 = 3;
+const STREAM_REJECT_WIDEBAND: u16 = 1;
+const STATUS_WORDS: usize = 8;
+/// Largest stretch of noise inserted for one gap (0.1 s at 16 Msps); a longer
+/// gap only happens across a restart, and its time is skipped.
+const MAX_GAP_PAIRS: u64 = 1_600_000;
+/// Pairs per chunk handed to the pipeline.
+const CHUNK_PAIRS: usize = 32768;
 
 /// Noise-filled pairs placed between snapshots.
 const GAP_PAIRS: usize = 2048;
@@ -184,6 +200,187 @@ impl EspLink {
     }
 }
 
+/// One record of the ESP's burst stream.
+enum Record {
+    Burst { start: u64, pairs: Vec<u32> },
+    Status { start: u64, words: [u32; STATUS_WORDS] },
+    End,
+}
+
+impl EspLink {
+    /// Starts burst streaming. Ok(false) if the firmware cannot stream (no
+    /// command, or not at this sample rate).
+    fn start_stream(&mut self, arg: u16) -> Result<bool, String> {
+        match self.request(ESP_STREAM, arg)? {
+            (0, _) => Ok(true),
+            (CTL_UNKNOWN_OP, _) | (CTL_NOT_READY, _) => Ok(false),
+            (status, _) => Err(format!("eSpDR: stream failed with status {}", status)),
+        }
+    }
+
+    /// Reads the next stream record, resynchronising on the magic if needed.
+    fn next_record(&mut self) -> Result<Record, String> {
+        let mut window = [0u8; 4];
+        self.read_exact(&mut window)?;
+        while u32::from_le_bytes(window) != STREAM_MAGIC {
+            window.copy_within(1.., 0);
+            self.read_exact(&mut window[3..])?;
+        }
+        let mut header = [0u8; 20];
+        self.read_exact(&mut header)?;
+        let word = |i: usize| u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]);
+        let kind = (word(0) & 0xFFFF) as u16;
+        let start = word(8) as u64 | (word(12) as u64) << 32;
+        let length = word(16) as usize;
+        let mut check = [0u8; 4];
+        match kind {
+            STREAM_BURST => {
+                let mut payload = vec![0u8; length.div_ceil(2) * 5];
+                self.read_exact(&mut payload)?;
+                self.read_exact(&mut check)?;
+                let mut pairs = Vec::with_capacity(length + 1);
+                for g in payload.chunks_exact(5) {
+                    let lo = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+                    pairs.push(lo & 0xF_FFFF);
+                    pairs.push(lo >> 20 | (g[4] as u32) << 12);
+                }
+                let sum = pairs.iter().fold(0u32, |a, &p| a.wrapping_add(p));
+                if sum != u32::from_le_bytes(check) {
+                    return Err("eSpDR: stream burst check failed".to_string());
+                }
+                pairs.truncate(length);
+                Ok(Record::Burst { start, pairs })
+            }
+            STREAM_STATUS => {
+                let mut payload = [0u8; STATUS_WORDS * 4];
+                self.read_exact(&mut payload)?;
+                self.read_exact(&mut check)?;
+                let mut words = [0u32; STATUS_WORDS];
+                for (w, b) in words.iter_mut().zip(payload.chunks_exact(4)) {
+                    *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                }
+                let sum = words.iter().fold(0u32, |a, &w| a.wrapping_add(w));
+                if sum != u32::from_le_bytes(check) {
+                    return Err("eSpDR: stream status check failed".to_string());
+                }
+                Ok(Record::Status { start, words })
+            }
+            STREAM_END => {
+                self.read_exact(&mut check)?;
+                Ok(Record::End)
+            }
+            _ => Err(format!("eSpDR: unknown stream record type {}", kind)),
+        }
+    }
+
+    /// Stops the stream and reads up to its END record.
+    fn stop_stream(&mut self) {
+        let _ = self.port.write_all(&[0]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match self.next_record() {
+                Ok(Record::End) => return,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        self.drain();
+    }
+}
+
+/// Places stream bursts on a continuous timeline, filling the gaps with noise
+/// at the reported floor, and hands the result to the pipeline in chunks.
+struct Timeline {
+    tx: Sender<Vec<i16>>,
+    /// Output sample index of the current stream's pair 0.
+    base: u64,
+    /// Output samples produced so far.
+    emitted: u64,
+    /// Noise standard deviation per component, in output units.
+    sigma: f32,
+    noise: Vec<f32>,
+    noise_pos: usize,
+}
+
+impl Timeline {
+    fn new(tx: Sender<Vec<i16>>) -> Self {
+        // Unit-variance Gaussian noise (Box-Muller), reused cyclically.
+        let mut state = 0x9E37_79B9u32;
+        let mut uniform = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 + 1.0) / (u32::MAX as f32 + 2.0)
+        };
+        let mut noise = Vec::with_capacity(1 << 16);
+        while noise.len() < 1 << 16 {
+            let r = (-2.0 * uniform().ln()).sqrt();
+            let theta = 2.0 * std::f32::consts::PI * uniform();
+            noise.push(r * theta.cos());
+            noise.push(r * theta.sin());
+        }
+        Self { tx, base: 0, emitted: 0, sigma: 4.0 * SAMPLE_SCALE as f32, noise, noise_pos: 0 }
+    }
+
+    fn send(&self, chunk: Vec<i16>) -> bool {
+        self.tx.send(chunk).is_ok()
+    }
+
+    /// Fills with noise up to output index `target`. False once the pipeline
+    /// has gone away.
+    fn fill_to(&mut self, target: u64) -> bool {
+        if target > self.emitted + MAX_GAP_PAIRS {
+            self.emitted = target - MAX_GAP_PAIRS;
+        }
+        while self.emitted < target {
+            let n = ((target - self.emitted) as usize).min(CHUNK_PAIRS);
+            let mut chunk = Vec::with_capacity(2 * n);
+            for _ in 0..2 * n {
+                chunk.push((self.noise[self.noise_pos] * self.sigma) as i16);
+                self.noise_pos = (self.noise_pos + 1) & (self.noise.len() - 1);
+            }
+            self.emitted += n as u64;
+            if !self.send(chunk) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Adds a burst that starts at stream pair `start`.
+    fn burst(&mut self, start: u64, pairs: &[u32]) -> bool {
+        let at = self.base + start;
+        if !self.fill_to(at) {
+            return false;
+        }
+        let skip = (self.emitted.saturating_sub(at) as usize).min(pairs.len());
+        for piece in pairs[skip..].chunks(CHUNK_PAIRS) {
+            if !self.send(convert_pairs(piece)) {
+                return false;
+            }
+        }
+        self.emitted = self.emitted.max(at + pairs.len() as u64);
+        true
+    }
+
+    /// Continues the timeline across a stream restart.
+    fn restart(&mut self) {
+        self.base = self.emitted;
+    }
+}
+
+/// Converts 20-bit dump pairs to conjugated, scaled int16 I/Q.
+fn convert_pairs(pairs: &[u32]) -> Vec<i16> {
+    let mut out = Vec::with_capacity(2 * pairs.len());
+    for &w in pairs {
+        let i = ((w & 1023) ^ 512) as i32 - 512;
+        let q = (((w >> 10) & 1023) ^ 512) as i32 - 512;
+        out.push((i * SAMPLE_SCALE).clamp(-32768, 32767) as i16);
+        out.push((-q * SAMPLE_SCALE).clamp(-32768, 32767) as i16);
+    }
+    out
+}
+
 /// Converts dump words to conjugated, scaled int16 pairs, followed by a
 /// noise-filled gap at the snapshot's measured noise floor.
 fn convert_snapshot(words: &[u32], rng: &mut u32) -> Vec<i16> {
@@ -253,6 +450,98 @@ fn resolve_port(iface: &str) -> Result<String, String> {
     })
 }
 
+/// Receives the burst stream until stopped. Gain changes stop the stream,
+/// apply the setting and restart it, continuing the timeline.
+fn stream_loop(
+    mut link: EspLink,
+    tx: Sender<Vec<i16>>,
+    gain_rx: Receiver<u8>,
+    running: &AtomicBool,
+    overflow: &AtomicU64,
+    arg: u16,
+) {
+    let mut timeline = Timeline::new(tx);
+    while running.load(Ordering::Relaxed) {
+        if let Ok(gain) = gain_rx.try_recv() {
+            link.stop_stream();
+            if let Err(e) = link.command(ESP_SET_GAIN, gain as u16) {
+                eprintln!("{}", e);
+            }
+            match link.start_stream(arg) {
+                Ok(true) => timeline.restart(),
+                Ok(false) => return,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    return;
+                }
+            }
+        }
+        match link.next_record() {
+            Ok(Record::Burst { start, pairs }) => {
+                if !timeline.burst(start, &pairs) {
+                    return;
+                }
+            }
+            Ok(Record::Status { start, words }) => {
+                let floor = f32::from_bits(words[0]);
+                if floor > 0.0 {
+                    timeline.sigma = (floor / 2.0).sqrt() * SAMPLE_SCALE as f32;
+                }
+                // Bursts the ESP dropped for queue space, plus blocks skipped
+                // when it fell behind.
+                overflow.store(words[3] as u64 + words[5] as u64, Ordering::Relaxed);
+                if !timeline.fill_to(timeline.base + start) {
+                    return;
+                }
+            }
+            Ok(Record::End) => return,
+            Err(e) => {
+                // A corrupted record: resynchronise by restarting the stream.
+                eprintln!("{}", e);
+                link.stop_stream();
+                match link.start_stream(arg) {
+                    Ok(true) => timeline.restart(),
+                    _ => return,
+                }
+            }
+        }
+    }
+    link.stop_stream();
+}
+
+/// Requests snapshots until stopped (firmware without streaming).
+fn snapshot_loop(
+    mut link: EspLink,
+    tx: Sender<Vec<i16>>,
+    gain_rx: Receiver<u8>,
+    running: &AtomicBool,
+    overflow: &AtomicU64,
+) {
+    let mut rng = 0x1234_5678u32;
+    while running.load(Ordering::Relaxed) {
+        if let Ok(g) = gain_rx.try_recv() {
+            if let Err(e) = link.command(ESP_SET_GAIN, g as u16) {
+                eprintln!("{}", e);
+            }
+        }
+        let words = match link.snapshot() {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("{}", e);
+                link.drain();
+                continue;
+            }
+        };
+        match tx.try_send(convert_snapshot(&words, &mut rng)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                overflow.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => break,
+        }
+    }
+}
+
 pub struct EspdrHandle {
     rx: Receiver<Vec<i16>>,
     pending: Vec<i16>,
@@ -266,7 +555,8 @@ pub struct EspdrHandle {
 }
 
 impl EspdrHandle {
-    /// Opens the ESP, configures the receiver and starts the snapshot thread.
+    /// Opens the ESP, configures the receiver and starts receiving, streaming
+    /// bursts if the firmware supports it and falling back to snapshots.
     /// `sample_rate` must be 16 or 80 Msps; `gain` is the ESP gain-table
     /// selector (0..127, not dB; about 24..30 suits a nearby antenna).
     pub fn open(iface: &str, sample_rate: u32, center_freq: u64, gain: i32) -> Result<Self, String> {
@@ -295,17 +585,30 @@ impl EspdrHandle {
         let gain_sel = gain.clamp(0, 127) as u16;
         link.command(ESP_SET_GAIN, gain_sel)?;
         let lo_hz = link.command32(ESP_SET_LO, center_freq as u32)?;
-        // Verify the snapshot command before committing to the stream.
-        link.snapshot()?;
+        let reject = std::env::var_os("BD_ESPDR_KEEP_WIDEBAND").is_none();
+        let stream_arg = if reject { STREAM_REJECT_WIDEBAND } else { 0 };
+        let force_snapshot = std::env::var_os("BD_ESPDR_SNAPSHOT").is_some();
+        let streaming = !force_snapshot && link.start_stream(stream_arg)?;
+        if !streaming {
+            // Older firmware, or 80 Msps: verify snapshots before relying on them.
+            link.snapshot()?;
+        }
         eprintln!(
-            "eSpDR: {} LO {:.6} MHz, {} Msps, gain selector {}",
+            "eSpDR: {} LO {:.6} MHz, {} Msps, gain selector {}, {}",
             path,
             lo_hz as f64 / 1e6,
             sample_rate / 1_000_000,
-            gain_sel
+            gain_sel,
+            if !streaming {
+                "snapshot mode"
+            } else if reject {
+                "streaming bursts (Wi-Fi rejected)"
+            } else {
+                "streaming bursts"
+            }
         );
 
-        let (tx, rx) = bounded::<Vec<i16>>(32);
+        let (tx, rx) = bounded::<Vec<i16>>(64);
         let (gain_tx, gain_rx) = bounded::<u8>(4);
         let running = Arc::new(AtomicBool::new(true));
         let overflow = Arc::new(AtomicU64::new(0));
@@ -315,28 +618,10 @@ impl EspdrHandle {
             std::thread::Builder::new()
                 .name("espdr-recv".to_string())
                 .spawn(move || {
-                    let mut rng = 0x1234_5678u32;
-                    while running.load(Ordering::Relaxed) {
-                        if let Ok(g) = gain_rx.try_recv() {
-                            if let Err(e) = link.command(ESP_SET_GAIN, g as u16) {
-                                eprintln!("{}", e);
-                            }
-                        }
-                        let words = match link.snapshot() {
-                            Ok(w) => w,
-                            Err(e) => {
-                                eprintln!("{}", e);
-                                link.drain();
-                                continue;
-                            }
-                        };
-                        match tx.try_send(convert_snapshot(&words, &mut rng)) {
-                            Ok(()) => {}
-                            Err(TrySendError::Full(_)) => {
-                                overflow.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(TrySendError::Disconnected(_)) => break,
-                        }
+                    if streaming {
+                        stream_loop(link, tx, gain_rx, &running, &overflow, stream_arg);
+                    } else {
+                        snapshot_loop(link, tx, gain_rx, &running, &overflow);
                     }
                 })
                 .map_err(|e| format!("eSpDR: cannot start receive thread: {}", e))?
@@ -346,7 +631,7 @@ impl EspdrHandle {
             rx,
             pending: Vec::new(),
             pending_offset: 0,
-            max_samps: 32768,
+            max_samps: CHUNK_PAIRS,
             running,
             overflow,
             gain_tx,
@@ -375,7 +660,7 @@ impl EspdrHandle {
             written += n;
             self.pending_offset += n;
             if self.pending_offset >= self.pending.len() {
-                break; // return one snapshot at a time
+                break; // return one chunk at a time
             }
         }
         written / 2
@@ -390,7 +675,9 @@ impl EspdrHandle {
         self.max_samps
     }
 
-    /// Snapshots dropped because the pipeline fell behind.
+    /// Data lost before reaching the pipeline: in stream mode, bursts the ESP
+    /// dropped plus blocks it skipped; in snapshot mode, snapshots dropped
+    /// because the pipeline fell behind.
     pub fn overflow_count(&self) -> u64 {
         self.overflow.load(Ordering::Relaxed)
     }
@@ -436,5 +723,48 @@ mod tests {
     fn interface_with_explicit_path() {
         assert_eq!(resolve_port("espdr:/dev/ttyACM3").unwrap(), "/dev/ttyACM3");
         assert!(resolve_port("espdrX").is_err());
+    }
+    fn drain(rx: &Receiver<Vec<i16>>) -> Vec<i16> {
+        let mut all = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            all.extend(chunk);
+        }
+        all
+    }
+
+    #[test]
+    fn timeline_places_bursts_on_sample_time() {
+        let (tx, rx) = bounded::<Vec<i16>>(1024);
+        let mut t = Timeline::new(tx);
+        let burst = [100u32; 10]; // I = 100, Q = 0
+        assert!(t.burst(100, &burst));
+        let out = drain(&rx);
+        assert_eq!(out.len(), 2 * 110);
+        assert_eq!(out[2 * 100], 100 * 64); // the burst starts exactly at pair 100
+        assert_eq!(t.emitted, 110);
+    }
+
+    #[test]
+    fn timeline_trims_overlap_and_continues_after_restart() {
+        let (tx, rx) = bounded::<Vec<i16>>(1024);
+        let mut t = Timeline::new(tx);
+        assert!(t.burst(0, &[1u32; 20]));
+        assert!(t.burst(15, &[2u32; 10])); // overlaps the first by 5 pairs
+        assert_eq!(t.emitted, 25);
+        t.restart(); // a new stream counts from 0 again
+        assert!(t.burst(5, &[3u32; 1]));
+        assert_eq!(t.emitted, 31);
+        let out = drain(&rx);
+        assert_eq!(out.len(), 2 * 31);
+        assert_eq!(out[2 * 30], 3 * 64);
+    }
+
+    #[test]
+    fn timeline_caps_long_gaps() {
+        let (tx, rx) = bounded::<Vec<i16>>(4096);
+        let mut t = Timeline::new(tx);
+        assert!(t.fill_to(MAX_GAP_PAIRS * 3));
+        assert_eq!(t.emitted, MAX_GAP_PAIRS * 3);
+        assert_eq!(drain(&rx).len() as u64, 2 * MAX_GAP_PAIRS);
     }
 }
