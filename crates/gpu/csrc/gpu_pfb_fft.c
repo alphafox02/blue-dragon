@@ -501,7 +501,11 @@ float *gpu_pfb_submit(void) {
 }
 
 float *gpu_pfb_flush(void) {
-    /* Get the last submitted batch's result */
+    /* Get the last submitted batch's result; there is none if no batch was
+     * ever submitted (stopped before the first one filled), and waiting for
+     * one would never return. */
+    if (first_submit)
+        return NULL;
     return wait_for_result();
 }
 
