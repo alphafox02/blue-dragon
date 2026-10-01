@@ -374,6 +374,17 @@ and Classic packets at their true channels (15,000 in 38 s during an
 LOs received 5,968 Classic packets and all four former boundary channels
 (2417, 2433, 2449 and 2465 MHz).
 
+Current eSpDR firmware also latches each board's sample count on common USB
+start-of-frame boundaries (every device below one USB host sees the same
+1 ms frame numbers). blue-dragon fits those observations to the reference
+board, removing USB arrival latency from tiled timing and tracking the
+crystals' drift (here -3 to +2 ppm). On the five-board hub the boards'
+sample clocks agreed to 1.2-1.8 us RMS (under about 7 us peak). During an
+`l2ping` flood, the share of Classic packets within 7.5 us of their link's
+slot timing rose from about a fifth with arrival timing alone to all of
+them, and the link's UAP was recovered. Older firmware remains usable with
+arrival timing.
+
 **Folded.** With the filter open each ESP hears about 80 MHz around its LO
 folded into its window (flat to about 25 MHz from the LO, 5 dB down at 39,
 gone by 55), so a burst is known only to within a multiple of 16 MHz. Every

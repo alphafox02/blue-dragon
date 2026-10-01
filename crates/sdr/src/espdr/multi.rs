@@ -39,13 +39,16 @@
 //!
 //! A millisecond is too coarse for Classic Bluetooth, whose address and
 //! clock recovery compare packets slot by slot (625 us), and consecutive
-//! packets come from different boards. So every board also sends one shared
-//! position, where BLE advertising channel 38 folds: the same bursts arrive
-//! from every board. Their demodulated content gives each board's offset
-//! from a reference board to a fraction of a microsecond; once measured, a
-//! board's samples are mapped onto the reference's by that offset, tracked
-//! with its drift (the crystals differ by tens of ppm). Only one copy of each
-//! shared burst is kept.
+//! packets come from different boards. Current firmware therefore latches
+//! its sample count at USB start-of-frame boundaries. Every board below one
+//! host sees the same frame number; matching reports map each board onto the
+//! reference's sample count and track its crystal drift to a few microseconds.
+//!
+//! Folded boards can refine that further: every board also sends one shared
+//! position, where BLE advertising channel 38 folds, so the same bursts
+//! arrive from every board. Their demodulated content gives each board's
+//! offset from the reference to a fraction of a microsecond. Only one copy
+//! of each shared burst is kept.
 //!
 //! The output timeline is the reference board's own sample count, scaled to
 //! the output rate, so bursts keep exactly the spacing they were received
@@ -337,7 +340,7 @@ enum Event {
     /// A burst ready for the timeline, from a record received at `seen`
     /// whose last pair was board pair `last`.
     Burst { board: usize, seen: Instant, last: u64, burst: Shaped },
-    Status { board: usize, seen: Instant, at: u64, words: [u32; STATUS_WORDS] },
+    Status { board: usize, seen: Instant, at: u64, usb_frame: Option<u16>, words: [u32; STATUS_WORDS] },
     /// The board's stream restarted and counts from 0 again.
     Restart { board: usize },
 }
@@ -377,7 +380,9 @@ fn board_loop(
         }
         let event = match link.next_record() {
             Ok(Record::End) => return,
-            Ok(Record::Status { start, words }) => Event::Status { board, seen: Instant::now(), at: start, words },
+            Ok(Record::Status { start, usb_frame, words }) => {
+                Event::Status { board, seen: Instant::now(), at: start, usb_frame, words }
+            }
             Ok(Record::Narrow { start, offset, pairs }) => Event::Burst {
                 board,
                 seen: Instant::now(),
@@ -661,6 +666,17 @@ struct Board {
     /// While unlocked, the offsets (pairs) measured so far, each with the
     /// reference burst (its output sample) it was measured against.
     candidates: Vec<(f64, i64)>,
+    /// Recent USB SOF latches, and matched (own pair, reference-minus-own
+    /// pair) measurements used by tiled receivers.
+    usb_stamps: Vec<UsbStamp>,
+    usb_samples: Vec<(f64, f64)>,
+}
+
+#[derive(Clone, Copy)]
+struct UsbStamp {
+    frame: u16,
+    pair: f64,
+    seen: f64,
 }
 
 /// A burst placed on the output timeline.
@@ -712,6 +728,8 @@ impl Merger {
                 relative: None,
                 matches: 0,
                 candidates: Vec::new(),
+                usb_stamps: Vec::new(),
+                usb_samples: Vec::new(),
             })
             .collect();
         let mut state = 0x2545_F491u32;
@@ -824,6 +842,68 @@ impl Merger {
         b.start.map_or(0.0, |s| s + b.rate * (now - b.steered))
     }
 
+    /// Matches one board's sample count to the reference at a USB SOF. The
+    /// firmware reports only common 256-frame boundaries, and arrival time
+    /// distinguishes the same 11-bit frame number after its 2.048 s wrap.
+    fn usb_stamp(&mut self, board: usize, frame: u16, pair: u64, seen: Instant) {
+        // Leave older firmware on the existing host-time path. Seeing the
+        // extension opts this stream into board 0's sample timeline.
+        let reference = *self.reference.get_or_insert(0);
+        let stamp = UsbStamp { frame, pair: pair as f64, seen: seen.duration_since(self.t0).as_secs_f64() };
+        let stamps = &mut self.boards[board].usb_stamps;
+        stamps.push(stamp);
+        if stamps.len() > 16 {
+            stamps.remove(0);
+        }
+        let nearest = |stamps: &[UsbStamp], target: UsbStamp| {
+            stamps
+                .iter()
+                .copied()
+                .filter(|s| s.frame == target.frame && (s.seen - target.seen).abs() < 0.5)
+                .min_by(|a, b| (a.seen - target.seen).abs().total_cmp(&(b.seen - target.seen).abs()))
+        };
+        if board == reference {
+            let matches: Vec<(usize, UsbStamp)> = (0..self.boards.len())
+                .filter(|&b| b != reference)
+                .filter_map(|b| nearest(&self.boards[b].usb_stamps, stamp).map(|s| (b, s)))
+                .collect();
+            for (b, other) in matches {
+                self.measure_usb(b, other.pair, stamp.pair);
+            }
+        } else if let Some(r) = nearest(&self.boards[reference].usb_stamps, stamp) {
+            self.measure_usb(board, stamp.pair, r.pair);
+        }
+    }
+
+    /// Fits reference-minus-own pair offset and drift to recent USB SOF
+    /// matches. Regression averages the measured 1--2 us latch jitter while
+    /// retaining the boards' several-ppm crystal differences.
+    fn measure_usb(&mut self, board: usize, pair: f64, reference_pair: f64) {
+        let b = &mut self.boards[board];
+        if b.usb_samples.last().is_some_and(|&(p, _)| p == pair) {
+            return;
+        }
+        b.usb_samples.push((pair, reference_pair - pair));
+        if b.usb_samples.len() > 32 {
+            b.usb_samples.remove(0);
+        }
+        let n = b.usb_samples.len() as f64;
+        let mean_x = b.usb_samples.iter().map(|s| s.0).sum::<f64>() / n;
+        let mean_y = b.usb_samples.iter().map(|s| s.1).sum::<f64>() / n;
+        let variance = b.usb_samples.iter().map(|s| (s.0 - mean_x).powi(2)).sum::<f64>();
+        let drift = if variance > 0.0 {
+            b.usb_samples.iter().map(|s| (s.0 - mean_x) * (s.1 - mean_y)).sum::<f64>() / variance
+        } else {
+            0.0
+        };
+        let offset = mean_y + drift * (pair - mean_x);
+        b.relative = Some((offset, drift, pair));
+        b.matches = b.usb_samples.len() as u32;
+        if b.matches == 3 {
+            eprintln!("eSpDR: board {} aligned to USB frame clock", board);
+        }
+    }
+
     fn take(&mut self, event: Event) {
         match event {
             Event::Restart { board } => {
@@ -839,11 +919,18 @@ impl Merger {
                         b.relative = None;
                         b.matches = 0;
                         b.candidates.clear();
+                        b.usb_stamps.clear();
+                        b.usb_samples.clear();
                     }
                 }
             }
-            Event::Status { board, seen, at, words } => {
+            Event::Status { board, seen, at, usb_frame, words } => {
                 self.track(board, seen, at);
+                if self.sync.is_none() {
+                    if let Some(frame) = usb_frame {
+                        self.usb_stamp(board, frame, at, seen);
+                    }
+                }
                 let b = &mut self.boards[board];
                 let floor = f32::from_bits(words[0]);
                 if floor > 0.0 {
@@ -1357,6 +1444,37 @@ mod tests {
         m.boards[0].rate = 80e-6;
         let second = m.position(0, 9_000_000.0, 9.0);
         assert_eq!(second - first, 8_000_000 * FACTOR as i64);
+    }
+
+    #[test]
+    fn usb_frames_align_tiled_boards_and_track_drift() {
+        let (tx, _rx) = bounded::<Vec<i16>>(16);
+        let t0 = Instant::now();
+        let mut m = Merger::new(2, t0, tx);
+        m.reference = Some(0);
+        let mut last = (0.0, 0.0);
+        for n in 1..=40u64 {
+            let reference = 500_000.0 + n as f64 * 4_096_000.0;
+            let other = 1_000_000.0 + reference * (1.0 + 2e-6);
+            let jitter = [-20, 8, 17, -5, 0][n as usize % 5] as f64;
+            let frame = ((n * 256) & 0x7ff) as u16;
+            let seen = t0 + Duration::from_secs_f64(n as f64 * 0.256);
+            // Either board's record may reach the merger first. Frame-number
+            // wrap is harmless because arrival time selects the same event.
+            if n & 1 == 0 {
+                m.usb_stamp(0, frame, reference.round() as u64, seen);
+                m.usb_stamp(1, frame, (other + jitter).round() as u64, seen + Duration::from_millis(3));
+            } else {
+                m.usb_stamp(1, frame, (other + jitter).round() as u64, seen + Duration::from_millis(3));
+                m.usb_stamp(0, frame, reference.round() as u64, seen);
+            }
+            last = (reference, other);
+        }
+        let mapped = m.reference_pair(1, last.1, 10.0);
+        assert!((mapped - last.0).abs() < 5.0, "mapped {} instead of {}", mapped, last.0);
+        let (_, drift, _) = m.boards[1].relative.unwrap();
+        assert!((drift + 2e-6).abs() < 0.2e-6, "drift {}", drift);
+        assert_eq!(m.boards[1].matches, 32);
     }
 
     #[test]
