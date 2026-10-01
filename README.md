@@ -51,6 +51,7 @@ dashboard for real-time monitoring.
 | Spectran V6 | `-i aaronia` | 46-245 MHz | f32 | Supported `-C` values: 46, 61, 77, 92, 122, 184, 245 (device-dependent). Other values snap up to the nearest supported clock automatically. |
 | RFNM (Lime) | `-i rfnm` or `-i rfnm-SERIAL` | 122 MHz | 12-bit | 122.88 Msps base clock, all 40 BLE channels |
 | Epiq Sidekiq family | `-i sidekiq-SERIAL` | per-device | 12 or 16 (per-device) | Bit depth, LO range, sample-rate range and gain index range are queried from the device at open; the recv path scales samples to i16 per the reported ADC resolution. Family includes Stretch / m.2-2280 / m.2 (3042) / mPCIe (AD9361/4, 12-bit); X2 / X4 / X40 / Nv100 / Nvm2 (16-bit). Opt-in `--features sidekiq`; requires libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`). |
+| ESP32-S3 (eSpDR, USB) | `-i espdr0` or `-i espdr:/dev/ttyACM0` | 16 MHz | 10-bit | Experimental. The ESP's own radio as a receiver, over its USB port with no extra hardware. Streams the bursts in one 16 MHz window; USB bandwidth limits how many. Opt-in `--features espdr`; see [ESP32-S3](#esp32-s3-espdr). |
 
 To list available SDR devices:
 
@@ -285,6 +286,44 @@ The 122.88 MHz base clock doesn't divide evenly into 1 MHz channels
 resamples to correct the timing drift. This is transparent and does not
 affect other SDR backends.
 
+### ESP32-S3 (eSpDR)
+
+Experimental. An ESP32-S3 can act as a 2.4 GHz IQ receiver using the
+[eSpDR](https://github.com/h0m3us3r/eSpDR) radio firmware, which exposes
+the chip's undocumented sample-dump engine. The original eSpDR streams
+80 Msps through an external FPGA; the
+[alphafox02/eSpDR](https://github.com/alphafox02/eSpDR) fork adds a mode
+that uses only the ESP's own USB port, so a bare ESP32-S3 dev board works.
+
+USB Full Speed (about 1 MB/s) cannot carry the full stream, so the ESP
+watches a 16 MHz window continuously and sends only the bursts above the
+noise floor, each timestamped; blue-dragon places them on a true timeline
+and fills the gaps with noise at the reported floor. Wi-Fi-like bursts are
+dropped on the ESP to save USB bandwidth (set `BD_ESPDR_KEEP_WIDEBAND=1` to
+keep them). With an antenna on advertising channel 38 this decoded 251 of
+259 BLE packets with a valid CRC in 45 s. On a busy band the USB link is the
+limit, and bursts the ESP could not send are reported as overflows. Older
+firmware without streaming falls back to 1 ms snapshots automatically
+(`BD_ESPDR_SNAPSHOT=1` forces that mode).
+
+Load the firmware into the ESP's RAM (nothing is written to flash; a power
+cycle restores the board), then point blue-dragon at it:
+
+    git clone https://github.com/alphafox02/eSpDR && cd eSpDR
+    . $IDF_PATH/export.sh            # ESP-IDF v5.5.3 or later
+    make -C esp32s3
+    esptool --chip esp32s3 --port /dev/ttyACM0 --before default-reset \
+            --after no-reset --no-stub load-ram esp32s3/build/iq-source.bin
+
+    cargo build --release --features espdr
+    blue-dragon -l -i espdr0 -C 16 -c 2426 -g 28 --check-crc --stats
+
+Use `-C 16` (`-C 80` works only in snapshot mode, each capture covering 0.2 ms). `-c` sets the ESP's LO (2210-2790 MHz); 2426 centres the
+window on advertising channel 38. `-g` is the ESP's gain-table selector
+(0-127, not dB); with an antenna attached, values around 24-30 avoid
+clipping. With several ESPs attached, `espdr1`, `espdr2`, ... select them
+in the order of their USB serial port names.
+
 ### Feature Flags
 
 Features are opt-in. Build only what you need:
@@ -302,6 +341,7 @@ Features are opt-in. Build only what you need:
 | `aaronia` | Spectran V6 support | RTSA Suite Pro |
 | `rfnm` | RFNM (Lime daughtercard) support | librfnm, spdlog |
 | `sidekiq` | Epiq Sidekiq family support | libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`) |
+| `espdr` | ESP32-S3 receiver over USB (eSpDR firmware) | (none -- uses the serial port) |
 
 #### Sidekiq DMA buffer tuning (high-rate capture only)
 
