@@ -337,7 +337,7 @@ the order of their USB serial port names.
 
 #### Whole band with several ESPs
 
-    BD_ESPDR_GAINS=52,40,52,52,52 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats
+    BD_ESPDR_GAINS=44,28,44,44,56 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats
 
 `-C 80` with `-i espdr` (every attached ESP) or a comma list (`-i
 espdr0,espdr2`) makes the ESPs one 80 MHz receiver. blue-dragon picks the
@@ -349,9 +349,15 @@ layout from how many there are:
 | 1-4 | folded | the whole band, folded into 16 MHz | true for BLE, may be a fold for Classic |
 
 `BD_ESPDR_LAYOUT=tile` or `fold` overrides the choice. `BD_ESPDR_GAINS` sets
-each board's gain in board order: about 52 for a board on its PCB antenna,
-about 40 for one with an external antenna (it clips at 52). A single
-antenna feeding every board through a powered splitter would even them out.
+each board's gain in board order. It is worth tuning per board: the gain
+table is not monotonic, and boards of the same kind differ. Here, boards on
+their PCB antennas did best at 44 or 56 (one decoded nothing at 44 but 150
+packets on channel 39 in 15 s at 48 or 56), one with an external antenna at
+20-28, and above about 60 decoding collapsed. With
+`BD_ESPDR_GAINS=44,28,44,44,56` the five boards received 742 valid BLE
+advertising packets in 30 s, against 294 at a uniform 52 (40 for the
+external antenna). A single antenna feeding every board through a powered
+splitter would even them out.
 
 **The baseband filter.** The ESP's 16 Msps samples are its 80 Msps capture
 decimated without a digital filter, so its analog baseband filter is all
