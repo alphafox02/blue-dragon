@@ -4,7 +4,8 @@
 //!
 //! With five boards (enough for 80 MHz) they are tiled: the baseband filter
 //! is narrowed (see `FILTER_16M`) so each hears only its own 16 MHz, they
-//! are tuned 16 MHz apart around the centre, and each burst is placed once
+//! are tuned 16 MHz apart around the centre, staggered by half a MHz so no
+//! Bluetooth channel lies on a boundary, and each burst is placed once
 //! at its own frequency, which the receiver itself then gives. With fewer
 //! boards they are folded: the filter is opened so that each hears the whole
 //! band, as described below. `BD_ESPDR_LAYOUT` (`tile` or `fold`) and
@@ -59,6 +60,9 @@ use std::time::Instant;
 const BOARD_RATE: f64 = 16e6;
 /// Output sample rate, the span an ESP hears around its LO.
 const FOLD_RATE: u32 = 80_000_000;
+/// Frequency-placement unit. Half-MHz units let tiled LOs sit between the
+/// integer-MHz Bluetooth channels while keeping mixer phases exact.
+const HALF_MHZ_HZ: i64 = 500_000;
 /// Output samples per board pair.
 const FACTOR: usize = 5;
 /// How far from the LO (MHz) a folded signal is still heard: measured flat
@@ -135,9 +139,11 @@ fn layout(count: usize) -> Result<(Layout, u16), String> {
     Ok((layout, filter))
 }
 
-/// MHz from the centre to board `index` of `count` when tiled.
-fn tile_offset_mhz(index: usize, count: usize) -> i64 {
-    16 * index as i64 - 8 * (count as i64 - 1)
+/// Half-MHz units from the centre to board `index` of `count` when tiled.
+/// The half-MHz stagger puts integer-MHz Bluetooth channels inside one tile
+/// or the other rather than exactly on a 16 MHz boundary.
+fn tile_offset_half_mhz(index: usize, count: usize) -> i64 {
+    32 * index as i64 - 16 * (count as i64 - 1) - 1
 }
 
 /// The serial ports to use for `iface` at `sample_rate`, or None for a
@@ -242,8 +248,8 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
         None
     };
     for (index, path) in paths.iter().enumerate() {
-        let offset = if folded { 0 } else { tile_offset_mhz(index, count) };
-        let lo = (center_freq as i64 + offset * 1_000_000) as u32;
+        let offset = if folded { 0 } else { tile_offset_half_mhz(index, count) };
+        let lo = (center_freq as i64 + offset * HALF_MHZ_HZ) as u32;
         let (mut link, tuned) = open_board(path, 1, 20, gains[index], lo, filter)?;
         if offset == 0 {
             lo_hz = tuned;
@@ -417,9 +423,10 @@ struct Shaped {
 /// they came from: for a tiled board, its own; for a folded one, each it
 /// could have come from.
 struct Shaper {
-    /// A tiled board's LO, MHz from the centre; None when folded.
+    /// A tiled board's LO, in half-MHz units from the centre; None when
+    /// folded.
     tile: Option<i64>,
-    /// e^(j 2 pi m / 80): whole-MHz offsets at 80 Msps repeat every 80
+    /// e^(j 2 pi m / 160): half-MHz offsets at 80 Msps repeat every 160
     /// samples.
     turn: Vec<Complex32>,
     /// From a 4 Msps channel: 20 phases of NARROW_TAPS_PER_PHASE.
@@ -430,14 +437,14 @@ struct Shaper {
 
 impl Shaper {
     fn new(tile: Option<i64>) -> Self {
-        let period = (FOLD_RATE / 1_000_000) as usize;
+        let period = (FOLD_RATE as i64 / HALF_MHZ_HZ) as usize;
         let turn = (0..period)
             .map(|m| {
                 let a = 2.0 * std::f64::consts::PI * m as f64 / period as f64;
                 Complex32::new(a.cos() as f32, a.sin() as f32)
             })
             .collect();
-        let rate = period as f64; // output rate in MHz
+        let rate = FOLD_RATE as f64 / 1e6; // output rate in MHz
         // A channel's content lies within +-1.6 MHz and its first image
         // starts 2.4 MHz out; a window's lies within +-8 MHz, imaged from
         // 8 MHz on, so keep it to about +-7.4.
@@ -446,13 +453,13 @@ impl Shaper {
         Self { tile, turn, narrow_taps, wide_taps }
     }
 
-    /// Where (MHz from the centre) a signal seen `offset` MHz above the
-    /// board's LO goes: tiled, just there; folded, everywhere it could have
-    /// come from.
+    /// Where (half-MHz units from the centre) a signal seen `offset` MHz
+    /// above the board's LO goes: tiled, just there; folded, everywhere it
+    /// could have come from.
     fn places(&self, offset: i64) -> Vec<i64> {
         match self.tile {
-            Some(lo) => vec![lo + offset],
-            None => Self::folds(offset),
+            Some(lo) => vec![lo + 2 * offset],
+            None => Self::folds(offset).into_iter().map(|f| 2 * f).collect(),
         }
     }
 
@@ -506,7 +513,7 @@ impl Shaper {
     }
 
     /// Interpolates `x` by the number of phases and repeats it at each of
-    /// `offsets` (MHz).
+    /// `offsets` (half-MHz units).
     fn interpolate(&self, x: &[Complex32], phases: &[Vec<f32>], offsets: &[i64]) -> Vec<Complex32> {
         let ratio = phases.len();
         let taps = phases[0].len();
@@ -1354,13 +1361,33 @@ mod tests {
 
     #[test]
     fn tiled_boards_place_bursts_once_at_their_frequency() {
-        // Board 4 of 5 tiled (LO 32 MHz above the centre) hears a channel
-        // 7 MHz above its LO (LO-minus-RF offset -7): only at +39 MHz.
-        let shaper = Shaper::new(Some(tile_offset_mhz(4, 5)));
+        // Board 4 of 5 tiled (LO 31.5 MHz above the centre) places the
+        // centre of channelizer bin -7 only at +38.5 MHz. A real Bluetooth
+        // channel at +39 retains its +0.5 MHz residual inside that bin.
+        let shaper = Shaper::new(Some(tile_offset_half_mhz(4, 5)));
         let s = shaper.narrow(1000, -7, &vec![100u32; 1000]);
         let mid = 2000..18000;
-        assert!(share_at(&s.samples, mid.clone(), 39.0) > 0.99);
-        assert!(share_at(&s.samples, mid, 23.0) < 1e-6);
-        assert_eq!((0..5).map(|i| tile_offset_mhz(i, 5)).collect::<Vec<_>>(), vec![-32, -16, 0, 16, 32]);
+        assert!(share_at(&s.samples, mid.clone(), 38.5) > 0.99);
+        assert!(share_at(&s.samples, mid, 22.5) < 1e-6);
+        assert_eq!(
+            (0..5)
+                .map(|i| tile_offset_half_mhz(i, 5))
+                .collect::<Vec<_>>(),
+            vec![-65, -33, -1, 31, 63]
+        );
+    }
+
+    #[test]
+    fn tiled_boards_cover_every_classic_channel_away_from_a_seam() {
+        let los: Vec<i64> = (0..5).map(|i| tile_offset_half_mhz(i, 5)).collect();
+        // Classic channels 0..78 are -39..+39 MHz around 2441. Each is no
+        // farther than 7.5 MHz from exactly one LO, so the firmware's
+        // channelizer (-7..+7 whole-MHz bins) retains it with a 0.5 MHz
+        // residual instead of losing it on a tile boundary.
+        for rf_mhz in -39..=39 {
+            let rf_half_mhz = 2 * rf_mhz;
+            let receivers = los.iter().filter(|&&lo| (rf_half_mhz - lo).abs() <= 15).count();
+            assert_eq!(receivers, 1, "{} MHz has {} tiles", rf_mhz, receivers);
+        }
     }
 }
