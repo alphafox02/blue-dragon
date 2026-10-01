@@ -52,6 +52,7 @@ const ESP_ARG_HIGH: u8 = 19;
 const ESP_SET_LO: u8 = 20;
 const ESP_SET_RATE: u8 = 21;
 const ESP_SET_WIDTH: u8 = 22;
+const ESP_SET_FILTER: u8 = 23;
 const ESP_SET_GAIN: u8 = 24;
 const ESP_SNAPSHOT: u8 = 40;
 const ESP_STREAM: u8 = 41;
@@ -78,6 +79,16 @@ const CHUNK_PAIRS: usize = 32768;
 const GAP_PAIRS: usize = 2048;
 /// Scale from 10-bit samples toward int16 full scale.
 const SAMPLE_SCALE: i32 = 64;
+/// Baseband filter capacitor code for 16 Msps (0..63; larger is narrower).
+/// The 16 Msps samples are the 80 Msps capture decimated by five without a
+/// digital filter, so this analog filter is the only thing keeping signals
+/// from outside the window from folding into it: at the firmware's default
+/// (0, about 69 MHz) a signal 23 MHz away came through as strongly as one in
+/// the window. Measured on channel 39: at 54 one 9 or 23 MHz outside the
+/// window no longer came through, while one 7 MHz inside still did, a dB or
+/// so down. (Codes from the ESP-SDR project's S3 calibration: 48 is about
+/// 16 MHz wide, 60 about 13.)
+const FILTER_16M: u16 = 54;
 /// The ESP's channel filter (Q14), also used here to interpolate back to
 /// 16 Msps. Narrow output j is centred on pair start + 4j - 2.5.
 const NARROW_TAPS: [i32; 12] = [-27, 62, 476, 1428, 2676, 3577, 3577, 2676, 1428, 476, 62, -27];
@@ -502,9 +513,17 @@ fn stream_arg() -> (u16, bool, bool) {
     (arg, channelize, reject)
 }
 
-/// Opens the ESP at `path`, checks its firmware and tunes it. Returns the
-/// link and the LO actually tuned, in Hz.
-fn open_board(path: &str, rate_sel: u16, width: u16, gain_sel: u16, lo_hz: u32) -> Result<(EspLink, u32), String> {
+/// Opens the ESP at `path`, checks its firmware and tunes it, with baseband
+/// filter code `filter` at 16 Msps. Returns the link and the LO actually
+/// tuned, in Hz.
+fn open_board(
+    path: &str,
+    rate_sel: u16,
+    width: u16,
+    gain_sel: u16,
+    lo_hz: u32,
+    filter: u16,
+) -> Result<(EspLink, u32), String> {
     let mut link = EspLink::open(path)?;
     let id = link.handshake()?;
     if id != CTL_ESP_FIRMWARE_ID {
@@ -515,9 +534,26 @@ fn open_board(path: &str, rate_sel: u16, width: u16, gain_sel: u16, lo_hz: u32) 
     }
     link.command(ESP_SET_RATE, rate_sel)?;
     link.command(ESP_SET_WIDTH, width)?;
+    if rate_sel == 1 {
+        link.command(ESP_SET_FILTER, filter | filter << 8)?;
+    }
     link.command(ESP_SET_GAIN, gain_sel)?;
     let tuned = link.command32(ESP_SET_LO, lo_hz)?;
     Ok((link, tuned))
+}
+
+/// The baseband filter code for 16 Msps: `BD_ESPDR_FILTER` (0..63) or
+/// `default`.
+fn filter_code(default: u16) -> Result<u16, String> {
+    match std::env::var("BD_ESPDR_FILTER") {
+        Err(_) => Ok(default),
+        Ok(v) => v
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|&c| c <= 63)
+            .ok_or_else(|| format!("eSpDR: BD_ESPDR_FILTER must be 0..63, got '{}'", v)),
+    }
 }
 
 /// Serial ports of the attached ESP32-S3 boards, sorted by path.
@@ -690,7 +726,8 @@ impl EspdrHandle {
         };
         let path = resolve_port(iface)?;
         let gain_sel = gain.clamp(0, 127) as u16;
-        let (mut link, lo_hz) = open_board(&path, rate_sel, width, gain_sel, center_freq as u32)?;
+        let (mut link, lo_hz) =
+            open_board(&path, rate_sel, width, gain_sel, center_freq as u32, filter_code(FILTER_16M)?)?;
         let (stream_arg, channelize, reject) = stream_arg();
         let force_snapshot = std::env::var_os("BD_ESPDR_SNAPSHOT").is_some();
         let streaming = !force_snapshot && link.start_stream(stream_arg)?;
