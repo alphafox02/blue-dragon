@@ -6,6 +6,7 @@ pub mod btbb;
 pub mod crypto;
 pub mod fec;
 pub mod fold;
+pub mod hop;
 pub mod fuzz;
 pub mod smp;
 pub mod vuln;
