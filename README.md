@@ -51,7 +51,7 @@ dashboard for real-time monitoring.
 | Spectran V6 | `-i aaronia` | 46-245 MHz | f32 | Supported `-C` values: 46, 61, 77, 92, 122, 184, 245 (device-dependent). Other values snap up to the nearest supported clock automatically. |
 | RFNM (Lime) | `-i rfnm` or `-i rfnm-SERIAL` | 122 MHz | 12-bit | 122.88 Msps base clock, all 40 BLE channels |
 | Epiq Sidekiq family | `-i sidekiq-SERIAL` | per-device | 12 or 16 (per-device) | Bit depth, LO range, sample-rate range and gain index range are queried from the device at open; the recv path scales samples to i16 per the reported ADC resolution. Family includes Stretch / m.2-2280 / m.2 (3042) / mPCIe (AD9361/4, 12-bit); X2 / X4 / X40 / Nv100 / Nvm2 (16-bit). Opt-in `--features sidekiq`; requires libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`). |
-| ESP32-S3 (eSpDR, USB) | `-i espdr0` or `-i espdr:/dev/ttyACM0` | 16 MHz | 10-bit | Experimental. The ESP's own radio as a receiver, over its USB port with no extra hardware. Streams the bursts in one 16 MHz window; USB bandwidth limits how many. Opt-in `--features espdr`; see [ESP32-S3](#esp32-s3-espdr). |
+| ESP32-S3 (eSpDR, USB) | `-i espdr0` or `-i espdr:/dev/ttyACM0` | 16 MHz | 10-bit | Experimental. The ESP's own radio as a receiver, over its USB port with no extra hardware. Streams the bursts in one 16 MHz window, each cut to its channel on the ESP; USB bandwidth limits how many. Opt-in `--features espdr`; see [ESP32-S3](#esp32-s3-espdr). |
 
 To list available SDR devices:
 
@@ -298,13 +298,22 @@ that uses only the ESP's own USB port, so a bare ESP32-S3 dev board works.
 USB Full Speed (about 1 MB/s) cannot carry the full stream, so the ESP
 watches a 16 MHz window continuously and sends only the bursts above the
 noise floor, each timestamped; blue-dragon places them on a true timeline
-and fills the gaps with noise at the reported floor. Wi-Fi-like bursts are
-dropped on the ESP to save USB bandwidth (set `BD_ESPDR_KEEP_WIDEBAND=1` to
-keep them). With an antenna on advertising channel 38 this decoded 251 of
-259 BLE packets with a valid CRC in 45 s. On a busy band the USB link is the
-limit, and bursts the ESP could not send are reported as overflows. Older
-firmware without streaming falls back to 1 ms snapshots automatically
-(`BD_ESPDR_SNAPSHOT=1` forces that mode).
+and fills the gaps with noise at the reported floor. The ESP also cuts each
+burst down to its own channel at 4 Msps with the S3's vector unit, a
+quarter of the data, and blue-dragon restores it to the window; this lets
+about twice as many packets through and bursts up to 3 ms (a whole 3-DH5).
+Set `BD_ESPDR_WIDE=1` to receive whole-window bursts instead, which keeps
+two simultaneous signals on different channels. Wi-Fi bursts are dropped on
+the ESP to save USB bandwidth (set `BD_ESPDR_KEEP_WIDEBAND=1` to keep them).
+
+On a busy band with an antenna at 2426 MHz this decoded 514 BLE packets
+with a valid CRC in 45 s (257 with whole-window bursts); with a Classic
+link flooded by `l2ping` at 2441 MHz, about 11,000 Classic framings and a
+few EDR packets in 38 s. The USB link is still the limit on a busy band, and
+bursts the ESP could not send are reported as overflows. Older firmware
+without channelization sends whole-window bursts, and firmware without
+streaming falls back to 1 ms snapshots automatically (`BD_ESPDR_SNAPSHOT=1`
+forces that mode).
 
 Load the firmware into the ESP's RAM (nothing is written to flash; a power
 cycle restores the board), then point blue-dragon at it:

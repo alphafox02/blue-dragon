@@ -11,8 +11,12 @@
 //! * stream (preferred): the ESP watches a 16 MHz window continuously and
 //!   sends each burst above the noise floor, timestamped in samples. The
 //!   backend places bursts on a true timeline and fills the gaps with noise
-//!   at the reported floor. Bursts whose envelope fluctuates like OFDM
-//!   (Wi-Fi) are dropped on the ESP unless `BD_ESPDR_KEEP_WIDEBAND` is set.
+//!   at the reported floor. The ESP cuts each burst down to its own channel
+//!   at 4 Msps (about 4x less data over USB, so more bursts get through and
+//!   long ones such as 3-DH5 fit), and the backend restores it to the 16 MHz
+//!   window; `BD_ESPDR_WIDE` asks for whole-window bursts instead, which keep
+//!   simultaneous signals on different channels. Wi-Fi bursts are dropped on
+//!   the ESP unless `BD_ESPDR_KEEP_WIDEBAND` is set.
 //! * snapshot (fallback, for firmware without streaming, at 80 Msps, or with
 //!   `BD_ESPDR_SNAPSHOT` set): the
 //!   ESP sends about 1 ms of samples per request, and snapshots are joined
@@ -52,7 +56,9 @@ const STREAM_MAGIC: u32 = 0x5453_5242;
 const STREAM_BURST: u16 = 1;
 const STREAM_STATUS: u16 = 2;
 const STREAM_END: u16 = 3;
+const STREAM_NARROW: u16 = 4;
 const STREAM_REJECT_WIDEBAND: u16 = 1;
+const STREAM_CHANNELIZE: u16 = 2;
 const STATUS_WORDS: usize = 8;
 /// Largest stretch of noise inserted for one gap (0.1 s at 16 Msps); a longer
 /// gap only happens across a restart, and its time is skipped.
@@ -64,6 +70,9 @@ const CHUNK_PAIRS: usize = 32768;
 const GAP_PAIRS: usize = 2048;
 /// Scale from 10-bit samples toward int16 full scale.
 const SAMPLE_SCALE: i32 = 64;
+/// The ESP's channel filter (Q14), also used here to interpolate back to
+/// 16 Msps. Narrow output j is centred on pair start + 4j - 2.5.
+const NARROW_TAPS: [i32; 12] = [-27, 62, 476, 1428, 2676, 3577, 3577, 2676, 1428, 476, 62, -27];
 
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -203,6 +212,9 @@ impl EspLink {
 /// One record of the ESP's burst stream.
 enum Record {
     Burst { start: u64, pairs: Vec<u32> },
+    /// One channel of a burst at 4 Msps, mixed down by `offset` MHz
+    /// (LO-minus-RF orientation, like the pairs).
+    Narrow { start: u64, offset: i32, pairs: Vec<u32> },
     Status { start: u64, words: [u32; STATUS_WORDS] },
     End,
 }
@@ -230,11 +242,12 @@ impl EspLink {
         self.read_exact(&mut header)?;
         let word = |i: usize| u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]);
         let kind = (word(0) & 0xFFFF) as u16;
+        let flags = word(0) >> 16;
         let start = word(8) as u64 | (word(12) as u64) << 32;
         let length = word(16) as usize;
         let mut check = [0u8; 4];
         match kind {
-            STREAM_BURST => {
+            STREAM_BURST | STREAM_NARROW => {
                 let mut payload = vec![0u8; length.div_ceil(2) * 5];
                 self.read_exact(&mut payload)?;
                 self.read_exact(&mut check)?;
@@ -249,7 +262,12 @@ impl EspLink {
                     return Err("eSpDR: stream burst check failed".to_string());
                 }
                 pairs.truncate(length);
-                Ok(Record::Burst { start, pairs })
+                if kind == STREAM_NARROW {
+                    let offset = ((flags >> 8) & 15) as i32 - 8;
+                    Ok(Record::Narrow { start, offset, pairs })
+                } else {
+                    Ok(Record::Burst { start, pairs })
+                }
             }
             STREAM_STATUS => {
                 let mut payload = [0u8; STATUS_WORDS * 4];
@@ -347,19 +365,21 @@ impl Timeline {
         true
     }
 
-    /// Adds a burst that starts at stream pair `start`.
-    fn burst(&mut self, start: u64, pairs: &[u32]) -> bool {
+    /// Adds a burst, as interleaved output samples, that starts at stream
+    /// pair `start`.
+    fn burst(&mut self, start: u64, samples: &[i16]) -> bool {
         let at = self.base + start;
         if !self.fill_to(at) {
             return false;
         }
-        let skip = (self.emitted.saturating_sub(at) as usize).min(pairs.len());
-        for piece in pairs[skip..].chunks(CHUNK_PAIRS) {
-            if !self.send(convert_pairs(piece)) {
+        let pairs = samples.len() / 2;
+        let skip = (self.emitted.saturating_sub(at) as usize).min(pairs);
+        for piece in samples[2 * skip..].chunks(2 * CHUNK_PAIRS) {
+            if !self.send(piece.to_vec()) {
                 return false;
             }
         }
-        self.emitted = self.emitted.max(at + pairs.len() as u64);
+        self.emitted = self.emitted.max(at + pairs as u64);
         true
     }
 
@@ -377,6 +397,43 @@ fn convert_pairs(pairs: &[u32]) -> Vec<i16> {
         let q = (((w >> 10) & 1023) ^ 512) as i32 - 512;
         out.push((i * SAMPLE_SCALE).clamp(-32768, 32767) as i16);
         out.push((-q * SAMPLE_SCALE).clamp(-32768, 32767) as i16);
+    }
+    out
+}
+
+/// Restores a narrow record, starting at stream pair `start`, to the 16 MHz
+/// window: interpolates by 4 with the ESP's filter, mixes back up by
+/// `offset` MHz, then conjugates and scales like `convert_pairs`.
+fn convert_narrow(pairs: &[u32], start: u64, offset: i32) -> Vec<i16> {
+    let unit = |m: i64| {
+        let a = 2.0 * std::f32::consts::PI * (m.rem_euclid(16) as f32) / 16.0;
+        (a.cos(), a.sin())
+    };
+    let y: Vec<(f32, f32)> = pairs
+        .iter()
+        .map(|&w| (((w & 1023) ^ 512) as f32 - 512.0, (((w >> 10) & 1023) ^ 512) as f32 - 512.0))
+        .collect();
+    let gain = 4.0 / 16384.0;
+    let mut out = Vec::with_capacity(8 * y.len());
+    for i in 0..4 * y.len() {
+        // Output i of the full interpolating convolution is centred on pair
+        // start - 8 + i; take pairs from start on.
+        let c = i + 8;
+        let (mut zi, mut zq) = (0.0f32, 0.0f32);
+        let mut t = c % 4;
+        while t < NARROW_TAPS.len() {
+            let j = (c - t) / 4;
+            if j < y.len() {
+                zi += y[j].0 * NARROW_TAPS[t] as f32;
+                zq += y[j].1 * NARROW_TAPS[t] as f32;
+            }
+            t += 4;
+        }
+        let (cos, sin) = unit(offset as i64 * (start + i as u64) as i64);
+        let (ri, rq) = ((zi * cos - zq * sin) * gain, (zi * sin + zq * cos) * gain);
+        let scale = SAMPLE_SCALE as f32;
+        out.push((ri.round() * scale).clamp(-32768.0, 32767.0) as i16);
+        out.push((-rq.round() * scale).clamp(-32768.0, 32767.0) as i16);
     }
     out
 }
@@ -478,7 +535,12 @@ fn stream_loop(
         }
         match link.next_record() {
             Ok(Record::Burst { start, pairs }) => {
-                if !timeline.burst(start, &pairs) {
+                if !timeline.burst(start, &convert_pairs(&pairs)) {
+                    return;
+                }
+            }
+            Ok(Record::Narrow { start, offset, pairs }) => {
+                if !timeline.burst(start, &convert_narrow(&pairs, start, offset)) {
                     return;
                 }
             }
@@ -586,7 +648,9 @@ impl EspdrHandle {
         link.command(ESP_SET_GAIN, gain_sel)?;
         let lo_hz = link.command32(ESP_SET_LO, center_freq as u32)?;
         let reject = std::env::var_os("BD_ESPDR_KEEP_WIDEBAND").is_none();
-        let stream_arg = if reject { STREAM_REJECT_WIDEBAND } else { 0 };
+        let channelize = std::env::var_os("BD_ESPDR_WIDE").is_none();
+        let stream_arg = if reject { STREAM_REJECT_WIDEBAND } else { 0 }
+            | if channelize { STREAM_CHANNELIZE } else { 0 };
         let force_snapshot = std::env::var_os("BD_ESPDR_SNAPSHOT").is_some();
         let streaming = !force_snapshot && link.start_stream(stream_arg)?;
         if !streaming {
@@ -601,10 +665,13 @@ impl EspdrHandle {
             gain_sel,
             if !streaming {
                 "snapshot mode"
-            } else if reject {
-                "streaming bursts (Wi-Fi rejected)"
             } else {
-                "streaming bursts"
+                match (channelize, reject) {
+                    (true, true) => "streaming channelized bursts (Wi-Fi rejected)",
+                    (true, false) => "streaming channelized bursts",
+                    (false, true) => "streaming bursts (Wi-Fi rejected)",
+                    (false, false) => "streaming bursts",
+                }
             }
         );
 
@@ -737,7 +804,7 @@ mod tests {
         let (tx, rx) = bounded::<Vec<i16>>(1024);
         let mut t = Timeline::new(tx);
         let burst = [100u32; 10]; // I = 100, Q = 0
-        assert!(t.burst(100, &burst));
+        assert!(t.burst(100, &convert_pairs(&burst)));
         let out = drain(&rx);
         assert_eq!(out.len(), 2 * 110);
         assert_eq!(out[2 * 100], 100 * 64); // the burst starts exactly at pair 100
@@ -748,11 +815,11 @@ mod tests {
     fn timeline_trims_overlap_and_continues_after_restart() {
         let (tx, rx) = bounded::<Vec<i16>>(1024);
         let mut t = Timeline::new(tx);
-        assert!(t.burst(0, &[1u32; 20]));
-        assert!(t.burst(15, &[2u32; 10])); // overlaps the first by 5 pairs
+        assert!(t.burst(0, &convert_pairs(&[1u32; 20])));
+        assert!(t.burst(15, &convert_pairs(&[2u32; 10]))); // overlaps the first by 5 pairs
         assert_eq!(t.emitted, 25);
         t.restart(); // a new stream counts from 0 again
-        assert!(t.burst(5, &[3u32; 1]));
+        assert!(t.burst(5, &convert_pairs(&[3u32; 1])));
         assert_eq!(t.emitted, 31);
         let out = drain(&rx);
         assert_eq!(out.len(), 2 * 31);
@@ -766,5 +833,23 @@ mod tests {
         assert!(t.fill_to(MAX_GAP_PAIRS * 3));
         assert_eq!(t.emitted, MAX_GAP_PAIRS * 3);
         assert_eq!(drain(&rx).len() as u64, 2 * MAX_GAP_PAIRS);
+    }
+
+    #[test]
+    fn narrow_bursts_return_to_their_channel() {
+        // A steady signal in a channel 3 MHz from the LO (LO-minus-RF), as
+        // the ESP would send it after mixing down: constant I = 100.
+        let pairs = [100u32; 64];
+        let start = 1000u64;
+        let out = convert_narrow(&pairs, start, 3);
+        assert_eq!(out.len(), 2 * 4 * 64);
+        // Away from the edges the restored pairs rotate by 3/16 of a turn
+        // per pair, and conjugation turns the rotation the other way.
+        for i in 20..200 {
+            let a = 2.0 * std::f32::consts::PI * (3 * (start + i as u64) % 16) as f32 / 16.0;
+            let (ei, eq) = (6400.0 * a.cos(), -6400.0 * a.sin());
+            assert!((out[2 * i] as f32 - ei).abs() <= 64.0 * 2.0, "I at {}: {} vs {}", i, out[2 * i], ei);
+            assert!((out[2 * i + 1] as f32 - eq).abs() <= 64.0 * 2.0, "Q at {}: {} vs {}", i, out[2 * i + 1], eq);
+        }
     }
 }
