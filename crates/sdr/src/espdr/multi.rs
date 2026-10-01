@@ -2,6 +2,15 @@
 
 //! One or more ESP32-S3 receivers as an 80 MHz receiver.
 //!
+//! With five boards (enough for 80 MHz) they are tiled: the baseband filter
+//! is narrowed (see `FILTER_16M`) so each hears only its own 16 MHz, they
+//! are tuned 16 MHz apart around the centre, and each burst is placed once
+//! at its own frequency, which the receiver itself then gives. With fewer
+//! boards they are folded: the filter is opened so that each hears the whole
+//! band, as described below. `BD_ESPDR_LAYOUT` (`tile` or `fold`) and
+//! `BD_ESPDR_FILTER` override the choice.
+//!
+//! Folded:
 //! At 16 Msps an ESP's samples are its 80 Msps capture decimated by five
 //! without filtering, so it hears about 80 MHz around its LO folded into a
 //! 16 MHz window: a burst seen at some offset in the window may have come
@@ -101,9 +110,39 @@ const SYNC_MAX_LAG: i64 = 160;
 /// Correlation of the demodulated copies needed to call them one burst.
 const SYNC_MIN_CORRELATION: f32 = 0.5;
 
+/// How several boards share the band.
+#[derive(Clone, Copy, PartialEq)]
+enum Layout {
+    /// Filter narrowed: each board hears its own 16 MHz; boards tuned 16 MHz
+    /// apart.
+    Tiled,
+    /// Filter open: each board hears 80 MHz folded; boards on one LO, sharing
+    /// out the channel positions.
+    Folded,
+}
+
+/// The layout for `count` boards, and the filter code it wants.
+fn layout(count: usize) -> Result<(Layout, u16), String> {
+    let tiles = (FOLD_RATE / 16_000_000) as usize;
+    let layout = match std::env::var("BD_ESPDR_LAYOUT").as_deref() {
+        Ok("tile") => Layout::Tiled,
+        Ok("fold") => Layout::Folded,
+        Ok(other) => return Err(format!("eSpDR: BD_ESPDR_LAYOUT must be tile or fold, got '{}'", other)),
+        Err(_) if count >= tiles => Layout::Tiled,
+        Err(_) => Layout::Folded,
+    };
+    let filter = filter_code(if layout == Layout::Tiled { FILTER_16M } else { 0 })?;
+    Ok((layout, filter))
+}
+
+/// MHz from the centre to board `index` of `count` when tiled.
+fn tile_offset_mhz(index: usize, count: usize) -> i64 {
+    16 * index as i64 - 8 * (count as i64 - 1)
+}
+
 /// The serial ports to use for `iface` at `sample_rate`, or None for a
-/// single-board interface. `espdr` takes every attached ESP; a comma list
-/// names them.
+/// single-board interface. `espdr` takes every attached ESP (up to five
+/// when tiled); a comma list names them.
 pub(super) fn boards_for(iface: &str, sample_rate: u32) -> Result<Option<Vec<String>>, String> {
     let list = iface.contains(',');
     if !list && (iface != "espdr" || sample_rate <= 16_000_000) {
@@ -111,11 +150,12 @@ pub(super) fn boards_for(iface: &str, sample_rate: u32) -> Result<Option<Vec<Str
     }
     if sample_rate != FOLD_RATE {
         return Err(format!(
-            "eSpDR: each ESP hears 80 MHz folded into 16; use -C 80 with -i {} (got -C {})",
+            "eSpDR: several ESPs make an 80 MHz receiver; use -C 80 with -i {} (got -C {})",
             iface,
             sample_rate / 1_000_000
         ));
     }
+    let tiles = (FOLD_RATE / 16_000_000) as usize;
     let paths: Vec<String> = if list {
         iface
             .split(',')
@@ -129,6 +169,14 @@ pub(super) fn boards_for(iface: &str, sample_rate: u32) -> Result<Option<Vec<Str
     if paths.is_empty() {
         return Err("eSpDR: no ESP32-S3 USB serial ports found".to_string());
     }
+    let paths = if layout(paths.len())?.0 == Layout::Tiled && paths.len() > tiles {
+        if list {
+            return Err(format!("eSpDR: at most {} ESPs tile 80 MHz, {} were named", tiles, paths.len()));
+        }
+        paths.into_iter().take(tiles).collect()
+    } else {
+        paths
+    };
     Ok(Some(paths))
 }
 
@@ -184,16 +232,23 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
     let mut board_gain_tx = Vec::with_capacity(count);
     let mut threads = Vec::with_capacity(count);
     let mut lo_hz = center_freq as u32;
-    // Whole-window bursts cannot be shared by position, nor aligned by one.
-    let sync = if channelize && count > 1 {
+    let (layout, filter) = layout(count)?;
+    let folded = layout == Layout::Folded;
+    // Whole-window bursts cannot be shared by position, nor aligned by one;
+    // tiled boards hear nothing in common.
+    let sync = if folded && channelize && count > 1 {
         fold_position(SYNC_MHZ, (center_freq as i64 + 500_000) / 1_000_000)
     } else {
         None
     };
     for (index, path) in paths.iter().enumerate() {
-        let (mut link, tuned) = open_board(path, 1, 20, gains[index], center_freq as u32)?;
-        lo_hz = tuned;
-        let mask = if channelize { position_mask(index, count, sync) } else { 0 };
+        let offset = if folded { 0 } else { tile_offset_mhz(index, count) };
+        let lo = (center_freq as i64 + offset * 1_000_000) as u32;
+        let (mut link, tuned) = open_board(path, 1, 20, gains[index], lo, filter)?;
+        if offset == 0 {
+            lo_hz = tuned;
+        }
+        let mask = if folded && channelize { position_mask(index, count, sync) } else { 0 };
         if !link.start_stream_masked(stream_arg, mask)? {
             return Err(format!("eSpDR: the ESP at {} cannot stream; load the current firmware", path));
         }
@@ -209,7 +264,7 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
         board_gain_tx.push(gain_tx);
         let events = event_tx.clone();
         let running = running.clone();
-        let shaper = Shaper::new();
+        let shaper = Shaper::new(if folded { None } else { Some(offset) });
         threads.push(
             std::thread::Builder::new()
                 .name(format!("espdr-board{}", index))
@@ -219,10 +274,11 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
     }
     drop(event_tx);
     eprintln!(
-        "eSpDR: {} board{} hearing 80 MHz around {:.3} MHz folded into 16, {}",
+        "eSpDR: {} board{} {} {:.3} MHz, {}",
         count,
         if count == 1 { "" } else { "s" },
-        lo_hz as f64 / 1e6,
+        if folded { "hearing 80 MHz folded into 16 around" } else { "tiling 16 MHz each around" },
+        center_freq as f64 / 1e6,
         match (channelize, reject) {
             (true, true) => "channelized bursts (Wi-Fi rejected)",
             (true, false) => "channelized bursts",
@@ -230,7 +286,7 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
             (false, false) => "bursts",
         }
     );
-    if !channelize && count > 1 {
+    if folded && !channelize && count > 1 {
         eprintln!("eSpDR: whole-window bursts are not shared out, so every board sends the same ones");
     }
 
@@ -357,9 +413,12 @@ struct Shaped {
     channel: Option<Vec<Complex32>>,
 }
 
-/// Interpolates bursts to the output rate and repeats them at each
-/// frequency they could have come from.
+/// Interpolates bursts to the output rate and places them at the frequency
+/// they came from: for a tiled board, its own; for a folded one, each it
+/// could have come from.
 struct Shaper {
+    /// A tiled board's LO, MHz from the centre; None when folded.
+    tile: Option<i64>,
     /// e^(j 2 pi m / 80): whole-MHz offsets at 80 Msps repeat every 80
     /// samples.
     turn: Vec<Complex32>,
@@ -370,7 +429,7 @@ struct Shaper {
 }
 
 impl Shaper {
-    fn new() -> Self {
+    fn new(tile: Option<i64>) -> Self {
         let period = (FOLD_RATE / 1_000_000) as usize;
         let turn = (0..period)
             .map(|m| {
@@ -384,7 +443,17 @@ impl Shaper {
         // 8 MHz on, so keep it to about +-7.4.
         let narrow_taps = polyphase(lowpass(4 * FACTOR, NARROW_TAPS_PER_PHASE, 2.0 / rate, 4.5), 4 * FACTOR);
         let wide_taps = polyphase(lowpass(FACTOR, WIDE_TAPS_PER_PHASE, 8.0 / rate, 5.65), FACTOR);
-        Self { turn, narrow_taps, wide_taps }
+        Self { tile, turn, narrow_taps, wide_taps }
+    }
+
+    /// Where (MHz from the centre) a signal seen `offset` MHz above the
+    /// board's LO goes: tiled, just there; folded, everywhere it could have
+    /// come from.
+    fn places(&self, offset: i64) -> Vec<i64> {
+        match self.tile {
+            Some(lo) => vec![lo + offset],
+            None => Self::folds(offset),
+        }
     }
 
     /// The offsets from the LO (MHz) that a signal seen at `offset` in the
@@ -415,7 +484,7 @@ impl Shaper {
         let delay = (self.narrow_taps.len() * NARROW_TAPS_PER_PHASE - 1) as f64 / 2.0;
         Shaped {
             first: start as f64 - 2.5 - delay * step,
-            samples: self.interpolate(&x, &self.narrow_taps, &Self::folds(-offset as i64)),
+            samples: self.interpolate(&x, &self.narrow_taps, &self.places(-offset as i64)),
             offset: Some(offset),
             channel: Some(x),
         }
@@ -430,7 +499,7 @@ impl Shaper {
         let delay = (self.wide_taps.len() * WIDE_TAPS_PER_PHASE - 1) as f64 / 2.0;
         Shaped {
             first: start as f64 - delay / FACTOR as f64,
-            samples: self.interpolate(&x, &self.wide_taps, &Self::folds(0)),
+            samples: self.interpolate(&x, &self.wide_taps, &self.places(0)),
             offset: None,
             channel: None,
         }
@@ -1039,7 +1108,7 @@ mod tests {
     fn a_channel_appears_at_each_fold() {
         // A steady signal 7 MHz below the LO in RF terms (LO-minus-RF
         // offset +7): 2434, 2402 (adv 37), 2418, 2450, 2466 around 2441.
-        let shaper = Shaper::new();
+        let shaper = Shaper::new(None);
         let pairs = vec![100u32; 1000]; // I = 100, Q = 0 at 4 Msps
         let s = shaper.narrow(1000, 7, &pairs);
         assert_eq!(s.samples.len(), (1000 + NARROW_TAPS_PER_PHASE) * 20);
@@ -1281,5 +1350,17 @@ mod tests {
         m.boards[0].rate = 80e-6;
         let second = m.position(0, 9_000_000.0, 9.0);
         assert_eq!(second - first, 8_000_000 * FACTOR as i64);
+    }
+
+    #[test]
+    fn tiled_boards_place_bursts_once_at_their_frequency() {
+        // Board 4 of 5 tiled (LO 32 MHz above the centre) hears a channel
+        // 7 MHz above its LO (LO-minus-RF offset -7): only at +39 MHz.
+        let shaper = Shaper::new(Some(tile_offset_mhz(4, 5)));
+        let s = shaper.narrow(1000, -7, &vec![100u32; 1000]);
+        let mid = 2000..18000;
+        assert!(share_at(&s.samples, mid.clone(), 39.0) > 0.99);
+        assert!(share_at(&s.samples, mid, 23.0) < 1e-6);
+        assert_eq!((0..5).map(|i| tile_offset_mhz(i, 5)).collect::<Vec<_>>(), vec![-32, -16, 0, 16, 32]);
     }
 }

@@ -335,43 +335,60 @@ around 24-30 avoid clipping, while boards using their PCB antenna need
 about 52. With several ESPs attached, `espdr1`, `espdr2`, ... select them in
 the order of their USB serial port names.
 
-#### Whole band: the fold
+#### Whole band with several ESPs
 
-The ESP's 16 Msps samples are its 80 Msps capture decimated without
-filtering, so it hears about 80 MHz around its LO folded into its 16 MHz
-window (flat to about 25 MHz from the LO, 5 dB down at 39, gone by 55). A
-burst is only known to within a multiple of 16 MHz, and tuning several ESPs
-to different frequencies does not split the band between them: each still
-hears all of it. With `-C 80` and `-i espdr` (every attached ESP) or a comma
-list (`-i espdr0,espdr2`), blue-dragon therefore tunes every ESP to the same
-LO, gives each a share of the channel positions in the window, and places
-each burst at every frequency it could have come from across 80 MHz. A BLE
-packet passes its CRC only at the channel it was sent on, so the decoders
-sort them out:
+    BD_ESPDR_GAINS=52,40,52,52,52 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats
 
-    BD_ESPDR_GAINS=52,52,52,52,52 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats
+`-C 80` with `-i espdr` (every attached ESP) or a comma list (`-i
+espdr0,espdr2`) makes the ESPs one 80 MHz receiver. blue-dragon picks the
+layout from how many there are:
 
-At 2441 MHz all three advertising channels are heard (they fold to
-different positions); five ESPs on one USB hub, four on their PCB antennas,
-received 815 advertising packets with a valid CRC in 28 s (301 on channel
-37, 353 on 38, 161 on 39). `BD_ESPDR_GAINS` sets each board's gain in board
-order: about 52 for a board on its PCB antenna, about 40 for one with an
-external antenna (it clips at 52); with a single antenna feeding every board
-through a splitter they would all hear the same signal.
+| ESPs | Layout | What each ESP hears | Channels reported |
+|---|---|---|---|
+| 5 | tiled | its own 16 MHz, tuned 16 MHz apart | the true channel |
+| 1-4 | folded | the whole band, folded into 16 MHz | true for BLE, may be a fold for Classic |
 
-Every board also sends the bursts at one shared position (where channel 38
-folds), so each board's sample clock is measured against a reference board's
-from the same packets, to a fraction of a microsecond, and followed as the
-crystals drift. The output timeline is the reference board's own sample
-count, so packets from all the boards keep the slot timing a single receiver
-would give them, which Classic address recovery depends on. Classic BR/EDR packets decode at every
-folded frequency, since their whitening does not depend on the channel; a
-piconet sends on one channel at a time, so the repeats are dropped and each
-packet is reported once, though its reported channel may be any of the
-folds. A BLE packet that fails its CRC is likewise dropped when a copy at
-another fold passes (failing packets are held about 30 ms for this). With
-an `l2ping` flood between two Classic devices, five ESPs reported about
-10,000 distinct Classic packets in 37 s alongside the BLE advertising.
+`BD_ESPDR_LAYOUT=tile` or `fold` overrides the choice. `BD_ESPDR_GAINS` sets
+each board's gain in board order: about 52 for a board on its PCB antenna,
+about 40 for one with an external antenna (it clips at 52). A single
+antenna feeding every board through a powered splitter would even them out.
+
+**The baseband filter.** The ESP's 16 Msps samples are its 80 Msps capture
+decimated without a digital filter, so its analog baseband filter is all
+that keeps signals outside the window from folding in. The eSpDR firmware
+leaves it wide open (about 69 MHz), and then a signal 23 MHz away comes
+through as strongly as one in the window. blue-dragon narrows it to code 54
+(set `BD_ESPDR_FILTER`, 0-63, larger is narrower) for a single ESP and when
+tiled; measured on channel 39, a signal 9 or 23 MHz outside the window then
+no longer came through while one 7 MHz inside still did, and the noise
+floor dropped. The register mapping and bandwidth calibration came from the
+[ESP-SDR](https://github.com/ESPARGOS/esp-sdr) project.
+
+**Tiled.** Each burst is placed once at the frequency it came from. Five
+ESPs on one USB hub, four on their PCB antennas, received 894 BLE
+advertising packets with a valid CRC in 25 s across channels 37, 38 and 39,
+and Classic packets at their true channels (15,000 in 38 s during an
+`l2ping` flood, with the link's UAP recovered). The four Classic channels
+on the boundaries between windows (2417, 2433, 2449, 2465 MHz at `-c 2441`)
+are not received.
+
+**Folded.** With the filter open each ESP hears about 80 MHz around its LO
+folded into its window (flat to about 25 MHz from the LO, 5 dB down at 39,
+gone by 55), so a burst is known only to within a multiple of 16 MHz. Every
+ESP is tuned to the same LO and sends only its share of the channel
+positions, and each burst is placed at every frequency it could have come
+from; a BLE packet passes its CRC only at the channel it was sent on, so the
+decoders sort them out. Two ESPs received 514 valid advertising packets in
+25 s across all three channels. Classic packets decode at every fold, since
+their whitening does not depend on the channel; a piconet sends on one
+channel at a time, so the repeats are dropped and each packet is reported
+once, though its reported channel may be any of the folds. A BLE packet
+that fails its CRC is likewise dropped when a copy at another fold passes
+(failing packets are held about 30 ms for this). Every board also sends the
+bursts where channel 38 folds, so each board's sample clock is measured
+against a reference board's from the same packets, to a fraction of a
+microsecond; the output timeline is the reference board's own sample count,
+so packets keep the slot timing a single receiver would give them.
 
 ### Feature Flags
 
