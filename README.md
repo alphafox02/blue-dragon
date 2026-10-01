@@ -51,7 +51,7 @@ dashboard for real-time monitoring.
 | Spectran V6 | `-i aaronia` | 46-245 MHz | f32 | Supported `-C` values: 46, 61, 77, 92, 122, 184, 245 (device-dependent). Other values snap up to the nearest supported clock automatically. |
 | RFNM (Lime) | `-i rfnm` or `-i rfnm-SERIAL` | 122 MHz | 12-bit | 122.88 Msps base clock, all 40 BLE channels |
 | Epiq Sidekiq family | `-i sidekiq-SERIAL` | per-device | 12 or 16 (per-device) | Bit depth, LO range, sample-rate range and gain index range are queried from the device at open; the recv path scales samples to i16 per the reported ADC resolution. Family includes Stretch / m.2-2280 / m.2 (3042) / mPCIe (AD9361/4, 12-bit); X2 / X4 / X40 / Nv100 / Nvm2 (16-bit). Opt-in `--features sidekiq`; requires libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`). |
-| ESP32-S3 (eSpDR, USB) | `-i espdr0` or `-i espdr:/dev/ttyACM0` | 16 MHz | 10-bit | Experimental. The ESP's own radio as a receiver, over its USB port with no extra hardware. Streams the bursts in one 16 MHz window, each cut to its channel on the ESP; USB bandwidth limits how many. Opt-in `--features espdr`; see [ESP32-S3](#esp32-s3-espdr). |
+| ESP32-S3 (eSpDR, USB) | `-i espdr0` or `-i espdr:/dev/ttyACM0` | 16 MHz | 10-bit | Experimental. The ESP's own radio as a receiver, over its USB port with no extra hardware. Streams bursts cut to their channel on the ESP; several ESPs on one LO cover the whole band through the ESP's 80 MHz fold (`-i espdr -C 80`). Opt-in `--features espdr`; see [ESP32-S3](#esp32-s3-espdr). |
 
 To list available SDR devices:
 
@@ -327,11 +327,38 @@ cycle restores the board), then point blue-dragon at it:
     cargo build --release --features espdr
     blue-dragon -l -i espdr0 -C 16 -c 2426 -g 28 --check-crc --stats
 
-Use `-C 16` (`-C 80` works only in snapshot mode, each capture covering 0.2 ms). `-c` sets the ESP's LO (2210-2790 MHz); 2426 centres the
-window on advertising channel 38. `-g` is the ESP's gain-table selector
-(0-127, not dB); with an antenna attached, values around 24-30 avoid
-clipping. With several ESPs attached, `espdr1`, `espdr2`, ... select them
-in the order of their USB serial port names.
+Use `-C 16` with a single ESP (`-i espdr0`; `-C 80` with a single named ESP
+takes 0.2 ms snapshots at 80 Msps). `-c` sets the ESP's LO (2210-2790 MHz);
+2426 centres the window on advertising channel 38. `-g` is the ESP's
+gain-table selector (0-127, not dB); with an antenna attached, values
+around 24-30 avoid clipping, while boards using their PCB antenna need
+about 52. With several ESPs attached, `espdr1`, `espdr2`, ... select them in
+the order of their USB serial port names.
+
+#### Whole band: the fold
+
+The ESP's 16 Msps samples are its 80 Msps capture decimated without
+filtering, so it hears about 80 MHz around its LO folded into its 16 MHz
+window (flat to about 25 MHz from the LO, 5 dB down at 39, gone by 55). A
+burst is only known to within a multiple of 16 MHz, and tuning several ESPs
+to different frequencies does not split the band between them: each still
+hears all of it. With `-C 80` and `-i espdr` (every attached ESP) or a comma
+list (`-i espdr0,espdr2`), blue-dragon therefore tunes every ESP to the same
+LO, gives each a share of the channel positions in the window, and places
+each burst at every frequency it could have come from across 80 MHz. A BLE
+packet passes its CRC only at the channel it was sent on, so the decoders
+sort them out:
+
+    BD_ESPDR_GAINS=52,52,52,52,52 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats
+
+At 2441 MHz all three advertising channels are heard (they fold to
+different positions); five ESPs on one USB hub, four on their PCB antennas,
+received 815 advertising packets with a valid CRC in 28 s (301 on channel
+37, 353 on 38, 161 on 39). `BD_ESPDR_GAINS` sets each board's gain in board
+order; with a single antenna feeding every board through a splitter they
+would all hear the same signal. Classic BR/EDR packets decode the same way,
+but their whitening does not depend on the channel, so each appears at every
+folded frequency.
 
 ### Feature Flags
 

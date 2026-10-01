@@ -8,6 +8,7 @@ license.workspace = true
 crossbeam.workspace = true
 libc = "0.2"
 log.workspace = true
+num-complex = { workspace = true, optional = true }
 prost = "0.13"
 serialport = { version = "4", optional = true }
 
@@ -21,7 +22,7 @@ hackrf = []
 bladerf = []
 usrp = []
 whad = ["dep:serialport"]
-espdr = ["dep:serialport"]
+espdr = ["dep:serialport", "dep:num-complex"]
 soapysdr = []
 aaronia = []
 rfnm = []
