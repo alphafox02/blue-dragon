@@ -358,7 +358,7 @@ enum Event {
     /// A burst ready for the timeline, from a record received at `seen`
     /// whose last pair was board pair `last`.
     Burst { board: usize, seen: Instant, last: u64, burst: Shaped },
-    Status { board: usize, seen: Instant, at: u64, usb_frame: Option<u16>, words: [u32; STATUS_WORDS] },
+    Status { board: usize, seen: Instant, at: u64, usb_frame: Option<u16>, words: Vec<u32> },
     /// The board's stream restarted and counts from 0 again.
     Restart { board: usize },
 }
@@ -376,6 +376,8 @@ fn board_loop(
     arg: u16,
     mask: u16,
 ) {
+    let mut telemetry = ReceiverTelemetry::default();
+    let mut telemetry_reported = Instant::now();
     let send = |event: Event| -> bool {
         let mut event = event;
         loop {
@@ -399,6 +401,13 @@ fn board_loop(
         let event = match link.next_record() {
             Ok(Record::End) => return,
             Ok(Record::Status { start, usb_frame, words }) => {
+                telemetry.add(&words);
+                if words.len() >= STATUS_V2_WORDS
+                    && telemetry_reported.elapsed() >= Duration::from_secs(1)
+                {
+                    telemetry.report(Some(board));
+                    telemetry_reported = Instant::now();
+                }
                 Event::Status { board, seen: Instant::now(), at: start, usb_frame, words }
             }
             Ok(Record::Narrow { start, offset, pairs }) => Event::Burst {

@@ -42,7 +42,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REQ_MAGIC: u8 = 0xB4;
 const RSP_MAGIC: u8 = 0xB5;
@@ -66,11 +66,14 @@ const STREAM_BURST: u16 = 1;
 const STREAM_STATUS: u16 = 2;
 const STREAM_END: u16 = 3;
 const STREAM_NARROW: u16 = 4;
+const STREAM_STATUS_V2: u16 = 5;
 const STREAM_REJECT_WIDEBAND: u16 = 1;
 const STREAM_CHANNELIZE: u16 = 2;
+const STREAM_TELEMETRY: u16 = 4;
 const STREAM_STATUS_USB_SOF: u32 = 0x8000;
 const STREAM_STATUS_USB_FRAME: u32 = 0x07FF;
 const STATUS_WORDS: usize = 8;
+const STATUS_V2_WORDS: usize = 16;
 /// Largest stretch of noise inserted for one gap (0.1 s at 16 Msps); a longer
 /// gap only happens across a restart, and its time is skipped.
 const MAX_GAP_PAIRS: u64 = 1_600_000;
@@ -236,7 +239,7 @@ enum Record {
     /// One channel of a burst at 4 Msps, mixed down by `offset` MHz
     /// (LO-minus-RF orientation, like the pairs).
     Narrow { start: u64, offset: i32, pairs: Vec<u32> },
-    Status { start: u64, usb_frame: Option<u16>, words: [u32; STATUS_WORDS] },
+    Status { start: u64, usb_frame: Option<u16>, words: Vec<u32> },
     End,
 }
 
@@ -299,14 +302,18 @@ impl EspLink {
                     Ok(Record::Burst { start, pairs })
                 }
             }
-            STREAM_STATUS => {
-                let mut payload = [0u8; STATUS_WORDS * 4];
+            STREAM_STATUS | STREAM_STATUS_V2 => {
+                let count = if kind == STREAM_STATUS { STATUS_WORDS } else { STATUS_V2_WORDS };
+                if kind == STREAM_STATUS_V2 && length != STATUS_V2_WORDS {
+                    return Err(format!("eSpDR: bad extended status length {}", length));
+                }
+                let mut payload = vec![0u8; count * 4];
                 self.read_exact(&mut payload)?;
                 self.read_exact(&mut check)?;
-                let mut words = [0u32; STATUS_WORDS];
-                for (w, b) in words.iter_mut().zip(payload.chunks_exact(4)) {
-                    *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                }
+                let words: Vec<u32> = payload
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
                 let sum = words.iter().fold(0u32, |a, &w| a.wrapping_add(w));
                 if sum != u32::from_le_bytes(check) {
                     return Err("eSpDR: stream status check failed".to_string());
@@ -512,8 +519,10 @@ fn convert_snapshot(words: &[u32], rng: &mut u32) -> Vec<i16> {
 fn stream_arg() -> (u16, bool, bool) {
     let reject = std::env::var_os("BD_ESPDR_KEEP_WIDEBAND").is_none();
     let channelize = std::env::var_os("BD_ESPDR_WIDE").is_none();
+    let telemetry = std::env::var_os("BD_ESPDR_TELEMETRY").is_some();
     let arg = if reject { STREAM_REJECT_WIDEBAND } else { 0 }
-        | if channelize { STREAM_CHANNELIZE } else { 0 };
+        | if channelize { STREAM_CHANNELIZE } else { 0 }
+        | if telemetry { STREAM_TELEMETRY } else { 0 };
     (arg, channelize, reject)
 }
 
@@ -605,6 +614,57 @@ fn resolve_port(iface: &str) -> Result<String, String> {
     })
 }
 
+#[derive(Default)]
+struct ReceiverTelemetry {
+    queue_high_water: u32,
+    triggers: u64,
+    trigger_power: f32,
+    trigger_floor: f32,
+    rejected: [u64; 3],
+    backlog: u32,
+}
+
+impl ReceiverTelemetry {
+    fn add(&mut self, words: &[u32]) {
+        if words.len() < STATUS_V2_WORDS {
+            return;
+        }
+        self.queue_high_water = self.queue_high_water.max(words[8]);
+        self.triggers += words[9] as u64;
+        let power = f32::from_bits(words[10]);
+        if power > self.trigger_power {
+            self.trigger_power = power;
+            self.trigger_floor = f32::from_bits(words[11]);
+        }
+        for (total, &value) in self.rejected.iter_mut().zip(&words[12..15]) {
+            *total += value as u64;
+        }
+        self.backlog = self.backlog.max(words[15]);
+    }
+
+    fn report(&mut self, board: Option<usize>) {
+        let trigger = if self.trigger_floor <= 0.0 {
+            0.0
+        } else {
+            self.trigger_power / self.trigger_floor
+        };
+        let label = board.map_or_else(|| "eSpDR".to_string(), |n| format!("eSpDR board {}", n));
+        eprintln!(
+            "{} rx: queue={}/{} triggers={} max={:.2}x reject(mask/env/power)={}/{}/{} backlog={}",
+            label,
+            self.queue_high_water,
+            64 * 1024,
+            self.triggers,
+            trigger,
+            self.rejected[0],
+            self.rejected[1],
+            self.rejected[2],
+            self.backlog,
+        );
+        *self = Self::default();
+    }
+}
+
 /// Receives the burst stream until stopped. Gain changes stop the stream,
 /// apply the setting and restart it, continuing the timeline.
 fn stream_loop(
@@ -616,6 +676,8 @@ fn stream_loop(
     arg: u16,
 ) {
     let mut timeline = Timeline::new(tx);
+    let mut telemetry = ReceiverTelemetry::default();
+    let mut telemetry_reported = Instant::now();
     while running.load(Ordering::Relaxed) {
         if let Ok(gain) = gain_rx.try_recv() {
             link.stop_stream();
@@ -650,6 +712,13 @@ fn stream_loop(
                 // Bursts the ESP dropped for queue space, plus blocks skipped
                 // when it fell behind.
                 overflow.store(words[3] as u64 + words[5] as u64, Ordering::Relaxed);
+                telemetry.add(&words);
+                if words.len() >= STATUS_V2_WORDS
+                    && telemetry_reported.elapsed() >= Duration::from_secs(1)
+                {
+                    telemetry.report(None);
+                    telemetry_reported = Instant::now();
+                }
                 if !timeline.fill_to(timeline.base + start) {
                     return;
                 }
@@ -882,6 +951,24 @@ mod tests {
         assert_eq!(resolve_port("espdr:/dev/ttyACM3").unwrap(), "/dev/ttyACM3");
         assert!(resolve_port("espdrX").is_err());
     }
+
+    #[test]
+    fn extended_status_accumulates() {
+        let mut status = vec![0; STATUS_V2_WORDS];
+        status[8] = 12000;
+        status[9] = 7;
+        status[10] = 20.0f32.to_bits();
+        status[11] = 4.0f32.to_bits();
+        status[12..16].copy_from_slice(&[1, 2, 3, 5000]);
+        let mut telemetry = ReceiverTelemetry::default();
+        telemetry.add(&status);
+        assert_eq!(telemetry.queue_high_water, 12000);
+        assert_eq!(telemetry.triggers, 7);
+        assert_eq!(telemetry.rejected, [1, 2, 3]);
+        assert_eq!(telemetry.backlog, 5000);
+        assert_eq!(telemetry.trigger_power / telemetry.trigger_floor, 5.0);
+    }
+
     fn drain(rx: &Receiver<Vec<i16>>) -> Vec<i16> {
         let mut all = Vec::new();
         while let Ok(chunk) = rx.try_recv() {
