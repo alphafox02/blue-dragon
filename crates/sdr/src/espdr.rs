@@ -696,12 +696,12 @@ fn stream_loop(
         match link.next_record() {
             Ok(Record::Burst { start, pairs }) => {
                 if !timeline.burst(start, &convert_pairs(&pairs)) {
-                    return;
+                    break; // stop the ESP's stream on the way out
                 }
             }
             Ok(Record::Narrow { start, offset, pairs }) => {
                 if !timeline.burst(start, &convert_narrow(&pairs, start, offset)) {
-                    return;
+                    break; // stop the ESP's stream on the way out
                 }
             }
             Ok(Record::Status { start, usb_frame: _, words }) => {
@@ -720,7 +720,7 @@ fn stream_loop(
                     telemetry_reported = Instant::now();
                 }
                 if !timeline.fill_to(timeline.base + start) {
-                    return;
+                    break; // stop the ESP's stream on the way out
                 }
             }
             Ok(Record::End) => return,
