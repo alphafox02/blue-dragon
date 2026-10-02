@@ -307,6 +307,8 @@ two simultaneous signals on different channels. Wi-Fi bursts are dropped on
 the ESP to save USB bandwidth (set `BD_ESPDR_KEEP_WIDEBAND=1` to keep them).
 `BD_ESPDR_TELEMETRY=1` enables once-per-second receiver diagnostics for
 controlled tests; it does not change the default stream format.
+`BD_ESPDR_TRIGGER_RATIO` can set the burst-to-noise power ratio from 3 to 31
+for controlled A/B tests; the default remains 4 (6 dB).
 
 On a busy band with an antenna at 2426 MHz this decoded 514 BLE packets
 with a valid CRC in 45 s (257 with whole-window bursts); with a Classic

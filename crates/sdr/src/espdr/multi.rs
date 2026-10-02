@@ -234,7 +234,7 @@ fn owner(k: i32, count: usize) -> usize {
 pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<EspdrHandle, String> {
     let count = paths.len();
     let gains = board_gains(count, gain)?;
-    let (stream_arg, channelize, reject) = stream_arg();
+    let (stream_arg, channelize, reject) = stream_arg()?;
     let t0 = Instant::now();
     let (event_tx, event_rx) = bounded::<Event>(4096);
     let running = Arc::new(AtomicBool::new(true));

@@ -70,6 +70,7 @@ const STREAM_STATUS_V2: u16 = 5;
 const STREAM_REJECT_WIDEBAND: u16 = 1;
 const STREAM_CHANNELIZE: u16 = 2;
 const STREAM_TELEMETRY: u16 = 4;
+const STREAM_TRIGGER_RATIO_SHIFT: u16 = 3;
 const STREAM_STATUS_USB_SOF: u32 = 0x8000;
 const STREAM_STATUS_USB_FRAME: u32 = 0x07FF;
 const STATUS_WORDS: usize = 8;
@@ -516,14 +517,29 @@ fn convert_snapshot(words: &[u32], rng: &mut u32) -> Vec<i16> {
 
 /// The ESP_STREAM argument from the environment, with whether it asks for
 /// channelized bursts and Wi-Fi rejection.
-fn stream_arg() -> (u16, bool, bool) {
+fn stream_arg() -> Result<(u16, bool, bool), String> {
     let reject = std::env::var_os("BD_ESPDR_KEEP_WIDEBAND").is_none();
     let channelize = std::env::var_os("BD_ESPDR_WIDE").is_none();
     let telemetry = std::env::var_os("BD_ESPDR_TELEMETRY").is_some();
+    let trigger_ratio = match std::env::var("BD_ESPDR_TRIGGER_RATIO") {
+        Ok(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|ratio| (3..=31).contains(ratio))
+            .ok_or_else(|| "BD_ESPDR_TRIGGER_RATIO must be an integer from 3 to 31".to_string())?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("BD_ESPDR_TRIGGER_RATIO is not valid text".to_string())
+        }
+    };
     let arg = if reject { STREAM_REJECT_WIDEBAND } else { 0 }
         | if channelize { STREAM_CHANNELIZE } else { 0 }
-        | if telemetry { STREAM_TELEMETRY } else { 0 };
-    (arg, channelize, reject)
+        | if telemetry { STREAM_TELEMETRY } else { 0 }
+        | trigger_ratio << STREAM_TRIGGER_RATIO_SHIFT;
+    if trigger_ratio != 0 {
+        eprintln!("eSpDR: burst trigger {}x noise", trigger_ratio);
+    }
+    Ok((arg, channelize, reject))
 }
 
 /// Opens the ESP at `path`, checks its firmware and tunes it, with baseband
@@ -806,7 +822,7 @@ impl EspdrHandle {
         let gain_sel = gain.clamp(0, 127) as u16;
         let (mut link, lo_hz) =
             open_board(&path, rate_sel, width, gain_sel, center_freq as u32, filter_code(FILTER_16M)?)?;
-        let (stream_arg, channelize, reject) = stream_arg();
+        let (stream_arg, channelize, reject) = stream_arg()?;
         let force_snapshot = std::env::var_os("BD_ESPDR_SNAPSHOT").is_some();
         let streaming = !force_snapshot && link.start_stream(stream_arg)?;
         if !streaming {
