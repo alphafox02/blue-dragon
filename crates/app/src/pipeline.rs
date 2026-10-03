@@ -2707,6 +2707,8 @@ fn open_sdr_handle(
     sidekiq_agc: bool,
     sidekiq_dc_corr: bool,
     sidekiq_gpsdo: bool,
+    espdr_load: bool,
+    espdr_image: Option<&Path>,
 ) -> Result<SdrHandle, String> {
     let sdr_type = detect_sdr_type(iface);
     match sdr_type {
@@ -2769,7 +2771,8 @@ fn open_sdr_handle(
         }
         #[cfg(feature = "espdr")]
         SdrType::Espdr => {
-            let h = bd_sdr::espdr::EspdrHandle::open(iface, sample_rate, center_freq_hz, gain as i32)?;
+            let load = bd_sdr::espdr::LoadOptions { enabled: espdr_load, image: espdr_image.map(Path::to_path_buf) };
+            let h = bd_sdr::espdr::EspdrHandle::open_with(iface, sample_rate, center_freq_hz, gain as i32, &load)?;
             Ok(SdrHandle::Espdr(h))
         }
         #[allow(unreachable_patterns)]
@@ -2796,6 +2799,10 @@ pub struct LiveConfig<'a> {
     /// Sidekiq: enable FPGA-based GPSDO (requires integrated GPS receiver +
     /// GPS antenna with lock).
     pub sidekiq_gpsdo: bool,
+    /// ESP32-S3: load the firmware into boards that need it.
+    pub espdr_load: bool,
+    /// ESP32-S3: firmware image for `espdr_load` (default: search paths).
+    pub espdr_image: Option<&'a Path>,
     pub antenna: Option<&'a str>,
     pub pcap_path: Option<&'a Path>,
     pub burst_path: Option<&'a Path>,
@@ -2846,6 +2853,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         sidekiq_agc,
         sidekiq_dc_corr,
         sidekiq_gpsdo,
+        espdr_load,
+        espdr_image,
         running,
     } = cfg;
     let sample_rate = num_channels as u32 * 1_000_000;
@@ -2919,7 +2928,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         .collect();
 
     // Open SDR early so we can query the actual sample rate for resample ratio.
-    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna, aaronia_decim, sidekiq_agc, sidekiq_dc_corr, sidekiq_gpsdo)?;
+    let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna, aaronia_decim, sidekiq_agc, sidekiq_dc_corr, sidekiq_gpsdo, espdr_load, espdr_image)?;
     let classic_alias_channels: Arc<[u32]> = sdr.classic_alias_channels().into();
 
     // Compute resample ratio: if actual per-channel rate differs from target

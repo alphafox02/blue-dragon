@@ -102,6 +102,17 @@ struct Cli {
     #[arg(long)]
     sidekiq_gpsdo: bool,
 
+    /// ESP32-S3: load the eSpDR firmware into the RAM of boards that are not
+    /// running it or run an older revision (nothing is written to flash; a
+    /// power cycle restores a board)
+    #[arg(long)]
+    espdr_load: bool,
+
+    /// ESP32-S3: firmware image for --espdr-load (default:
+    /// /usr/share/espdr/iq-source.bin, then /usr/local/share/espdr/iq-source.bin)
+    #[arg(long, value_name = "PATH")]
+    espdr_image: Option<std::path::PathBuf>,
+
     /// SDR antenna/RX port (e.g. RX2, TX/RX for USRP; RX1, RX2 for bladeRF)
     #[arg(long)]
     antenna: Option<String>,
@@ -629,6 +640,8 @@ fn main() {
             sidekiq_agc: cli.sidekiq_agc,
             sidekiq_dc_corr: !cli.sidekiq_no_dc,
             sidekiq_gpsdo: cli.sidekiq_gpsdo,
+            espdr_load: cli.espdr_load,
+            espdr_image: cli.espdr_image.as_deref(),
             antenna: cli.antenna.as_deref(),
             pcap_path: cli.write.as_deref(),
             burst_path: cli.write_bursts.as_deref(),

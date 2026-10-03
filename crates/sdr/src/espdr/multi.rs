@@ -283,7 +283,7 @@ fn owner(k: i32, count: usize) -> usize {
     (k + 8) as usize % count
 }
 
-pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<EspdrHandle, String> {
+pub(super) fn open(paths: &[String], center_freq: u64, gain: i32, load: &LoadOptions) -> Result<EspdrHandle, String> {
     let count = paths.len();
     let gains = board_gains(count, gain)?;
     let (stream_arg, channelize, reject) = stream_arg()?;
@@ -322,7 +322,7 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
     for (index, path) in paths.iter().enumerate() {
         let offset = if folded { 0 } else { tile_offset_half_mhz(index, count, layout) };
         let lo = (center_freq as i64 + offset * HALF_MHZ_HZ) as u32;
-        let (link, tuned) = open_board(path, 1, 20, gains[index], lo, filter)?;
+        let (link, tuned) = open_board(path, 1, 20, gains[index], lo, filter, load)?;
         if offset == 0 {
             lo_hz = tuned;
         }
