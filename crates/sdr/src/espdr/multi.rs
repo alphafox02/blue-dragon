@@ -8,8 +8,10 @@
 //! Bluetooth channel lies on a boundary, and each burst is placed once
 //! at its own frequency, which the receiver itself then gives. With fewer
 //! boards they are folded: the filter is opened so that each hears the whole
-//! band, as described below. `BD_ESPDR_LAYOUT` (`tile` or `fold`) and
-//! `BD_ESPDR_FILTER` override the choice.
+//! band, as described below. `BD_ESPDR_LAYOUT` (`tile`, `tile-ble`, or
+//! `fold`) and `BD_ESPDR_FILTER` override the choice. `tile-ble` tunes
+//! the top board 1 MHz higher for stronger BLE advertising reception, at the
+//! cost of one Classic channel; ordinary `tile` retains complete coverage.
 //!
 //! Folded:
 //! At 16 Msps an ESP's samples are its 80 Msps capture decimated by five
@@ -123,9 +125,18 @@ enum Layout {
     /// Filter narrowed: each board hears its own 16 MHz; boards tuned 16 MHz
     /// apart.
     Tiled,
+    /// As tiled, but move the upper board 1 MHz to keep BLE advertising
+    /// channel 39 away from the analog filter's outer edge.
+    TiledBle,
     /// Filter open: each board hears 80 MHz folded; boards on one LO, sharing
     /// out the channel positions.
     Folded,
+}
+
+impl Layout {
+    fn tiled(self) -> bool {
+        self != Self::Folded
+    }
 }
 
 /// The layout for `count` boards, and the filter code it wants.
@@ -133,20 +144,27 @@ fn layout(count: usize) -> Result<(Layout, u16), String> {
     let tiles = (FOLD_RATE / 16_000_000) as usize;
     let layout = match std::env::var("BD_ESPDR_LAYOUT").as_deref() {
         Ok("tile") => Layout::Tiled,
+        Ok("tile-ble") => Layout::TiledBle,
         Ok("fold") => Layout::Folded,
-        Ok(other) => return Err(format!("eSpDR: BD_ESPDR_LAYOUT must be tile or fold, got '{}'", other)),
+        Ok(other) => return Err(format!(
+            "eSpDR: BD_ESPDR_LAYOUT must be tile, tile-ble, or fold, got '{}'", other
+        )),
         Err(_) if count >= tiles => Layout::Tiled,
         Err(_) => Layout::Folded,
     };
-    let filter = filter_code(if layout == Layout::Tiled { FILTER_16M } else { 0 })?;
+    let filter = filter_code(if layout.tiled() { FILTER_16M } else { 0 })?;
     Ok((layout, filter))
 }
 
 /// Half-MHz units from the centre to board `index` of `count` when tiled.
 /// The half-MHz stagger puts integer-MHz Bluetooth channels inside one tile
 /// or the other rather than exactly on a 16 MHz boundary.
-fn tile_offset_half_mhz(index: usize, count: usize) -> i64 {
-    32 * index as i64 - 16 * (count as i64 - 1) - 1
+///
+/// In the BLE-optimised layout the upper board moves 1 MHz so advertising
+/// channel 39 is 1 MHz inside the analog filter rather than on its weak edge.
+fn tile_offset_half_mhz(index: usize, count: usize, layout: Layout) -> i64 {
+    let ble_top = layout == Layout::TiledBle && index + 1 == count;
+    32 * index as i64 - 16 * (count as i64 - 1) - 1 + if ble_top { 2 } else { 0 }
 }
 
 /// The serial ports to use for `iface` at `sample_rate`, or None for a
@@ -178,7 +196,8 @@ pub(super) fn boards_for(iface: &str, sample_rate: u32) -> Result<Option<Vec<Str
     if paths.is_empty() {
         return Err("eSpDR: no ESP32-S3 USB serial ports found".to_string());
     }
-    let paths = if layout(paths.len())?.0 == Layout::Tiled && paths.len() > tiles {
+    let selected = layout(paths.len())?.0;
+    let paths = if selected.tiled() && paths.len() > tiles {
         if list {
             return Err(format!("eSpDR: at most {} ESPs tile 80 MHz, {} were named", tiles, paths.len()));
         }
@@ -186,6 +205,13 @@ pub(super) fn boards_for(iface: &str, sample_rate: u32) -> Result<Option<Vec<Str
     } else {
         paths
     };
+    if selected == Layout::TiledBle && paths.len() != tiles {
+        return Err(format!(
+            "eSpDR: BD_ESPDR_LAYOUT=tile-ble needs exactly {} boards, got {}",
+            tiles,
+            paths.len()
+        ));
+    }
     Ok(Some(paths))
 }
 
@@ -243,6 +269,18 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
     let mut lo_hz = center_freq as u32;
     let (layout, filter) = layout(count)?;
     let folded = layout == Layout::Folded;
+    if layout == Layout::TiledBle && count != (FOLD_RATE / 16_000_000) as usize {
+        return Err(format!("eSpDR: BLE tiling needs exactly 5 boards, got {}", count));
+    }
+    if layout == Layout::TiledBle && center_freq != 2_441_000_000 {
+        return Err(format!(
+            "eSpDR: BD_ESPDR_LAYOUT=tile-ble covers Bluetooth at -c 2441, got {:.3} MHz",
+            center_freq as f64 / 1e6
+        ));
+    }
+    if layout == Layout::TiledBle {
+        eprintln!("eSpDR: BLE tiling enabled; 2465 MHz Classic channel 63 is not received");
+    }
     // Whole-window bursts cannot be shared by position, nor aligned by one;
     // tiled boards hear nothing in common.
     let sync = if folded && channelize && count > 1 {
@@ -255,7 +293,7 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
     // none of the others streaming with no one to read or stop it.
     let mut boards = Vec::with_capacity(count);
     for (index, path) in paths.iter().enumerate() {
-        let offset = if folded { 0 } else { tile_offset_half_mhz(index, count) };
+        let offset = if folded { 0 } else { tile_offset_half_mhz(index, count, layout) };
         let lo = (center_freq as i64 + offset * HALF_MHZ_HZ) as u32;
         let (link, tuned) = open_board(path, 1, 20, gains[index], lo, filter)?;
         if offset == 0 {
@@ -1509,22 +1547,22 @@ mod tests {
         // Board 4 of 5 tiled (LO 31.5 MHz above the centre) places the
         // centre of channelizer bin -7 only at +38.5 MHz. A real Bluetooth
         // channel at +39 retains its +0.5 MHz residual inside that bin.
-        let shaper = Shaper::new(Some(tile_offset_half_mhz(4, 5)));
+        let shaper = Shaper::new(Some(tile_offset_half_mhz(4, 5, Layout::Tiled)));
         let s = shaper.narrow(1000, -7, &vec![100u32; 1000]);
         let mid = 2000..18000;
         assert!(share_at(&s.samples, mid.clone(), 38.5) > 0.99);
         assert!(share_at(&s.samples, mid, 22.5) < 1e-6);
         assert_eq!(
             (0..5)
-                .map(|i| tile_offset_half_mhz(i, 5))
+                .map(|i| tile_offset_half_mhz(i, 5, Layout::Tiled))
                 .collect::<Vec<_>>(),
             vec![-65, -33, -1, 31, 63]
         );
     }
 
     #[test]
-    fn tiled_boards_cover_every_classic_channel_away_from_a_seam() {
-        let los: Vec<i64> = (0..5).map(|i| tile_offset_half_mhz(i, 5)).collect();
+    fn tiled_boards_cover_every_classic_channel() {
+        let los: Vec<i64> = (0..5).map(|i| tile_offset_half_mhz(i, 5, Layout::Tiled)).collect();
         // Classic channels 0..78 are -39..+39 MHz around 2441. Each is no
         // farther than 7.5 MHz from exactly one LO, so the firmware's
         // channelizer (-7..+7 whole-MHz bins) retains it with a 0.5 MHz
@@ -1534,5 +1572,25 @@ mod tests {
             let receivers = los.iter().filter(|&&lo| (rf_half_mhz - lo).abs() <= 15).count();
             assert_eq!(receivers, 1, "{} MHz has {} tiles", rf_mhz, receivers);
         }
+    }
+
+    #[test]
+    fn ble_tiling_covers_ble_and_moves_advertising_channels_inside() {
+        let los: Vec<i64> = (0..5).map(|i| tile_offset_half_mhz(i, 5, Layout::TiledBle)).collect();
+        assert_eq!(los, [-65, -33, -1, 31, 65]);
+        // BLE channels are 2402..2480 MHz in 2 MHz steps: -39..+39 MHz,
+        // odd offsets from 2441.
+        for rf_mhz in (-39..=39).step_by(2) {
+            let receivers = los.iter().filter(|&&lo| (2 * rf_mhz - lo).abs() <= 15).count();
+            assert_eq!(receivers, 1, "{} MHz has {} tiles", rf_mhz, receivers);
+        }
+        // Advertising channels 37, 38 and 39 (2402, 2426, 2480) sit at
+        // least 1 MHz inside their tile.
+        for rf_mhz in [-39i64, -15, 39] {
+            assert!(los.iter().any(|&lo| (2 * rf_mhz - lo).abs() <= 13), "{} MHz is on a tile edge", rf_mhz);
+        }
+        // Relative +24 MHz is Classic channel 63 at 2465 MHz. This is the
+        // one deliberate hole in this opt-in layout.
+        assert!(!los.iter().any(|&lo| (48 - lo).abs() <= 15));
     }
 }

@@ -356,8 +356,11 @@ layout from how many there are:
 | 5 | tiled | its own 16 MHz, tuned 16 MHz apart | the true channel |
 | 1-4 | folded | the whole band, folded into 16 MHz | true for BLE, may be a fold for Classic |
 
-`BD_ESPDR_LAYOUT=tile` or `fold` overrides the choice. `BD_ESPDR_GAINS` sets
-each board's gain in board order. It is worth tuning per board: the gain
+`BD_ESPDR_LAYOUT=tile`, `tile-ble`, or `fold` overrides the choice. `tile`
+is the five-board default and retains every Classic channel. `tile-ble` is
+an opt-in five-board layout for `-c 2441` that favours BLE advertising
+reception as described below. `BD_ESPDR_GAINS` sets each board's gain in
+board order. It is worth tuning per board: the gain
 table is not monotonic, and boards of the same kind differ. Here, boards on
 their PCB antennas did best at 44 or 56 (one decoded nothing at 44 but 150
 packets on channel 39 in 15 s at 48 or 56), one with an external antenna at
@@ -387,6 +390,15 @@ and Classic packets at their true channels (15,000 in 38 s during an
 `l2ping` flood, with the link's UAP recovered). A 29 s run with the staggered
 LOs received 5,968 Classic packets and all four former boundary channels
 (2417, 2433, 2449 and 2465 MHz).
+
+A board's outermost channels, 7.5 MHz from its LO, lose several dB to the
+baseband filter. In the complete layout that edge falls on 2480 MHz
+(advertising channel 39), where one test received 8-18 valid packets in 15
+s. `BD_ESPDR_LAYOUT=tile-ble` tunes the top board 1 MHz higher and brought
+that to 56-91 packets, increasing the total by about a third. It deliberately
+does not receive 2465 MHz (Classic channel 63), so use it for BLE-focused
+captures rather than as the general default. The program prints that
+trade-off at startup when the profile is selected.
 
 Current eSpDR firmware also latches each board's sample count on common USB
 start-of-frame boundaries (every device below one USB host sees the same
