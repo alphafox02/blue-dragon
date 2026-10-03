@@ -20,7 +20,7 @@ dashboard for real-time monitoring.
 | USRP B210 capture | Tested | USB 3, validated at -C 40 and -C 60 |
 | BLE LE 1M decoding | Tested | 95-96% CRC pass rate |
 | BLE LE 2M decoding | Tested | |
-| BLE LE Coded decoding | Tested | Low volume confirmed in drive tests |
+| BLE LE Coded decoding | Tested | Controlled Coded-PHY advertising and drive captures confirmed |
 | Classic BT BR detection | Tested | LAP extraction and CRC-valid BR payloads confirmed OTA |
 | Classic BT UAP recovery | Tested | Autonomous OTA recovery confirmed from two clock-consistent, CRC-valid payloads |
 | Classic BT EDR decoding | Experimental | Sync, DQPSK/8DPSK, matched filter, and CRC paths are unit-tested; CRC-valid OTA EDR not yet confirmed |
@@ -645,7 +645,8 @@ Capture BLE 5 Long Range (LE Coded PHY) on advertising channels:
 Without `--coded-scan`, coded decoding still runs on any squelch-triggered
 burst that fails LE 1M and BT decode. The flag adds continuous sampling on
 channels 37/38/39 to catch weak coded signals below the normal squelch
-threshold.
+threshold. Overlapping scan windows and the normal squelch path are
+de-duplicated, so one RF transmission is reported once.
 
 Read from a previously recorded IQ file:
 

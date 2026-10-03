@@ -1,6 +1,7 @@
 // Copyright 2025-2026 CEMAXECUTER LLC
 
 use crate::ble::{BlePacket, BLE_ADV_AA};
+use std::collections::VecDeque;
 
 pub const BLE_MAX_CONNECTIONS: usize = 128;
 
@@ -124,6 +125,12 @@ pub fn predict_channels(
 
 /// How close in time two BLE decodes must be to be one transmission.
 const FOLD_WINDOW_NS: i64 = 20_000;
+/// Continuous coded-PHY scan windows overlap, and a packet above squelch is
+/// also decoded through the normal burst path. Their corrected timestamps
+/// should agree closely; this tolerance covers channelizer timing skew.
+const CODED_COPY_WINDOW_NS: i64 = 2_000_000;
+const CODED_MEMORY_NS: i64 = 50_000_000;
+const CODED_MEMORY_ENTRIES: usize = 128;
 
 /// Connection table: tracks active BLE connections from CONNECT_IND PDUs
 pub struct ConnectionTable {
@@ -132,6 +139,8 @@ pub struct ConnectionTable {
     /// back in case a copy that passes is still to come.
     fold: crate::fold::FoldMemory,
     held: crate::fold::Held<BlePacket>,
+    coded_recent: VecDeque<(i64, u32, Vec<u8>)>,
+    coded_newest: i64,
 }
 
 impl ConnectionTable {
@@ -140,7 +149,13 @@ impl ConnectionTable {
         for _ in 0..BLE_MAX_CONNECTIONS {
             slots.push(BleConnection::default());
         }
-        Self { slots, fold: crate::fold::FoldMemory::new(), held: crate::fold::Held::new() }
+        Self {
+            slots,
+            fold: crate::fold::FoldMemory::new(),
+            held: crate::fold::Held::new(),
+            coded_recent: VecDeque::new(),
+            coded_newest: 0,
+        }
     }
 
     /// Holds a packet whose CRC failed for a short while (see `crate::fold`).
@@ -171,6 +186,33 @@ impl ConnectionTable {
     /// CRC, so callers drop copies that fail theirs.
     pub fn is_fold_copy(&mut self, pkt: &BlePacket) -> bool {
         self.fold.seen(pkt.aa, pkt.freq, &pkt.timestamp, FOLD_WINDOW_NS)
+    }
+
+    /// Records a CRC-valid coded-PHY packet and returns true when the same
+    /// packet was already decoded from an overlapping scan or normal burst.
+    pub fn is_coded_copy(&mut self, pkt: &BlePacket) -> bool {
+        if pkt.phy != crate::ble::BlePhy::PhyCoded || !pkt.crc_valid {
+            return false;
+        }
+        let t = pkt.timestamp.tv_sec as i64 * 1_000_000_000 + pkt.timestamp.tv_nsec as i64;
+        self.coded_newest = self.coded_newest.max(t);
+        while self
+            .coded_recent
+            .front()
+            .is_some_and(|(at, _, _)| self.coded_newest - at > CODED_MEMORY_NS)
+        {
+            self.coded_recent.pop_front();
+        }
+        let copy = self.coded_recent.iter().any(|(at, freq, data)| {
+            *freq == pkt.freq && (t - at).abs() <= CODED_COPY_WINDOW_NS && data == &pkt.data
+        });
+        if !copy {
+            if self.coded_recent.len() >= CODED_MEMORY_ENTRIES {
+                self.coded_recent.pop_front();
+            }
+            self.coded_recent.push_back((t, pkt.freq, pkt.data.clone()));
+        }
+        copy
     }
 
     /// Count active connections
@@ -377,6 +419,34 @@ impl Default for ConnectionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coded_packet(ns: u64, freq: u32, data: &[u8]) -> BlePacket {
+        BlePacket {
+            aa: BLE_ADV_AA,
+            rssi_db: -40,
+            noise_db: -90,
+            freq,
+            len: data.len(),
+            timestamp: crate::Timespec { tv_sec: 100, tv_nsec: ns },
+            crc_checked: true,
+            crc_valid: true,
+            is_data: false,
+            conn_valid: false,
+            phy: crate::ble::BlePhy::PhyCoded,
+            ext_header: None,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn coded_scan_copies_are_dropped_without_hiding_new_transmissions() {
+        let mut table = ConnectionTable::new();
+        assert!(!table.is_coded_copy(&coded_packet(10_000_000, 2426, &[1, 2, 3])));
+        assert!(table.is_coded_copy(&coded_packet(10_500_000, 2426, &[1, 2, 3])));
+        assert!(!table.is_coded_copy(&coded_packet(10_500_000, 2426, &[1, 2, 4])));
+        assert!(!table.is_coded_copy(&coded_packet(10_500_000, 2402, &[1, 2, 3])));
+        assert!(!table.is_coded_copy(&coded_packet(30_100_000, 2426, &[1, 2, 3])));
+    }
 
     #[test]
     fn test_connection_table_add_lookup() {
