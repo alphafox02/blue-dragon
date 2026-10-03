@@ -36,6 +36,7 @@
 //! burst came from (see `multi`).
 
 mod multi;
+mod rom;
 
 use crossbeam::channel::{bounded, Receiver, Sender, TrySendError};
 use std::io::{Read, Write};
@@ -58,8 +59,16 @@ const ESP_SNAPSHOT: u8 = 40;
 const ESP_STREAM: u8 = 41;
 const ESP_STAT_RADIO: u16 = 13;
 const CTL_UNKNOWN_OP: u8 = 1;
+const CTL_BAD_ARGUMENT: u8 = 2;
 const CTL_NOT_READY: u8 = 4;
 const CTL_ESP_FIRMWARE_ID: u32 = 0x4951_5305;
+/// CTL_INFO argument for the firmware revision (answered from revision 1 on).
+const CTL_INFO_REVISION: u16 = 3;
+/// The oldest firmware revision this build expects; older boards still work
+/// but miss later receiver fixes.
+const MIN_FIRMWARE_REVISION: u32 = 1;
+/// Where `--espdr-load` looks for the firmware image when none is named.
+const IMAGE_SEARCH: [&str; 2] = ["/usr/share/espdr/iq-source.bin", "/usr/local/share/espdr/iq-source.bin"];
 const SNAP_MAGIC: u32 = 0x5041_4E53;
 const STREAM_MAGIC: u32 = 0x5453_5242;
 const STREAM_BURST: u16 = 1;
@@ -577,6 +586,107 @@ fn stream_arg() -> Result<(u16, bool, bool), String> {
     Ok((arg, channelize, reject))
 }
 
+/// Whether to load the eSpDR firmware into the RAM of boards that are not
+/// running it, or run an older revision than this build expects, and which
+/// image to load (see `find_image`).
+#[derive(Clone, Debug, Default)]
+pub struct LoadOptions {
+    pub enabled: bool,
+    pub image: Option<std::path::PathBuf>,
+}
+
+/// The firmware image for `--espdr-load`: the one named, else
+/// `BD_ESPDR_IMAGE`, else the first of `IMAGE_SEARCH` that exists.
+fn find_image(load: &LoadOptions) -> Result<std::path::PathBuf, String> {
+    let named = load.image.clone().or_else(|| std::env::var_os("BD_ESPDR_IMAGE").map(Into::into));
+    pick_image(named, &IMAGE_SEARCH)
+}
+
+fn pick_image(named: Option<std::path::PathBuf>, search: &[&str]) -> Result<std::path::PathBuf, String> {
+    if let Some(path) = named {
+        return if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!("eSpDR: no firmware image at {}", path.display()))
+        };
+    }
+    search
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            format!(
+                "eSpDR: no firmware image to load (looked in {}); download iq-source.bin from \
+                 https://github.com/alphafox02/eSpDR/releases and pass --espdr-image PATH",
+                search.join(", ")
+            )
+        })
+}
+
+/// Opens the link to the eSpDR firmware at `path` and returns it with the
+/// firmware's revision (0 for firmware from before revisions).
+fn probe(path: &str) -> Result<(EspLink, u32), String> {
+    let mut link = EspLink::open(path)?;
+    let id = link.handshake()?;
+    if id != CTL_ESP_FIRMWARE_ID {
+        return Err(format!("eSpDR: unexpected firmware id {:#010x} on {}", id, path));
+    }
+    let revision = match link.request(CTL_INFO, CTL_INFO_REVISION)? {
+        (0, revision) => revision,
+        (CTL_BAD_ARGUMENT, _) => 0,
+        (status, _) => return Err(format!("eSpDR: revision query failed with status {} on {}", status, path)),
+    };
+    Ok((link, revision))
+}
+
+/// Connects to the eSpDR firmware at `path`, first loading it into the
+/// board's RAM if `load` asks for that and the board is not running it or
+/// runs an older revision.
+fn connect(path: &str, load: &LoadOptions) -> Result<EspLink, String> {
+    match probe(path) {
+        Ok((link, revision)) if revision >= MIN_FIRMWARE_REVISION => return Ok(link),
+        Ok((link, revision)) if !load.enabled => {
+            eprintln!(
+                "eSpDR: {} runs firmware revision {}, older than this build expects ({}); \
+                 --espdr-load updates it",
+                path, revision, MIN_FIRMWARE_REVISION
+            );
+            return Ok(link);
+        }
+        Err(e) if !load.enabled => {
+            return Err(format!(
+                "{} (the ESP at {} is not running the eSpDR firmware: --espdr-load loads it into RAM, \
+                 or power-cycle a board left busy)",
+                e, path
+            ))
+        }
+        _ => {}
+    }
+    let image_path = find_image(load)?;
+    let bytes = std::fs::read(&image_path)
+        .map_err(|e| format!("eSpDR: cannot read {}: {}", image_path.display(), e))?;
+    let image = rom::Image::parse(&bytes).map_err(|e| format!("eSpDR: {}: {}", image_path.display(), e))?;
+    eprintln!(
+        "eSpDR: loading {} into the RAM of {} (a power cycle restores the board)",
+        image_path.display(),
+        path
+    );
+    rom::load_ram(path, &image).map_err(|e| format!("eSpDR: loading the firmware failed: {}", e))?;
+    std::thread::sleep(Duration::from_secs(1)); // the firmware brings up its radio
+    let (link, revision) =
+        probe(path).map_err(|e| format!("{} (after loading {} into {})", e, image_path.display(), path))?;
+    if revision < MIN_FIRMWARE_REVISION {
+        eprintln!(
+            "eSpDR: {} holds firmware revision {}, older than this build expects ({}); \
+             use a newer release",
+            image_path.display(),
+            revision,
+            MIN_FIRMWARE_REVISION
+        );
+    }
+    Ok(link)
+}
+
 /// Opens the ESP at `path`, checks its firmware and tunes it, with baseband
 /// filter code `filter` at 16 Msps. Returns the link and the LO actually
 /// tuned, in Hz.
@@ -587,17 +697,9 @@ fn open_board(
     gain_sel: u16,
     lo_hz: u32,
     filter: u16,
+    load: &LoadOptions,
 ) -> Result<(EspLink, u32), String> {
-    let mut link = EspLink::open(path)?;
-    let id = link.handshake().map_err(|e| {
-        format!(
-            "{} (the ESP at {} did not answer: load the firmware into its RAM again, or power-cycle it)",
-            e, path
-        )
-    })?;
-    if id != CTL_ESP_FIRMWARE_ID {
-        return Err(format!("eSpDR: unexpected firmware id {:#010x} on {}", id, path));
-    }
+    let mut link = connect(path, load)?;
     if link.command(CTL_STATUS, ESP_STAT_RADIO)? != 0 {
         return Err(format!("eSpDR: radio initialisation failed on the ESP at {}", path));
     }
@@ -853,8 +955,20 @@ impl EspdrHandle {
     /// `sample_rate` must be 16 or 80 Msps; `gain` is the ESP gain-table
     /// selector (0..127, not dB; about 24..30 suits a nearby antenna).
     pub fn open(iface: &str, sample_rate: u32, center_freq: u64, gain: i32) -> Result<Self, String> {
+        Self::open_with(iface, sample_rate, center_freq, gain, &LoadOptions::default())
+    }
+
+    /// As `open`, loading the firmware into boards that need it when `load`
+    /// asks for that.
+    pub fn open_with(
+        iface: &str,
+        sample_rate: u32,
+        center_freq: u64,
+        gain: i32,
+        load: &LoadOptions,
+    ) -> Result<Self, String> {
         if let Some(paths) = multi::boards_for(iface, sample_rate)? {
-            return multi::open(&paths, center_freq, gain);
+            return multi::open(&paths, center_freq, gain, load);
         }
         let (rate_sel, width) = match sample_rate {
             16_000_000 => (1u16, 20u16),
@@ -869,7 +983,7 @@ impl EspdrHandle {
         let path = resolve_port(iface)?;
         let gain_sel = gain.clamp(0, 127) as u16;
         let (mut link, lo_hz) =
-            open_board(&path, rate_sel, width, gain_sel, center_freq as u32, filter_code(FILTER_16M)?)?;
+            open_board(&path, rate_sel, width, gain_sel, center_freq as u32, filter_code(FILTER_16M)?, load)?;
         let (stream_arg, channelize, reject) = stream_arg()?;
         let force_snapshot = std::env::var_os("BD_ESPDR_SNAPSHOT").is_some();
         let streaming = !force_snapshot && link.start_stream(stream_arg)?;
@@ -1091,6 +1205,27 @@ mod tests {
         assert!(t.fill_to(MAX_GAP_PAIRS * 3));
         assert_eq!(t.emitted, MAX_GAP_PAIRS * 3);
         assert_eq!(drain(&rx).len() as u64, 2 * MAX_GAP_PAIRS);
+    }
+
+    #[test]
+    fn firmware_image_search_order() {
+        let dir = std::env::temp_dir().join(format!("bd-espdr-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.bin");
+        let second = dir.join("second.bin");
+        std::fs::write(&second, b"x").unwrap();
+        let (first_s, second_s) = (first.to_str().unwrap(), second.to_str().unwrap());
+        // The first search path that exists wins.
+        assert_eq!(pick_image(None, &[first_s, second_s]).unwrap(), second);
+        std::fs::write(&first, b"x").unwrap();
+        assert_eq!(pick_image(None, &[first_s, second_s]).unwrap(), first);
+        // A named image wins, and must exist.
+        assert_eq!(pick_image(Some(second.clone()), &[first_s]).unwrap(), second);
+        assert!(pick_image(Some(dir.join("missing.bin")), &[first_s]).is_err());
+        // Nothing found: the error says where it looked.
+        let err = pick_image(None, &["/nonexistent/a.bin"]).unwrap_err();
+        assert!(err.contains("/nonexistent/a.bin") && err.contains("--espdr-image"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

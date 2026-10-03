@@ -108,6 +108,12 @@ Build with all SDR backends:
 
     cargo build --release --features "usrp,hackrf,bladerf,soapysdr,zmq,gps"
 
+ESP32-S3 boards as receivers (see [ESP32-S3](#esp32-s3-espdr)) need the
+`espdr` feature and libudev's headers:
+
+    sudo apt install libudev-dev
+    cargo build --release --features "usrp,hackrf,bladerf,soapysdr,zmq,gps,espdr"
+
 Optional GPU acceleration (OpenCL):
 
     sudo apt install ocl-icd-opencl-dev
@@ -328,21 +334,27 @@ without channelization sends whole-window bursts, and firmware without
 streaming falls back to 1 ms snapshots automatically (`BD_ESPDR_SNAPSHOT=1`
 forces that mode).
 
-Load the firmware into the ESPs' RAM (nothing is written to flash; a power
-cycle restores a board), then point blue-dragon at them. The fork's
-releases carry a prebuilt `iq-source.bin`, and its loader handles every
-attached ESP32-S3 at once and checks each one answers:
+The ESPs run the fork's firmware from RAM (nothing is written to flash; a
+power cycle restores a board). With `--espdr-load`, blue-dragon loads it
+itself into any ESP that is not running it, or runs an older revision,
+before starting; ESPs already running it are used as they are. Download
+`iq-source.bin` from the fork's
+[releases](https://github.com/alphafox02/eSpDR/releases) and either pass
+it with `--espdr-image PATH` or install it as
+`/usr/share/espdr/iq-source.bin` (or `/usr/local/share/espdr/`), where
+`--espdr-load` looks by default (`BD_ESPDR_IMAGE` also names it). The
+loader talks to the ESP32-S3's ROM directly; esptool is not needed.
 
-    git clone https://github.com/alphafox02/eSpDR && cd eSpDR
-    pip install esptool pyserial numpy
-    # iq-source.bin from https://github.com/alphafox02/eSpDR/releases
-    python3 usb/load.py --image iq-source.bin
+    cargo build --release --features espdr     # needs libudev-dev
+    blue-dragon -l -i espdr0 -C 16 -c 2426 -g 28 --check-crc --stats --espdr-load --espdr-image iq-source.bin
 
-To build the image instead: `. $IDF_PATH/export.sh` (ESP-IDF v5.5.3 or
-later), `make -C esp32s3`, then `python3 usb/load.py`.
-
-    cargo build --release --features espdr
-    blue-dragon -l -i espdr0 -C 16 -c 2426 -g 28 --check-crc --stats
+Without `--espdr-load`, an ESP that does not answer stops blue-dragon with
+a message saying so, and one with older firmware is used with a warning.
+The flag is opt-in because `-i espdr` takes every attached ESP32-S3, and an
+ESP32-S3 running other firmware would be reset into this one. The fork's
+own loader does the same from Python (`python3 usb/load.py --image
+iq-source.bin`, with esptool), and building the image yourself takes
+`. $IDF_PATH/export.sh` (ESP-IDF v5.5.3 or later) and `make -C esp32s3`.
 
 Use `-C 16` with a single ESP (`-i espdr0`; `-C 80` with a single named ESP
 takes 0.2 ms snapshots at 80 Msps). `-c` sets the ESP's LO (2210-2790 MHz);
@@ -354,7 +366,7 @@ the order of their USB serial port names.
 
 #### Whole band with several ESPs
 
-    BD_ESPDR_GAINS=44,28,44,44,56 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats
+    BD_ESPDR_GAINS=44,28,44,44,56 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats --espdr-load
 
 `-C 80` with `-i espdr` (every attached ESP) or a comma list (`-i
 espdr0,espdr2`) makes the ESPs one 80 MHz receiver. blue-dragon picks the
