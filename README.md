@@ -174,8 +174,9 @@ GPU acceleration is not recommended on Pi -- the VideoCore GPU cannot
 keep up with the PFB+FFT workload and the submission overhead exceeds
 any compute savings. The CPU NEON path is faster on Pi hardware.
 
-USRP is possible but UHD on Pi is heavy. SoapySDR with an RTL-SDR,
-Airspy, or HackRF is the better fit for Pi deployments.
+USRP is possible but UHD on Pi is heavy. A HackRF (directly or through
+SoapySDR) or ESP32-S3 boards (`espdr`) are the better fit for Pi
+deployments; RTL-SDR and Airspy receivers do not tune to 2.4 GHz.
 
 ### macOS (Homebrew) -- Untested
 
@@ -771,8 +772,7 @@ with one entry per connected SDR.
 
 ## ZMQ Streaming and Dashboard
 
-Blue Dragon streams packets over ZMQ using the same wire format as the
-C sniffer, so it works with the existing Python web dashboard.
+Blue Dragon streams packets over ZMQ to the bundled Python web dashboard.
 
     # Start dashboard (binds data on 5555, C2 on 5556):
     pip install pyzmq
@@ -1017,20 +1017,6 @@ embed the correct rpath automatically.
 The ZMQ endpoint format is `tcp://host:port` for connecting to a
 remote dashboard, or `tcp://*:port` for binding locally. Ensure the
 port is not already in use.
-
-## Differences from C Version
-
-| | Blue Dragon (Rust) | C version |
-|---|---|---|
-| FFT | rustfft (pure Rust, no FFTW) | FFTW3 |
-| AGC | Custom (no liquid-dsp dependency) | liquid-dsp |
-| GPS | TCP JSON to gpsd (no libgps) | libgps FFI |
-| Build | `cargo build` | cmake + make |
-| Threading | crossbeam channels | pthreads + custom queues |
-| GPU | OpenCL + VkFFT (optional) | OpenCL + VkFFT / Metal |
-| BLE 5 | LE 1M + LE 2M + LE Coded | LE 1M only |
-| Wire format | Identical | Identical |
-| Dashboard | Same Python dashboard | Same Python dashboard |
 
 ## Acknowledgments
 
