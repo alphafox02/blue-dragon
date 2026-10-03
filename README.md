@@ -39,6 +39,7 @@ dashboard for real-time monitoring.
 | HCI GATT probing | Untested | Compiles, needs end-to-end test with --hci |
 | HCI active scanning | Tested | --active-scan enriches device data |
 | Channel counts -C 60+ | Tested | -C 40 and -C 60 validated on USRP and bladeRF |
+| ESP32-S3 (eSpDR, USB) | Experimental | One board covers 16 MHz; five tiled boards cover the whole band (88-95% CRC OTA) |
 
 ## Supported Hardware
 
@@ -51,7 +52,7 @@ dashboard for real-time monitoring.
 | Spectran V6 | `-i aaronia` | 46-245 MHz | f32 | Supported `-C` values: 46, 61, 77, 92, 122, 184, 245 (device-dependent). Other values snap up to the nearest supported clock automatically. |
 | RFNM (Lime) | `-i rfnm` or `-i rfnm-SERIAL` | 122 MHz | 12-bit | 122.88 Msps base clock, all 40 BLE channels |
 | Epiq Sidekiq family | `-i sidekiq-SERIAL` | per-device | 12 or 16 (per-device) | Bit depth, LO range, sample-rate range and gain index range are queried from the device at open; the recv path scales samples to i16 per the reported ADC resolution. Family includes Stretch / m.2-2280 / m.2 (3042) / mPCIe (AD9361/4, 12-bit); X2 / X4 / X40 / Nv100 / Nvm2 (16-bit). Opt-in `--features sidekiq`; requires libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`). |
-| ESP32-S3 (eSpDR, USB) | `-i espdr0` or `-i espdr:/dev/ttyACM0` | 16 MHz | 10-bit | Experimental. The ESP's own radio as a receiver, over its USB port with no extra hardware. Streams bursts cut to their channel on the ESP; several ESPs on one LO cover the whole band through the ESP's 80 MHz fold (`-i espdr -C 80`). Opt-in `--features espdr`; see [ESP32-S3](#esp32-s3-espdr). |
+| ESP32-S3 (eSpDR, USB) | `-i espdr0` or `-i espdr:/dev/ttyACM0` | 16 MHz | 10-bit | Experimental. The ESP's own radio as a receiver, over its USB port with no extra hardware; the ESP sends bursts cut to their channel. Five ESPs tile the whole band (`-i espdr -C 80`); one to four share it through the ESP's 80 MHz fold. `--espdr-load` loads the firmware. Opt-in `--features espdr`; see [ESP32-S3](#esp32-s3-espdr). |
 
 To list available SDR devices:
 
@@ -72,6 +73,7 @@ too low buries the signal in the noise floor (low CRC rate).**
 | RFNM (Lime) | 30 | 20-30 | 30 | Lime gain range -24 to 30 dB |
 | Epiq Sidekiq | varies | **30-35** | TBD | `-g` is the device's RX gain *index* (range varies per model, read from the SDK at open time). On AD9361-based cards (Stretch / m.2-2280, m.2-3042, mPCIe) each step ≈ 1 dB; indices 30-35 measured highest CRC on a populated office BLE band in our testing. `--sidekiq-agc` switches to the SDK's auto-gain, `--sidekiq-no-dc` disables FPGA DC offset correction (on by default), `--sidekiq-gpsdo` enables FPGA GPSDO on cards with an integrated GPS receiver. **Recommended production config: build with `--features sidekiq,zmq,gps,gpu` and run `-C 60 -g 30`** for 85%+ CRC at 60 MHz of in-band BLE capture with the Intel/AMD integrated GPU PFB. Avoid prime-number `-C` values (e.g. 53, 59, 61) with the GPU PFB; CPU path handles them fine. |
 | SoapySDR | 60 | Device-dependent | Device-dependent | Depends on underlying hardware |
+| ESP32-S3 | 60 (too high) | 20-30 with an antenna, 44-56 on a PCB antenna | TBD | `-g` is a gain-table selector (0-127, not dB) and not linear; tune per board with `BD_ESPDR_GAINS` |
 
 **Symptoms of gain too high:** BLE count = 0, all bursts fail decode (ADC saturation
 clips the waveform so preamble/AA correlation fails). Fix: lower `-g`.
@@ -140,6 +142,8 @@ it, run `sudo ldconfig` to refresh the shared library cache.
 
     cd blue-dragon
     cargo build --release --features "usrp,hackrf,bladerf,soapysdr,zmq,gps"
+
+ESP32-S3 support adds the `espdr` feature and `libudev-dev`, as above.
 
 Optional GPU acceleration (OpenCL):
 
@@ -300,6 +304,49 @@ the chip's undocumented sample-dump engine. The original eSpDR streams
 80 Msps through an external FPGA; the
 [alphafox02/eSpDR](https://github.com/alphafox02/eSpDR) fork adds a mode
 that uses only the ESP's own USB port, so a bare ESP32-S3 dev board works.
+One ESP covers 16 MHz; five on a powered USB hub cover the whole band.
+
+#### Quick start
+
+Build with the `espdr` feature (it needs `libudev-dev`), and get the
+firmware image `iq-source.bin` from the fork's
+[releases](https://github.com/alphafox02/eSpDR/releases):
+
+    cargo build --release --features espdr
+    # one ESP, centred on advertising channel 38
+    blue-dragon -l -i espdr0 -C 16 -c 2426 -g 28 --check-crc --stats --espdr-load --espdr-image iq-source.bin
+    # five ESPs, the whole band (see "Whole band with several ESPs")
+    BD_ESPDR_GAINS=44,28,44,44,56 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats --espdr-load --espdr-image iq-source.bin
+
+The ESPs run the fork's firmware from RAM: nothing is written to flash,
+and a power cycle restores a board. `--espdr-load` makes blue-dragon load
+it into any ESP that is not running it, or runs an older revision, before
+starting; ESPs already running it are used as they are. The loader talks to
+the ESP32-S3's ROM directly, so esptool is not needed. Without
+`--espdr-image`, it looks for `/usr/share/espdr/iq-source.bin`, then
+`/usr/local/share/espdr/iq-source.bin` (`BD_ESPDR_IMAGE` also names an
+image), so a distribution can install the image once.
+
+`--espdr-load` is opt-in because `-i espdr` takes every attached ESP32-S3,
+and one running other firmware would be reset into this one. Without it,
+an ESP that does not answer stops blue-dragon with a message saying so, and
+one running an older firmware revision is used with a warning. The fork's
+own loader does the same from Python (`python3 usb/load.py --image
+iq-source.bin`, which uses esptool), and building the image yourself takes
+`. $IDF_PATH/export.sh` (ESP-IDF v5.5.3 or later) and `make -C esp32s3`.
+
+#### Settings
+
+Use `-C 16` with a single ESP (`-i espdr0`; `-C 80` with a single named ESP
+takes 0.2 ms snapshots at 80 Msps). `-c` sets the ESP's LO (2210-2790 MHz);
+2426 centres the window on advertising channel 38. `-g` is the ESP's
+gain-table selector (0-127, not dB), and the table is not linear: with an
+antenna attached, about 20-30 avoids clipping, while boards on their PCB
+antenna did best at 44-56, and above about 60 decoding collapsed. With
+several ESPs attached, `espdr1`, `espdr2`, ... select them in the order of
+their USB serial port names, and `BD_ESPDR_GAINS` sets each board's gain.
+
+#### How it works
 
 USB Full Speed (about 1 MB/s) cannot carry the full stream, so the ESP
 watches a 16 MHz window continuously and sends only the bursts above the
@@ -308,6 +355,16 @@ and fills the gaps with noise at the reported floor. The ESP also cuts each
 burst down to its own channel at 4 Msps with the S3's vector unit, a
 quarter of the data, and blue-dragon restores it to the window; this lets
 about twice as many packets through and bursts up to 3 ms (a whole 3-DH5).
+Wi-Fi bursts are dropped on the ESP to save USB bandwidth.
+
+On a busy band with an antenna at 2426 MHz this decoded 514 BLE packets
+with a valid CRC in 45 s (257 with whole-window bursts); with a Classic
+link flooded by `l2ping` at 2441 MHz, about 11,000 Classic framings and a
+few EDR packets in 38 s. The USB link is still the limit on a busy band, and
+bursts the ESP could not send are reported as overflows. Older firmware
+without channelization sends whole-window bursts, and firmware without
+streaming falls back to 1 ms snapshots automatically.
+
 The ESP's DC offset is often 20 dB above the noise in a 1 MHz channel. When
 five boards tile the band, each LO sits between two channels, and
 blue-dragon removes the offset from each tiled board's channelized bursts.
@@ -317,52 +374,18 @@ channel unchanged (they received 240-420 each, so those two remain weaker).
 A single ESP or folded ESPs can have a channel on the LO, where removing the
 offset would also take part of the packet, so their bursts are left as
 received.
-Set `BD_ESPDR_WIDE=1` to receive whole-window bursts instead, which keeps
-two simultaneous signals on different channels. Wi-Fi bursts are dropped on
-the ESP to save USB bandwidth (set `BD_ESPDR_KEEP_WIDEBAND=1` to keep them).
-`BD_ESPDR_TELEMETRY=1` enables once-per-second receiver diagnostics for
-controlled tests; it does not change the default stream format.
-`BD_ESPDR_TRIGGER_RATIO` can set the burst-to-noise power ratio from 3 to 31
-for controlled A/B tests; the default remains 4 (6 dB).
 
-On a busy band with an antenna at 2426 MHz this decoded 514 BLE packets
-with a valid CRC in 45 s (257 with whole-window bursts); with a Classic
-link flooded by `l2ping` at 2441 MHz, about 11,000 Classic framings and a
-few EDR packets in 38 s. The USB link is still the limit on a busy band, and
-bursts the ESP could not send are reported as overflows. Older firmware
-without channelization sends whole-window bursts, and firmware without
-streaming falls back to 1 ms snapshots automatically (`BD_ESPDR_SNAPSHOT=1`
-forces that mode).
+#### Options for testing
 
-The ESPs run the fork's firmware from RAM (nothing is written to flash; a
-power cycle restores a board). With `--espdr-load`, blue-dragon loads it
-itself into any ESP that is not running it, or runs an older revision,
-before starting; ESPs already running it are used as they are. Download
-`iq-source.bin` from the fork's
-[releases](https://github.com/alphafox02/eSpDR/releases) and either pass
-it with `--espdr-image PATH` or install it as
-`/usr/share/espdr/iq-source.bin` (or `/usr/local/share/espdr/`), where
-`--espdr-load` looks by default (`BD_ESPDR_IMAGE` also names it). The
-loader talks to the ESP32-S3's ROM directly; esptool is not needed.
-
-    cargo build --release --features espdr     # needs libudev-dev
-    blue-dragon -l -i espdr0 -C 16 -c 2426 -g 28 --check-crc --stats --espdr-load --espdr-image iq-source.bin
-
-Without `--espdr-load`, an ESP that does not answer stops blue-dragon with
-a message saying so, and one with older firmware is used with a warning.
-The flag is opt-in because `-i espdr` takes every attached ESP32-S3, and an
-ESP32-S3 running other firmware would be reset into this one. The fork's
-own loader does the same from Python (`python3 usb/load.py --image
-iq-source.bin`, with esptool), and building the image yourself takes
-`. $IDF_PATH/export.sh` (ESP-IDF v5.5.3 or later) and `make -C esp32s3`.
-
-Use `-C 16` with a single ESP (`-i espdr0`; `-C 80` with a single named ESP
-takes 0.2 ms snapshots at 80 Msps). `-c` sets the ESP's LO (2210-2790 MHz);
-2426 centres the window on advertising channel 38. `-g` is the ESP's
-gain-table selector (0-127, not dB); with an antenna attached, values
-around 24-30 avoid clipping, while boards using their PCB antenna need
-about 52. With several ESPs attached, `espdr1`, `espdr2`, ... select them in
-the order of their USB serial port names.
+| Variable | Effect |
+|---|---|
+| `BD_ESPDR_WIDE=1` | whole-window bursts instead of channelized ones (keeps two simultaneous signals on different channels) |
+| `BD_ESPDR_KEEP_WIDEBAND=1` | keep Wi-Fi bursts instead of dropping them on the ESP |
+| `BD_ESPDR_SNAPSHOT=1` | 1 ms snapshots instead of streaming |
+| `BD_ESPDR_TELEMETRY=1` | once-per-second receiver diagnostics; the stream format is unchanged |
+| `BD_ESPDR_TRIGGER_RATIO=N` | burst-to-noise power ratio, 3 to 31 (default 4, 6 dB) |
+| `BD_ESPDR_FILTER=N` | baseband filter code, 0-63 (see below) |
+| `BD_ESPDR_LAYOUT=...` | `tile`, `tile-ble` or `fold` (see below) |
 
 #### Whole band with several ESPs
 
@@ -381,11 +404,10 @@ layout from how many there are:
 is the five-board default and retains every Classic channel. `tile-ble` is
 an opt-in five-board layout for `-c 2441` that favours BLE advertising
 reception as described below. `BD_ESPDR_GAINS` sets each board's gain in
-board order. It is worth tuning per board: the gain
-table is not monotonic, and boards of the same kind differ. Here, boards on
-their PCB antennas did best at 44 or 56 (one decoded nothing at 44 but 150
-packets on channel 39 in 15 s at 48 or 56), one with an external antenna at
-20-28, and above about 60 decoding collapsed. With
+board order. It is worth tuning per board, since boards of the same kind
+differ: here one decoded nothing at 44 but 150 packets on channel 39 in
+15 s at 48 or 56, and the board with an external antenna did best at
+20-28. With
 `BD_ESPDR_GAINS=44,28,44,44,56` the five boards received 742 valid BLE
 advertising packets in 30 s, against 294 at a uniform 52 (40 for the
 external antenna). A single antenna feeding every board through a powered
@@ -475,7 +497,7 @@ Features are opt-in. Build only what you need:
 | `aaronia` | Spectran V6 support | RTSA Suite Pro |
 | `rfnm` | RFNM (Lime daughtercard) support | librfnm, spdlog |
 | `sidekiq` | Epiq Sidekiq family support | libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`) |
-| `espdr` | ESP32-S3 receiver over USB (eSpDR firmware) | (none -- uses the serial port) |
+| `espdr` | ESP32-S3 receiver over USB (eSpDR firmware) | libudev-dev |
 
 #### Sidekiq DMA buffer tuning (high-rate capture only)
 
@@ -569,9 +591,16 @@ SDR settings:
     -C, --channels N        Number of channels (default: 40)
     -a, --all-channels      Full BLE band: sets -C 96 -c 2441
     -g, --gain DB           SDR gain (default: 60)
+    -s, --squelch DB        Squelch threshold (default: -45)
+    --antenna PORT          RX port (USRP: RX2/TX/RX, bladeRF: RX1/RX2)
     --hackrf-lna DB         HackRF LNA gain (default: 40)
     --hackrf-vga DB         HackRF VGA gain (default: 20)
-    --antenna PORT          RX port (USRP: RX2/TX/RX, bladeRF: RX1/RX2)
+    --aaronia-decim D       Spectran V6 decimation (1, 2, 4, ... 512)
+    --sidekiq-agc           Sidekiq: AD9361 AGC instead of the -g gain index
+    --sidekiq-no-dc         Sidekiq: disable FPGA DC offset correction
+    --sidekiq-gpsdo         Sidekiq: enable the card's GPSDO
+    --espdr-load            ESP32-S3: load the firmware into boards that need it
+    --espdr-image PATH      ESP32-S3: firmware image for --espdr-load
 
 Output:
     -w, --write FILE        Output PCAP to file or FIFO
@@ -592,6 +621,7 @@ GPS:
 
 IQ file options:
     --format FORMAT         Sample format: ci8, ci16, cf32 (default: ci16)
+    --sample-rate HZ        Sample rate of the file
 
 BLE 5 Long Range:
     --coded-scan            Continuous LE Coded scan on advertising channels
@@ -645,6 +675,10 @@ Capture full BLE band with bladeRF at recommended OTA gain:
 Capture full BLE band (all 40 channels) with RFNM:
 
     blue-dragon -l -i rfnm -C 122 -c 2441 -g 30 --check-crc --stats
+
+Capture the whole band with five ESP32-S3 boards, loading their firmware:
+
+    BD_ESPDR_GAINS=44,28,44,44,56 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats --espdr-load
 
 Capture with active BLE scanning for device enrichment:
 
@@ -826,7 +860,8 @@ or special permissions beyond D-Bus policy are needed.
 ## Architecture
 
 ```
-SDR (USRP / HackRF / BladeRF / SoapySDR / Spectran V6)
+SDR (USRP / HackRF / bladeRF / SoapySDR / Spectran V6 / RFNM / Sidekiq,
+     or ESP32-S3 bursts placed on a continuous timeline)
     |
     | int16 IQ samples (native precision)
     v
@@ -920,7 +955,8 @@ currently uses int8 (i8) for OpenCL kernel compatibility.
 | Spectran V6 | 32-bit float | Scaled f32 → i16 | Scaled f32 → i8 |
 | RFNM (Lime) | 12-bit | CS16 native (12-bit left-shifted to i16) | CS16 → i16 GPU path |
 
-The i16 pipeline gives 12-bit SDRs (USRP, bladeRF) their full dynamic
+The ESP32-S3's 10-bit samples are scaled by 64 into the i16 range. The i16
+pipeline gives 12-bit SDRs (USRP, bladeRF) their full dynamic
 range -- about 24 dB more than the i8 path. HackRF is natively 8-bit,
 so both paths are equivalent. The Spectran V6 benefits from 16-bit
 quantization of its float samples instead of 8-bit.
@@ -953,6 +989,16 @@ quantization of its float samples instead of 8-bit.
 4. **Not using `--check-crc`.** Without this flag, CRC is never
    computed and shows `0/0`. This is not an error -- add `--check-crc`
    to enable validation.
+
+### ESP32-S3: "not running the eSpDR firmware"
+
+The ESP did not answer the eSpDR handshake: it was power-cycled (the
+firmware lives in RAM), runs other firmware, or was left busy. Run with
+`--espdr-load` (and `--espdr-image` if the image is not installed in
+`/usr/share/espdr/`), or replug the board and load it again. A warning that
+a board runs an older firmware revision is fixed the same way. Rising
+`overflow` counts in `--stats` mean the ESP had more bursts than USB could
+carry; that is normal on a busy band.
 
 ### Spectran V6: library not found
 
@@ -990,6 +1036,11 @@ port is not already in use.
 
 The name Blue Dragon is inspired by
 [Blue Hydra](https://github.com/pwnieexpress/blue_hydra).
+
+ESP32-S3 reception builds on h0m3us3r's
+[eSpDR](https://github.com/h0m3us3r/eSpDR) radio firmware, and the
+baseband filter calibration came from the
+[ESP-SDR](https://github.com/ESPARGOS/esp-sdr) project.
 
 ## License
 
