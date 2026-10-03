@@ -302,6 +302,15 @@ and fills the gaps with noise at the reported floor. The ESP also cuts each
 burst down to its own channel at 4 Msps with the S3's vector unit, a
 quarter of the data, and blue-dragon restores it to the window; this lets
 about twice as many packets through and bursts up to 3 ms (a whole 3-DH5).
+The ESP's DC offset is often 20 dB above the noise in a 1 MHz channel. When
+five boards tile the band, each LO sits between two channels, and
+blue-dragon removes the offset from each tiled board's channelized bursts.
+Decoding one board's `l2ping` recording both ways, the two Classic channels
+beside its LO went from 10 packets each to about 100, with every other
+channel unchanged (they received 240-420 each, so those two remain weaker).
+A single ESP or folded ESPs can have a channel on the LO, where removing the
+offset would also take part of the packet, so their bursts are left as
+received.
 Set `BD_ESPDR_WIDE=1` to receive whole-window bursts instead, which keeps
 two simultaneous signals on different channels. Wi-Fi bursts are dropped on
 the ESP to save USB bandwidth (set `BD_ESPDR_KEEP_WIDEBAND=1` to keep them).

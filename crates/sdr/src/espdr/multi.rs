@@ -548,15 +548,15 @@ impl Shaper {
     /// (centred on start + 4j - 2.5), mixed down by `offset` MHz in the
     /// LO-minus-RF orientation, i.e. the channel lies at LO - offset.
     fn narrow(&self, start: u64, offset: i32, pairs: &[u32]) -> Shaped {
-        let x: Vec<Complex32> = pairs
+        let mut raw: Vec<(f32, f32)> = pairs
             .iter()
-            .map(|&w| {
-                let i = ((w & 1023) ^ 512) as f32 - 512.0;
-                let q = (((w >> 10) & 1023) ^ 512) as f32 - 512.0;
-                // Conjugate to RF-minus-LO and scale like convert_pairs.
-                Complex32::new(i, -q) * SAMPLE_SCALE as f32
-            })
+            .map(|&w| (((w & 1023) ^ 512) as f32 - 512.0, (((w >> 10) & 1023) ^ 512) as f32 - 512.0))
             .collect();
+        if self.tile.is_some() {
+            remove_dc(&mut raw, offset);
+        }
+        // Conjugate to RF-minus-LO and scale like convert_pairs.
+        let x: Vec<Complex32> = raw.iter().map(|&(i, q)| Complex32::new(i, -q) * SAMPLE_SCALE as f32).collect();
         let step = 1.0 / FACTOR as f64; // board pairs per output sample
         let delay = (self.narrow_taps.len() * NARROW_TAPS_PER_PHASE - 1) as f64 / 2.0;
         Shaped {
@@ -1540,6 +1540,30 @@ mod tests {
         let (_, drift, _) = m.boards[1].relative.unwrap();
         assert!((drift + 2e-6).abs() < 0.2e-6, "drift {}", drift);
         assert_eq!(m.boards[1].matches, 32);
+    }
+
+    #[test]
+    fn only_tiled_boards_remove_the_dc_offset() {
+        // A record mixed down by 1 MHz holding only the board's DC offset
+        // (a tone at -1 MHz, a quarter turn back per sample).
+        let word = |i: i32, q: i32| (i & 1023) as u32 | (((q & 1023) as u32) << 10);
+        let pairs: Vec<u32> = (0..400)
+            .map(|n| match n % 4 {
+                0 => word(6, 0),
+                1 => word(0, -6),
+                2 => word(-6, 0),
+                _ => word(0, 6),
+            })
+            .collect();
+        let power = |s: &Shaped| {
+            let x = s.channel.as_ref().unwrap();
+            x.iter().map(|v| v.norm_sqr()).sum::<f32>() / x.len() as f32
+        };
+        // Folded boards can have a channel on the LO: left as received.
+        let folded = Shaper::new(None).narrow(1000, 1, &pairs);
+        assert!((power(&folded) - (6.0 * SAMPLE_SCALE as f32).powi(2)).abs() < 1.0);
+        let tiled = Shaper::new(Some(tile_offset_half_mhz(0, 5, Layout::Tiled))).narrow(1000, 1, &pairs);
+        assert!(power(&tiled) < 1e-3, "DC left: {}", power(&tiled));
     }
 
     #[test]

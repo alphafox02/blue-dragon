@@ -441,6 +441,41 @@ fn convert_pairs(pairs: &[u32]) -> Vec<i16> {
     out
 }
 
+/// Removes the board's DC offset from a narrow record (I, Q as sent, mixed
+/// down by `offset` MHz). The ESP's DC offset is often 20 dB above the noise
+/// in a 1 MHz channel, which ruins weak packets on the two channels either
+/// side of the LO. In the record it is a tone at -`offset` MHz, a quarter
+/// turn per output sample for each MHz, so it is measured over the record
+/// and subtracted: a notch a few kHz wide at a frequency no Bluetooth channel
+/// uses when tiled (the LOs sit half a MHz off the channels). Only tiled
+/// boards use it: a single board or folded boards can have a channel on the
+/// LO, where the notch would take part of the packet.
+fn remove_dc(y: &mut [(f32, f32)], offset: i32) {
+    if offset.abs() > 2 || y.len() < 64 {
+        return; // outside the record's +-2 MHz, or too short to measure
+    }
+    // e^(-j pi offset n / 2): cycles through 1, -j, -1, j for offset 1.
+    let turn = |n: usize| match ((-(offset as i64) * n as i64).rem_euclid(4)) as u8 {
+        0 => (1.0, 0.0),
+        1 => (0.0, 1.0),
+        2 => (-1.0, 0.0),
+        _ => (0.0, -1.0),
+    };
+    let (mut si, mut sq) = (0.0f64, 0.0f64);
+    for (n, &(i, q)) in y.iter().enumerate() {
+        let (c, s) = turn(n);
+        // y times the conjugate of the tone.
+        si += (i * c + q * s) as f64;
+        sq += (q * c - i * s) as f64;
+    }
+    let (di, dq) = ((si / y.len() as f64) as f32, (sq / y.len() as f64) as f32);
+    for (n, v) in y.iter_mut().enumerate() {
+        let (c, s) = turn(n);
+        v.0 -= di * c - dq * s;
+        v.1 -= di * s + dq * c;
+    }
+}
+
 /// Restores a narrow record, starting at stream pair `start`, to the 16 MHz
 /// window: interpolates by 4 with the ESP's filter, mixes back up by
 /// `offset` MHz, then conjugates and scales like `convert_pairs`.
@@ -1027,6 +1062,46 @@ mod tests {
         assert!(t.fill_to(MAX_GAP_PAIRS * 3));
         assert_eq!(t.emitted, MAX_GAP_PAIRS * 3);
         assert_eq!(drain(&rx).len() as u64, 2 * MAX_GAP_PAIRS);
+    }
+
+    #[test]
+    fn remove_dc_takes_out_the_offset_and_keeps_the_channel() {
+        // A record mixed down by 1 MHz: the board's DC is a tone at -1 MHz
+        // (a quarter turn back per 4 Msps sample), the channel a tone at
+        // -0.5 MHz, half a MHz from the DC as a tiled Bluetooth channel is.
+        let n = 400;
+        let tone = |f_mhz: f64, amp: f64, k: usize| {
+            let a = 2.0 * std::f64::consts::PI * f_mhz * k as f64 / 4.0;
+            (amp * a.cos(), amp * a.sin())
+        };
+        let power_at = |y: &[(f32, f32)], f: f64| {
+            let (mut i, mut q) = (0.0, 0.0);
+            for (k, &(a, b)) in y.iter().enumerate() {
+                let (c, s) = tone(-f, 1.0, k);
+                i += a as f64 * c - b as f64 * s;
+                q += a as f64 * s + b as f64 * c;
+            }
+            (i * i + q * q) / (y.len() * y.len()) as f64
+        };
+        // Mixed down by +1 or -1 MHz, the DC lies at -1 or +1 MHz.
+        for offset in [1, -1] {
+            let dc = -offset as f64;
+            let channel = dc / 2.0;
+            let mut y: Vec<(f32, f32)> = (0..n)
+                .map(|k| {
+                    let (di, dq) = tone(dc, 7.0, k);
+                    let (si, sq) = tone(channel, 3.0, k);
+                    ((di + si) as f32, (dq + sq) as f32)
+                })
+                .collect();
+            remove_dc(&mut y, offset);
+            assert!(power_at(&y, dc) < 1e-6, "offset {}: DC left: {}", offset, power_at(&y, dc));
+            assert!((power_at(&y, channel) - 9.0).abs() < 0.1, "offset {}: channel changed", offset);
+        }
+        // Far from the window the record is left alone.
+        let mut far = vec![(5.0f32, -2.0f32); n];
+        remove_dc(&mut far, 3);
+        assert_eq!(far[0], (5.0, -2.0));
     }
 
     #[test]
