@@ -438,6 +438,14 @@ against a reference board's from the same packets, to a fraction of a
 microsecond; the output timeline is the reference board's own sample count,
 so packets keep the slot timing a single receiver would give them.
 
+Classic packets reported at a position that can contain a 16 MHz image carry
+the standard `RF Channel Aliasing` flag in PCAP and ZMQ output
+(`btbredr_rf.flags.rf_channel_aliasing` in Wireshark). This covers every
+reported channel in folded mode, the outer positions of each tile, and the
+two outer positions of a single 16 Msps receiver. The flag preserves the
+packet and its observed channel while making the uncertainty explicit; it
+does not guess which of the two RF channels transmitted it.
+
 ### Feature Flags
 
 Features are opt-in. Build only what you need:

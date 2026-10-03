@@ -832,6 +832,19 @@ pub struct EspdrHandle {
     gain_tx: Sender<u8>,
     thread: Option<JoinHandle<()>>,
     lo_hz: u32,
+    classic_alias_channels: Vec<u32>,
+}
+
+fn single_classic_alias_channels(sample_rate: u32, center_freq: u64) -> Vec<u32> {
+    if sample_rate != 16_000_000 {
+        return Vec::new();
+    }
+    [center_freq.saturating_sub(7_000_000), center_freq + 7_000_000]
+        .into_iter()
+        .filter(|hz| hz % 1_000_000 == 0)
+        .map(|hz| (hz / 1_000_000) as u32)
+        .filter(|f| (2402..=2480).contains(f))
+        .collect()
 }
 
 impl EspdrHandle {
@@ -911,6 +924,7 @@ impl EspdrHandle {
             gain_tx,
             thread: Some(thread),
             lo_hz,
+            classic_alias_channels: single_classic_alias_channels(sample_rate, center_freq),
         })
     }
 
@@ -960,6 +974,11 @@ impl EspdrHandle {
     pub fn lo_hz(&self) -> u32 {
         self.lo_hz
     }
+
+    /// Classic RF channels whose reported frequency may be a 16 MHz image.
+    pub fn classic_alias_channels(&self) -> &[u32] {
+        &self.classic_alias_channels
+    }
 }
 
 impl Drop for EspdrHandle {
@@ -1001,6 +1020,16 @@ mod tests {
     fn interface_with_explicit_path() {
         assert_eq!(resolve_port("espdr:/dev/ttyACM3").unwrap(), "/dev/ttyACM3");
         assert!(resolve_port("espdrX").is_err());
+    }
+
+    #[test]
+    fn single_receiver_marks_only_its_edge_channels_as_aliased() {
+        assert_eq!(
+            single_classic_alias_channels(16_000_000, 2_441_000_000),
+            vec![2434, 2448]
+        );
+        assert!(single_classic_alias_channels(80_000_000, 2_441_000_000).is_empty());
+        assert!(single_classic_alias_channels(16_000_000, 2_441_500_000).is_empty());
     }
 
     #[test]

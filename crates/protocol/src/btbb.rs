@@ -220,6 +220,9 @@ pub struct ClassicBtPacket {
     pub rssi_db: i32,
     pub noise_db: i32,
     pub freq: u32,
+    /// The receiver reported this RF channel through an aliased position, so
+    /// the transmission may instead be on a channel 16 MHz away.
+    pub rf_channel_aliased: bool,
     pub timestamp: crate::Timespec,
     pub raw_header: [u8; 7],
     pub has_header: bool,
@@ -317,6 +320,7 @@ pub fn detect(
         rssi_db: rssi,
         noise_db: noise,
         freq,
+        rf_channel_aliased: false,
         timestamp,
         raw_header: [0; 7],
         has_header: false,
@@ -1895,6 +1899,7 @@ mod tests {
             rssi_db: -20,
             noise_db: -80,
             freq: 2441,
+            rf_channel_aliased: false,
             timestamp: mk_ts(SLOT_NS),
             raw_header,
             has_header: true,
@@ -1927,6 +1932,7 @@ mod tests {
                 rssi_db: -20,
                 noise_db: -80,
                 freq: 2441,
+                rf_channel_aliased: false,
                 timestamp,
                 raw_header,
                 has_header: true,

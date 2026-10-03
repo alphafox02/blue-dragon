@@ -167,6 +167,32 @@ fn tile_offset_half_mhz(index: usize, count: usize, layout: Layout) -> i64 {
     32 * index as i64 - 16 * (count as i64 - 1) - 1 + if ble_top { 2 } else { 0 }
 }
 
+/// Classic channels reported through an aliased position. Folded reception
+/// is ambiguous everywhere; a tiled board is ambiguous only at its two
+/// outermost half-MHz-staggered positions.
+fn classic_alias_channels(layout: Layout, count: usize, center_freq: u64) -> Vec<u32> {
+    if layout == Layout::Folded {
+        return (2402..=2480).collect();
+    }
+    let mut channels = Vec::new();
+    for index in 0..count {
+        let lo = center_freq as i64
+            + tile_offset_half_mhz(index, count, layout) * HALF_MHZ_HZ;
+        for edge in [-7_500_000, 7_500_000] {
+            let hz = lo + edge;
+            if hz % 1_000_000 == 0 {
+                let mhz = (hz / 1_000_000) as u32;
+                if (2402..=2480).contains(&mhz) {
+                    channels.push(mhz);
+                }
+            }
+        }
+    }
+    channels.sort_unstable();
+    channels.dedup();
+    channels
+}
+
 /// The serial ports to use for `iface` at `sample_rate`, or None for a
 /// single-board interface. `espdr` takes every attached ESP (up to five
 /// when tiled); a comma list names them.
@@ -268,6 +294,7 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
     let mut threads = Vec::with_capacity(count);
     let mut lo_hz = center_freq as u32;
     let (layout, filter) = layout(count)?;
+    let classic_alias_channels = classic_alias_channels(layout, count, center_freq);
     let folded = layout == Layout::Folded;
     if layout == Layout::TiledBle && count != (FOLD_RATE / 16_000_000) as usize {
         return Err(format!("eSpDR: BLE tiling needs exactly 5 boards, got {}", count));
@@ -389,6 +416,7 @@ pub(super) fn open(paths: &[String], center_freq: u64, gain: i32) -> Result<Espd
         gain_tx,
         thread: Some(merger),
         lo_hz,
+        classic_alias_channels,
     })
 }
 
@@ -1323,6 +1351,22 @@ mod tests {
         let masks: Vec<u16> = (0..5).map(|i| position_mask(i, 5, Some(-1))).collect();
         assert!(masks.iter().all(|m| m >> 7 & 1 == 1));
         assert_eq!(owner(-1, 5), 2);
+    }
+
+    #[test]
+    fn classic_alias_positions_follow_the_layout() {
+        assert_eq!(
+            classic_alias_channels(Layout::Tiled, 5, 2_441_000_000),
+            vec![2416, 2417, 2432, 2433, 2448, 2449, 2464, 2465, 2480]
+        );
+        assert_eq!(
+            classic_alias_channels(Layout::TiledBle, 5, 2_441_000_000),
+            vec![2416, 2417, 2432, 2433, 2448, 2449, 2464, 2466]
+        );
+        let folded = classic_alias_channels(Layout::Folded, 2, 2_441_000_000);
+        assert_eq!(folded.len(), 79);
+        assert_eq!(folded.first(), Some(&2402));
+        assert_eq!(folded.last(), Some(&2480));
     }
 
     /// A GFSK-like burst: random bits at 1 Mbit/s, 4 samples per bit,

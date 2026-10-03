@@ -616,6 +616,7 @@ pub fn run_burst_file(
             None,
             0,
             1,
+            &[],
             &mut fsk,
             &aa_correlator,
             &aa_correlator_2m,
@@ -1273,6 +1274,7 @@ fn process_burst(
     wideband: Option<&[Complex32]>,
     center_freq_mhz: u32,
     raw_sample_rate: u32,
+    classic_alias_channels: &[u32],
     fsk: &mut FskDemod,
     aa_correlator: &AaCorrelator,
     aa_correlator_2m: &AaCorrelator,
@@ -1415,6 +1417,7 @@ fn process_burst(
     ) {
         let demod_ts = channel_samples_after(&burst_ts, burst.edr_lead_samples);
         bt_pkt.timestamp = bt_sync_timestamp(&demod_ts, &fsk_result, bt_pkt.sync_offset);
+        bt_pkt.rf_channel_aliased = classic_alias_channels.binary_search(&freq).is_ok();
         if bt_tracker.is_fold_copy(&bt_pkt) {
             stats.bt_fold_copies += 1;
             return;
@@ -1980,6 +1983,7 @@ fn spawn_parallel_pipeline(
     syndrome_map: SyndromeMap,
     conn_table: ConnectionTable,
     classic_uaps: Vec<(u32, u8)>,
+    classic_alias_channels: Arc<[u32]>,
     pcap_writer: Option<PcapWriter<BufWriter<File>>>,
     burst_writer: Option<FileBurstWriter>,
     check_crc: bool,
@@ -2220,6 +2224,7 @@ fn spawn_parallel_pipeline(
                         wideband,
                         center_freq_mhz,
                         raw_sample_rate,
+                        &classic_alias_channels,
                         &mut fsk,
                         &aa_correlator,
                         &aa_correlator_2m,
@@ -2565,6 +2570,14 @@ enum SdrHandle {
 unsafe impl Send for SdrHandle {}
 
 impl SdrHandle {
+    fn classic_alias_channels(&self) -> Vec<u32> {
+        match self {
+            #[cfg(feature = "espdr")]
+            SdrHandle::Espdr(h) => h.classic_alias_channels().to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
     fn recv_into_i16(&mut self, buf: &mut [i16]) -> usize {
         match self {
             #[cfg(feature = "usrp")]
@@ -2923,6 +2936,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
 
     // Open SDR early so we can query the actual sample rate for resample ratio.
     let mut sdr = open_sdr_handle(iface, sample_rate, center_freq_hz, gain, hackrf_lna, hackrf_vga, antenna, aaronia_decim, sidekiq_agc, sidekiq_dc_corr, sidekiq_gpsdo)?;
+    let classic_alias_channels: Arc<[u32]> = sdr.classic_alias_channels().into();
 
     // Compute resample ratio: if actual per-channel rate differs from target
     // (sps * 1 MHz), resample demod output to correct timing drift.
@@ -3334,6 +3348,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
             syndrome_map,
             conn_table,
             classic_uaps.to_vec(),
+            classic_alias_channels,
             pcap_writer,
             burst_writer,
             check_crc,
@@ -3379,6 +3394,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         syndrome_map,
         conn_table,
         classic_uaps.to_vec(),
+        classic_alias_channels,
         pcap_writer,
         burst_writer,
         check_crc,
@@ -3559,6 +3575,7 @@ fn run_live_gpu_loop(
     syndrome_map: SyndromeMap,
     conn_table: ConnectionTable,
     classic_uaps: Vec<(u32, u8)>,
+    classic_alias_channels: Arc<[u32]>,
     pcap_writer: Option<PcapWriter<BufWriter<File>>>,
     burst_writer: Option<FileBurstWriter>,
     check_crc: bool,
@@ -3607,6 +3624,7 @@ fn run_live_gpu_loop(
         syndrome_map,
         conn_table,
         classic_uaps,
+        classic_alias_channels,
         pcap_writer,
         burst_writer,
         check_crc,
