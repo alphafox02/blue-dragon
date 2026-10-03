@@ -20,7 +20,7 @@ dashboard for real-time monitoring.
 | USRP B210 capture | Tested | USB 3, validated at -C 40 and -C 60 |
 | BLE LE 1M decoding | Tested | 95-96% CRC pass rate |
 | BLE LE 2M decoding | Tested | |
-| BLE LE Coded decoding | Tested | Low volume confirmed in drive tests |
+| BLE LE Coded decoding | Tested | Controlled Coded-PHY advertising and drive captures confirmed |
 | Classic BT BR detection | Tested | LAP extraction and CRC-valid BR payloads confirmed OTA |
 | Classic BT UAP recovery | Tested | Autonomous OTA recovery confirmed from two clock-consistent, CRC-valid payloads |
 | Classic BT EDR decoding | Experimental | Sync, DQPSK/8DPSK, matched filter, and CRC paths are unit-tested; CRC-valid OTA EDR not yet confirmed |
@@ -302,9 +302,22 @@ and fills the gaps with noise at the reported floor. The ESP also cuts each
 burst down to its own channel at 4 Msps with the S3's vector unit, a
 quarter of the data, and blue-dragon restores it to the window; this lets
 about twice as many packets through and bursts up to 3 ms (a whole 3-DH5).
+The ESP's DC offset is often 20 dB above the noise in a 1 MHz channel. When
+five boards tile the band, each LO sits between two channels, and
+blue-dragon removes the offset from each tiled board's channelized bursts.
+Decoding one board's `l2ping` recording both ways, the two Classic channels
+beside its LO went from 10 packets each to about 100, with every other
+channel unchanged (they received 240-420 each, so those two remain weaker).
+A single ESP or folded ESPs can have a channel on the LO, where removing the
+offset would also take part of the packet, so their bursts are left as
+received.
 Set `BD_ESPDR_WIDE=1` to receive whole-window bursts instead, which keeps
 two simultaneous signals on different channels. Wi-Fi bursts are dropped on
 the ESP to save USB bandwidth (set `BD_ESPDR_KEEP_WIDEBAND=1` to keep them).
+`BD_ESPDR_TELEMETRY=1` enables once-per-second receiver diagnostics for
+controlled tests; it does not change the default stream format.
+`BD_ESPDR_TRIGGER_RATIO` can set the burst-to-noise power ratio from 3 to 31
+for controlled A/B tests; the default remains 4 (6 dB).
 
 On a busy band with an antenna at 2426 MHz this decoded 514 BLE packets
 with a valid CRC in 45 s (257 with whole-window bursts); with a Classic
@@ -352,8 +365,11 @@ layout from how many there are:
 | 5 | tiled | its own 16 MHz, tuned 16 MHz apart | the true channel |
 | 1-4 | folded | the whole band, folded into 16 MHz | true for BLE, may be a fold for Classic |
 
-`BD_ESPDR_LAYOUT=tile` or `fold` overrides the choice. `BD_ESPDR_GAINS` sets
-each board's gain in board order. It is worth tuning per board: the gain
+`BD_ESPDR_LAYOUT=tile`, `tile-ble`, or `fold` overrides the choice. `tile`
+is the five-board default and retains every Classic channel. `tile-ble` is
+an opt-in five-board layout for `-c 2441` that favours BLE advertising
+reception as described below. `BD_ESPDR_GAINS` sets each board's gain in
+board order. It is worth tuning per board: the gain
 table is not monotonic, and boards of the same kind differ. Here, boards on
 their PCB antennas did best at 44 or 56 (one decoded nothing at 44 but 150
 packets on channel 39 in 15 s at 48 or 56), one with an external antenna at
@@ -384,6 +400,15 @@ and Classic packets at their true channels (15,000 in 38 s during an
 LOs received 5,968 Classic packets and all four former boundary channels
 (2417, 2433, 2449 and 2465 MHz).
 
+A board's outermost channels, 7.5 MHz from its LO, lose several dB to the
+baseband filter. In the complete layout that edge falls on 2480 MHz
+(advertising channel 39), where one test received 8-18 valid packets in 15
+s. `BD_ESPDR_LAYOUT=tile-ble` tunes the top board 1 MHz higher and brought
+that to 56-91 packets, increasing the total by about a third. It deliberately
+does not receive 2465 MHz (Classic channel 63), so use it for BLE-focused
+captures rather than as the general default. The program prints that
+trade-off at startup when the profile is selected.
+
 Current eSpDR firmware also latches each board's sample count on common USB
 start-of-frame boundaries (every device below one USB host sees the same
 1 ms frame numbers). blue-dragon fits those observations to the reference
@@ -412,6 +437,14 @@ bursts where channel 38 folds, so each board's sample clock is measured
 against a reference board's from the same packets, to a fraction of a
 microsecond; the output timeline is the reference board's own sample count,
 so packets keep the slot timing a single receiver would give them.
+
+Classic packets reported at a position that can contain a 16 MHz image carry
+the standard `RF Channel Aliasing` flag in PCAP and ZMQ output
+(`btbredr_rf.flags.rf_channel_aliasing` in Wireshark). This covers every
+reported channel in folded mode, the outer positions of each tile, and the
+two outer positions of a single 16 Msps receiver. The flag preserves the
+packet and its observed channel while making the uncertainty explicit; it
+does not guess which of the two RF channels transmitted it.
 
 ### Feature Flags
 
@@ -612,7 +645,8 @@ Capture BLE 5 Long Range (LE Coded PHY) on advertising channels:
 Without `--coded-scan`, coded decoding still runs on any squelch-triggered
 burst that fails LE 1M and BT decode. The flag adds continuous sampling on
 channels 37/38/39 to catch weak coded signals below the normal squelch
-threshold.
+threshold. Overlapping scan windows and the normal squelch path are
+de-duplicated, so one RF transmission is reported once.
 
 Read from a previously recorded IQ file:
 

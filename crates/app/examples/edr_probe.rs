@@ -74,6 +74,7 @@ fn main() {
                 rssi_db: 0,
                 noise_db: 0,
                 freq: 2440,
+                rf_channel_aliased: false,
                 timestamp: Timespec::default(),
                 raw_header: [0; 7],
                 has_header: true,

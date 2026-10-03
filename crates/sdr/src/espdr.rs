@@ -42,7 +42,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REQ_MAGIC: u8 = 0xB4;
 const RSP_MAGIC: u8 = 0xB5;
@@ -66,11 +66,15 @@ const STREAM_BURST: u16 = 1;
 const STREAM_STATUS: u16 = 2;
 const STREAM_END: u16 = 3;
 const STREAM_NARROW: u16 = 4;
+const STREAM_STATUS_V2: u16 = 5;
 const STREAM_REJECT_WIDEBAND: u16 = 1;
 const STREAM_CHANNELIZE: u16 = 2;
+const STREAM_TELEMETRY: u16 = 4;
+const STREAM_TRIGGER_RATIO_SHIFT: u16 = 3;
 const STREAM_STATUS_USB_SOF: u32 = 0x8000;
 const STREAM_STATUS_USB_FRAME: u32 = 0x07FF;
 const STATUS_WORDS: usize = 8;
+const STATUS_V2_WORDS: usize = 16;
 /// Largest stretch of noise inserted for one gap (0.1 s at 16 Msps); a longer
 /// gap only happens across a restart, and its time is skipped.
 const MAX_GAP_PAIRS: u64 = 1_600_000;
@@ -236,7 +240,7 @@ enum Record {
     /// One channel of a burst at 4 Msps, mixed down by `offset` MHz
     /// (LO-minus-RF orientation, like the pairs).
     Narrow { start: u64, offset: i32, pairs: Vec<u32> },
-    Status { start: u64, usb_frame: Option<u16>, words: [u32; STATUS_WORDS] },
+    Status { start: u64, usb_frame: Option<u16>, words: Vec<u32> },
     End,
 }
 
@@ -299,14 +303,18 @@ impl EspLink {
                     Ok(Record::Burst { start, pairs })
                 }
             }
-            STREAM_STATUS => {
-                let mut payload = [0u8; STATUS_WORDS * 4];
+            STREAM_STATUS | STREAM_STATUS_V2 => {
+                let count = if kind == STREAM_STATUS { STATUS_WORDS } else { STATUS_V2_WORDS };
+                if kind == STREAM_STATUS_V2 && length != STATUS_V2_WORDS {
+                    return Err(format!("eSpDR: bad extended status length {}", length));
+                }
+                let mut payload = vec![0u8; count * 4];
                 self.read_exact(&mut payload)?;
                 self.read_exact(&mut check)?;
-                let mut words = [0u32; STATUS_WORDS];
-                for (w, b) in words.iter_mut().zip(payload.chunks_exact(4)) {
-                    *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                }
+                let words: Vec<u32> = payload
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
                 let sum = words.iter().fold(0u32, |a, &w| a.wrapping_add(w));
                 if sum != u32::from_le_bytes(check) {
                     return Err("eSpDR: stream status check failed".to_string());
@@ -433,6 +441,41 @@ fn convert_pairs(pairs: &[u32]) -> Vec<i16> {
     out
 }
 
+/// Removes the board's DC offset from a narrow record (I, Q as sent, mixed
+/// down by `offset` MHz). The ESP's DC offset is often 20 dB above the noise
+/// in a 1 MHz channel, which ruins weak packets on the two channels either
+/// side of the LO. In the record it is a tone at -`offset` MHz, a quarter
+/// turn per output sample for each MHz, so it is measured over the record
+/// and subtracted: a notch a few kHz wide at a frequency no Bluetooth channel
+/// uses when tiled (the LOs sit half a MHz off the channels). Only tiled
+/// boards use it: a single board or folded boards can have a channel on the
+/// LO, where the notch would take part of the packet.
+fn remove_dc(y: &mut [(f32, f32)], offset: i32) {
+    if offset.abs() > 2 || y.len() < 64 {
+        return; // outside the record's +-2 MHz, or too short to measure
+    }
+    // e^(-j pi offset n / 2): cycles through 1, -j, -1, j for offset 1.
+    let turn = |n: usize| match ((-(offset as i64) * n as i64).rem_euclid(4)) as u8 {
+        0 => (1.0, 0.0),
+        1 => (0.0, 1.0),
+        2 => (-1.0, 0.0),
+        _ => (0.0, -1.0),
+    };
+    let (mut si, mut sq) = (0.0f64, 0.0f64);
+    for (n, &(i, q)) in y.iter().enumerate() {
+        let (c, s) = turn(n);
+        // y times the conjugate of the tone.
+        si += (i * c + q * s) as f64;
+        sq += (q * c - i * s) as f64;
+    }
+    let (di, dq) = ((si / y.len() as f64) as f32, (sq / y.len() as f64) as f32);
+    for (n, v) in y.iter_mut().enumerate() {
+        let (c, s) = turn(n);
+        v.0 -= di * c - dq * s;
+        v.1 -= di * s + dq * c;
+    }
+}
+
 /// Restores a narrow record, starting at stream pair `start`, to the 16 MHz
 /// window: interpolates by 4 with the ESP's filter, mixes back up by
 /// `offset` MHz, then conjugates and scales like `convert_pairs`.
@@ -509,12 +552,29 @@ fn convert_snapshot(words: &[u32], rng: &mut u32) -> Vec<i16> {
 
 /// The ESP_STREAM argument from the environment, with whether it asks for
 /// channelized bursts and Wi-Fi rejection.
-fn stream_arg() -> (u16, bool, bool) {
+fn stream_arg() -> Result<(u16, bool, bool), String> {
     let reject = std::env::var_os("BD_ESPDR_KEEP_WIDEBAND").is_none();
     let channelize = std::env::var_os("BD_ESPDR_WIDE").is_none();
+    let telemetry = std::env::var_os("BD_ESPDR_TELEMETRY").is_some();
+    let trigger_ratio = match std::env::var("BD_ESPDR_TRIGGER_RATIO") {
+        Ok(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|ratio| (3..=31).contains(ratio))
+            .ok_or_else(|| "BD_ESPDR_TRIGGER_RATIO must be an integer from 3 to 31".to_string())?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("BD_ESPDR_TRIGGER_RATIO is not valid text".to_string())
+        }
+    };
     let arg = if reject { STREAM_REJECT_WIDEBAND } else { 0 }
-        | if channelize { STREAM_CHANNELIZE } else { 0 };
-    (arg, channelize, reject)
+        | if channelize { STREAM_CHANNELIZE } else { 0 }
+        | if telemetry { STREAM_TELEMETRY } else { 0 }
+        | trigger_ratio << STREAM_TRIGGER_RATIO_SHIFT;
+    if trigger_ratio != 0 {
+        eprintln!("eSpDR: burst trigger {}x noise", trigger_ratio);
+    }
+    Ok((arg, channelize, reject))
 }
 
 /// Opens the ESP at `path`, checks its firmware and tunes it, with baseband
@@ -605,6 +665,57 @@ fn resolve_port(iface: &str) -> Result<String, String> {
     })
 }
 
+#[derive(Default)]
+struct ReceiverTelemetry {
+    queue_high_water: u32,
+    triggers: u64,
+    trigger_power: f32,
+    trigger_floor: f32,
+    rejected: [u64; 3],
+    backlog: u32,
+}
+
+impl ReceiverTelemetry {
+    fn add(&mut self, words: &[u32]) {
+        if words.len() < STATUS_V2_WORDS {
+            return;
+        }
+        self.queue_high_water = self.queue_high_water.max(words[8]);
+        self.triggers += words[9] as u64;
+        let power = f32::from_bits(words[10]);
+        if power > self.trigger_power {
+            self.trigger_power = power;
+            self.trigger_floor = f32::from_bits(words[11]);
+        }
+        for (total, &value) in self.rejected.iter_mut().zip(&words[12..15]) {
+            *total += value as u64;
+        }
+        self.backlog = self.backlog.max(words[15]);
+    }
+
+    fn report(&mut self, board: Option<usize>) {
+        let trigger = if self.trigger_floor <= 0.0 {
+            0.0
+        } else {
+            self.trigger_power / self.trigger_floor
+        };
+        let label = board.map_or_else(|| "eSpDR".to_string(), |n| format!("eSpDR board {}", n));
+        eprintln!(
+            "{} rx: queue={}/{} triggers={} max={:.2}x reject(mask/env/power)={}/{}/{} backlog={}",
+            label,
+            self.queue_high_water,
+            64 * 1024,
+            self.triggers,
+            trigger,
+            self.rejected[0],
+            self.rejected[1],
+            self.rejected[2],
+            self.backlog,
+        );
+        *self = Self::default();
+    }
+}
+
 /// Receives the burst stream until stopped. Gain changes stop the stream,
 /// apply the setting and restart it, continuing the timeline.
 fn stream_loop(
@@ -616,6 +727,8 @@ fn stream_loop(
     arg: u16,
 ) {
     let mut timeline = Timeline::new(tx);
+    let mut telemetry = ReceiverTelemetry::default();
+    let mut telemetry_reported = Instant::now();
     while running.load(Ordering::Relaxed) {
         if let Ok(gain) = gain_rx.try_recv() {
             link.stop_stream();
@@ -650,6 +763,13 @@ fn stream_loop(
                 // Bursts the ESP dropped for queue space, plus blocks skipped
                 // when it fell behind.
                 overflow.store(words[3] as u64 + words[5] as u64, Ordering::Relaxed);
+                telemetry.add(&words);
+                if words.len() >= STATUS_V2_WORDS
+                    && telemetry_reported.elapsed() >= Duration::from_secs(1)
+                {
+                    telemetry.report(None);
+                    telemetry_reported = Instant::now();
+                }
                 if !timeline.fill_to(timeline.base + start) {
                     break; // stop the ESP's stream on the way out
                 }
@@ -712,6 +832,19 @@ pub struct EspdrHandle {
     gain_tx: Sender<u8>,
     thread: Option<JoinHandle<()>>,
     lo_hz: u32,
+    classic_alias_channels: Vec<u32>,
+}
+
+fn single_classic_alias_channels(sample_rate: u32, center_freq: u64) -> Vec<u32> {
+    if sample_rate != 16_000_000 {
+        return Vec::new();
+    }
+    [center_freq.saturating_sub(7_000_000), center_freq + 7_000_000]
+        .into_iter()
+        .filter(|hz| hz % 1_000_000 == 0)
+        .map(|hz| (hz / 1_000_000) as u32)
+        .filter(|f| (2402..=2480).contains(f))
+        .collect()
 }
 
 impl EspdrHandle {
@@ -737,7 +870,7 @@ impl EspdrHandle {
         let gain_sel = gain.clamp(0, 127) as u16;
         let (mut link, lo_hz) =
             open_board(&path, rate_sel, width, gain_sel, center_freq as u32, filter_code(FILTER_16M)?)?;
-        let (stream_arg, channelize, reject) = stream_arg();
+        let (stream_arg, channelize, reject) = stream_arg()?;
         let force_snapshot = std::env::var_os("BD_ESPDR_SNAPSHOT").is_some();
         let streaming = !force_snapshot && link.start_stream(stream_arg)?;
         if !streaming {
@@ -791,6 +924,7 @@ impl EspdrHandle {
             gain_tx,
             thread: Some(thread),
             lo_hz,
+            classic_alias_channels: single_classic_alias_channels(sample_rate, center_freq),
         })
     }
 
@@ -840,6 +974,11 @@ impl EspdrHandle {
     pub fn lo_hz(&self) -> u32 {
         self.lo_hz
     }
+
+    /// Classic RF channels whose reported frequency may be a 16 MHz image.
+    pub fn classic_alias_channels(&self) -> &[u32] {
+        &self.classic_alias_channels
+    }
 }
 
 impl Drop for EspdrHandle {
@@ -882,6 +1021,34 @@ mod tests {
         assert_eq!(resolve_port("espdr:/dev/ttyACM3").unwrap(), "/dev/ttyACM3");
         assert!(resolve_port("espdrX").is_err());
     }
+
+    #[test]
+    fn single_receiver_marks_only_its_edge_channels_as_aliased() {
+        assert_eq!(
+            single_classic_alias_channels(16_000_000, 2_441_000_000),
+            vec![2434, 2448]
+        );
+        assert!(single_classic_alias_channels(80_000_000, 2_441_000_000).is_empty());
+        assert!(single_classic_alias_channels(16_000_000, 2_441_500_000).is_empty());
+    }
+
+    #[test]
+    fn extended_status_accumulates() {
+        let mut status = vec![0; STATUS_V2_WORDS];
+        status[8] = 12000;
+        status[9] = 7;
+        status[10] = 20.0f32.to_bits();
+        status[11] = 4.0f32.to_bits();
+        status[12..16].copy_from_slice(&[1, 2, 3, 5000]);
+        let mut telemetry = ReceiverTelemetry::default();
+        telemetry.add(&status);
+        assert_eq!(telemetry.queue_high_water, 12000);
+        assert_eq!(telemetry.triggers, 7);
+        assert_eq!(telemetry.rejected, [1, 2, 3]);
+        assert_eq!(telemetry.backlog, 5000);
+        assert_eq!(telemetry.trigger_power / telemetry.trigger_floor, 5.0);
+    }
+
     fn drain(rx: &Receiver<Vec<i16>>) -> Vec<i16> {
         let mut all = Vec::new();
         while let Ok(chunk) = rx.try_recv() {
@@ -924,6 +1091,46 @@ mod tests {
         assert!(t.fill_to(MAX_GAP_PAIRS * 3));
         assert_eq!(t.emitted, MAX_GAP_PAIRS * 3);
         assert_eq!(drain(&rx).len() as u64, 2 * MAX_GAP_PAIRS);
+    }
+
+    #[test]
+    fn remove_dc_takes_out_the_offset_and_keeps_the_channel() {
+        // A record mixed down by 1 MHz: the board's DC is a tone at -1 MHz
+        // (a quarter turn back per 4 Msps sample), the channel a tone at
+        // -0.5 MHz, half a MHz from the DC as a tiled Bluetooth channel is.
+        let n = 400;
+        let tone = |f_mhz: f64, amp: f64, k: usize| {
+            let a = 2.0 * std::f64::consts::PI * f_mhz * k as f64 / 4.0;
+            (amp * a.cos(), amp * a.sin())
+        };
+        let power_at = |y: &[(f32, f32)], f: f64| {
+            let (mut i, mut q) = (0.0, 0.0);
+            for (k, &(a, b)) in y.iter().enumerate() {
+                let (c, s) = tone(-f, 1.0, k);
+                i += a as f64 * c - b as f64 * s;
+                q += a as f64 * s + b as f64 * c;
+            }
+            (i * i + q * q) / (y.len() * y.len()) as f64
+        };
+        // Mixed down by +1 or -1 MHz, the DC lies at -1 or +1 MHz.
+        for offset in [1, -1] {
+            let dc = -offset as f64;
+            let channel = dc / 2.0;
+            let mut y: Vec<(f32, f32)> = (0..n)
+                .map(|k| {
+                    let (di, dq) = tone(dc, 7.0, k);
+                    let (si, sq) = tone(channel, 3.0, k);
+                    ((di + si) as f32, (dq + sq) as f32)
+                })
+                .collect();
+            remove_dc(&mut y, offset);
+            assert!(power_at(&y, dc) < 1e-6, "offset {}: DC left: {}", offset, power_at(&y, dc));
+            assert!((power_at(&y, channel) - 9.0).abs() < 0.1, "offset {}: channel changed", offset);
+        }
+        // Far from the window the record is left alone.
+        let mut far = vec![(5.0f32, -2.0f32); n];
+        remove_dc(&mut far, 3);
+        assert_eq!(far[0], (5.0, -2.0));
     }
 
     #[test]

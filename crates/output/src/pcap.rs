@@ -32,6 +32,7 @@ const BREDR_REFUAP_VALID: u16 = 0x0080;
 const BREDR_HEC_CHECKED: u16 = 0x0100;
 const BREDR_HEC_VALID: u16 = 0x0200;
 const BREDR_PAYLOAD_PRESENT: u16 = 0x0020;
+const BREDR_RF_CHANNEL_ALIASED: u16 = 0x0040;
 const BREDR_CRC_CHECKED: u16 = 0x0400;
 const BREDR_CRC_VALID: u16 = 0x0800;
 
@@ -260,7 +261,13 @@ impl<W: Write> PcapWriter<W> {
 
     /// Write a Classic BT packet record
     pub fn write_bt(&mut self, pkt: &ClassicBtPacket, gps: Option<&GpsFix>) -> io::Result<()> {
-        let flags: u16 = BREDR_SIGNAL_POWER_VALID | BREDR_NOISE_POWER_VALID;
+        let flags: u16 = BREDR_SIGNAL_POWER_VALID
+            | BREDR_NOISE_POWER_VALID
+            | if pkt.rf_channel_aliased {
+                BREDR_RF_CHANNEL_ALIASED
+            } else {
+                0
+            };
 
         let rf_channel = (pkt.freq - 2402) as u8;
         let payload_len = pkt.decoded_payload.len();
@@ -293,7 +300,7 @@ impl<W: Write> PcapWriter<W> {
             }
         }
 
-        // Classic BT BR/EDR baseband header (20 bytes, packed LE)
+        // Classic BT BR/EDR baseband header (22 bytes, packed LE)
         self.writer.write_u8(rf_channel)?; // rf_channel
         self.writer.write_i8(pkt.rssi_db as i8)?; // signal_power
         self.writer.write_i8(pkt.noise_db as i8)?; // noise_power
@@ -371,7 +378,13 @@ pub fn zmq_build_ble(pkt: &BlePacket) -> Vec<u8> {
 /// Build a ZMQ message buffer for a Classic BT packet.
 /// Format: type_byte(1) + pcaprec_hdr(16) + bredr_header(22) + [decoded payload]
 pub fn zmq_build_bt(pkt: &ClassicBtPacket) -> Vec<u8> {
-    let flags: u16 = BREDR_SIGNAL_POWER_VALID | BREDR_NOISE_POWER_VALID;
+    let flags: u16 = BREDR_SIGNAL_POWER_VALID
+        | BREDR_NOISE_POWER_VALID
+        | if pkt.rf_channel_aliased {
+            BREDR_RF_CHANNEL_ALIASED
+        } else {
+            0
+        };
     let payload_len = pkt.decoded_payload.len();
     let total_len = 22 + payload_len;
     let msg_len = 1 + 16 + total_len;
@@ -429,6 +442,7 @@ mod tests {
             freq: 2437,
             rssi_db: -40,
             noise_db: -90,
+            rf_channel_aliased: false,
             timestamp: bd_protocol::Timespec {
                 tv_sec: 1000,
                 tv_nsec: 500_000_000,
@@ -543,6 +557,24 @@ mod tests {
 
         assert_eq!(flags & BREDR_REFUAP_VALID, 0);
         assert_eq!(flags & (BREDR_HEC_CHECKED | BREDR_HEC_VALID), 0);
+    }
+
+    #[test]
+    fn test_bt_marks_aliased_rf_channel() {
+        let mut pkt = classic_packet(Vec::new());
+        pkt.rf_channel_aliased = true;
+
+        let msg = zmq_build_bt(&pkt);
+        let zmq_flags = u16::from_le_bytes(msg[37..39].try_into().unwrap());
+        assert_ne!(zmq_flags & BREDR_RF_CHANNEL_ALIASED, 0);
+
+        let mut capture = Vec::new();
+        PcapWriter::new(&mut capture)
+            .unwrap()
+            .write_bt(&pkt, None)
+            .unwrap();
+        let pcap_flags = u16::from_le_bytes(capture[68..70].try_into().unwrap());
+        assert_ne!(pcap_flags & BREDR_RF_CHANNEL_ALIASED, 0);
     }
 
     #[test]

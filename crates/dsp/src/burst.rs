@@ -195,11 +195,11 @@ impl BurstCatcher {
 
         // Scan mode: accumulate every AGC-processed sample regardless of squelch
         if let Some(ref mut sbuf) = self.scan_buf {
-            sbuf.push(output);
-            self.scan_new += 1;
-            if self.scan_new == 1 {
+            if sbuf.is_empty() {
                 self.scan_ts = timestamp_with_sample_offset(batch_start, sample_offset);
             }
+            sbuf.push(output);
+            self.scan_new += 1;
         }
 
         // Continuation in progress: keep the rest of the DPSK payload, ignoring
@@ -369,6 +369,7 @@ impl BurstCatcher {
         if sbuf.len() > keep {
             let drain_count = sbuf.len() - keep;
             sbuf.drain(..drain_count);
+            self.scan_ts = timestamp_with_sample_offset(&self.scan_ts, drain_count);
         }
         self.scan_new = 0;
 
@@ -394,5 +395,25 @@ mod tests {
         let result = timestamp_with_sample_offset(&start, 4);
         assert_eq!(result.tv_sec, 11);
         assert_eq!(result.tv_nsec, 1_000);
+    }
+
+    #[test]
+    fn overlapping_scan_windows_keep_the_retained_samples_timestamp() {
+        let mut catcher = BurstCatcher::new_scan(2426, -45.0);
+        let first = Timespec { tv_sec: 10, tv_nsec: 0 };
+        for offset in 0..SCAN_STEP {
+            catcher.execute_at(Complex32::new(0.0, 0.0), &first, offset);
+        }
+        let first_window = catcher.take_scan_burst().unwrap();
+        assert_eq!(first_window.timestamp.tv_sec, first.tv_sec);
+        assert_eq!(first_window.timestamp.tv_nsec, first.tv_nsec);
+
+        let second = Timespec { tv_sec: 10, tv_nsec: 16_384_000 };
+        for offset in 0..SCAN_STEP {
+            catcher.execute_at(Complex32::new(0.0, 0.0), &second, offset);
+        }
+        let second_window = catcher.take_scan_burst().unwrap();
+        assert_eq!(second_window.timestamp.tv_sec, 10);
+        assert_eq!(second_window.timestamp.tv_nsec, 8_192_000);
     }
 }

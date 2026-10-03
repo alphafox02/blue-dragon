@@ -9,6 +9,15 @@ pub const BLE_AA_TLEN: usize = BLE_AA_BITS * BLE_SPS; // 64 samples
 pub const BLE_CORR_THRESH: f32 = 0.6;
 pub const BLE_MAX_HD: u32 = 4;
 
+fn timestamp_with_sample_offset(timestamp: &Timespec, samples: usize, sps: usize) -> Timespec {
+    let offset_ns = samples as u64 * 1_000 / sps.max(1) as u64;
+    let total_ns = timestamp.tv_nsec + offset_ns;
+    Timespec {
+        tv_sec: timestamp.tv_sec + total_ns / 1_000_000_000,
+        tv_nsec: total_ns % 1_000_000_000,
+    }
+}
+
 // Pre-computed 127-bit whitening sequence (7-bit maximal-length LFSR, period 127)
 // All 40 BLE channels use the same sequence at different offsets
 static WHITENING: [u8; 127] = [
@@ -1186,7 +1195,7 @@ pub fn ble_coded_burst_search(
         freq,
         len: pkt_len,
         data,
-        timestamp,
+        timestamp: timestamp_with_sample_offset(&timestamp, preamble_start, sps),
         rssi_db: 0,
         noise_db: 0,
         crc_checked,
@@ -1702,5 +1711,6 @@ mod tests {
         // Verify dewhitened PDU
         assert_eq!(pkt.data[5], 0x02, "PDU type mismatch");
         assert_eq!(pkt.data[6], 0x06, "PDU length mismatch");
+        assert_eq!(pkt.timestamp.tv_nsec, 100_000);
     }
 }
