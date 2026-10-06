@@ -13,6 +13,38 @@ Output is Wireshark-compatible PCAP with optional ZMQ streaming for
 multi-sensor deployments, GPS tagging for drive surveys, and a web
 dashboard for real-time monitoring.
 
+## Quick start
+
+Build with the backends you need (see [Building](#building) for every
+platform and [Feature flags](#feature-flags) for the options; USRP support
+is always included and needs `libuhd-dev`), then capture:
+
+    cargo build --release --features "bladerf,zmq,gps"
+    sudo install -m 755 target/release/blue-dragon /usr/local/bin/
+
+    # list the radios Blue Dragon can see
+    blue-dragon --list
+
+    # capture, check CRCs, and print live statistics
+    blue-dragon -l -i bladerf0 -C 56 -c 2441 -g 35 --check-crc --stats -w capture.pcap
+
+`-C` is the bandwidth in MHz, `-c` the centre frequency and `-g` the gain;
+[Choosing settings](#choosing-settings) explains how to pick them for your
+radio. The PCAP opens in Wireshark.
+
+To watch devices in a browser, run the dashboard and the sensor in two
+terminals, the dashboard first:
+
+    # terminal 1: the dashboard (pip install pyzmq)
+    python3 tools/zmq_web_dashboard.py 'tcp://*:5555' --db ~/bluedragon.db
+
+    # terminal 2: the sensor, streaming to it
+    blue-dragon -l -i bladerf0 -C 56 -c 2441 -g 35 --check-crc --stats --zmq tcp://localhost:5555
+
+Then open http://localhost:8099. Keep `--db` in front of the database path:
+without it the path is taken as a second data address and the dashboard
+receives nothing.
+
 ## Status
 
 | Feature | Status | Notes |
@@ -39,7 +71,7 @@ dashboard for real-time monitoring.
 | HCI GATT probing | Untested | Compiles, needs end-to-end test with --hci |
 | HCI active scanning | Tested | --active-scan enriches device data |
 | Channel counts -C 60+ | Tested | -C 40 and -C 60 validated on USRP and bladeRF |
-| ESP32-S3 (eSpDR, USB) | Experimental | One board covers 16 MHz; five tiled boards cover the whole band (88-95% CRC OTA) |
+| ESP32-S3 (eSpDR, USB) | Experimental | One board covers 16 MHz; five tiled boards cover the whole band (85-98% CRC OTA across test runs) |
 
 ## Supported Hardware
 
@@ -57,32 +89,6 @@ dashboard for real-time monitoring.
 To list available SDR devices:
 
     blue-dragon --list
-
-### SDR Gain Recommendations
-
-The `-g` flag sets the SDR's receive gain in dB. The optimal value depends on
-the SDR hardware and environment. **Too high clips the ADC (zero packets);
-too low buries the signal in the noise floor (low CRC rate).**
-
-| SDR | Default | OTA Recommended | Cabled (30 dB atten) | Notes |
-|-----|---------|-----------------|----------------------|-------|
-| USRP B210 | 60 | 40-50 | 60 | UHD auto-AGC not used |
-| bladeRF 2.0 | 60 | **25-35** | 50-60 | Clips at 60 OTA -- use 30 |
-| HackRF | 40 LNA / 20 VGA | TBD | TBD | Separate `--hackrf-lna` / `--hackrf-vga` |
-| Spectran V6 | 60 | 30-60 | 20-30 | `-g N` → reflevel -N dBm, clamped [-36, 10]; preamp=Auto, auto-scaled f32→i16 |
-| RFNM (Lime) | 30 | 20-30 | 30 | Lime gain range -24 to 30 dB |
-| Epiq Sidekiq | varies | **30-35** | TBD | `-g` is the device's RX gain *index* (range varies per model, read from the SDK at open time). On AD9361-based cards (Stretch / m.2-2280, m.2-3042, mPCIe) each step ≈ 1 dB; indices 30-35 measured highest CRC on a populated office BLE band in our testing. `--sidekiq-agc` switches to the SDK's auto-gain, `--sidekiq-no-dc` disables FPGA DC offset correction (on by default), `--sidekiq-gpsdo` enables FPGA GPSDO on cards with an integrated GPS receiver. **Recommended production config: build with `--features sidekiq,zmq,gps,gpu` and run `-C 60 -g 30`** for 85%+ CRC at 60 MHz of in-band BLE capture with the Intel/AMD integrated GPU PFB. Avoid prime-number `-C` values (e.g. 53, 59, 61) with the GPU PFB; CPU path handles them fine. |
-| SoapySDR | 60 | Device-dependent | Device-dependent | Depends on underlying hardware |
-| ESP32-S3 | 60 (too high) | 20-30 with an antenna, 44-56 on a PCB antenna | TBD | `-g` is a gain-table selector (0-127, not dB) and not linear; tune per board with `BD_ESPDR_GAINS` |
-
-**Symptoms of gain too high:** BLE count = 0, all bursts fail decode (ADC saturation
-clips the waveform so preamble/AA correlation fails). Fix: lower `-g`.
-
-**Symptoms of gain too low:** Low CRC pass rate (< 50%), low BLE packet count.
-Fix: raise `-g`.
-
-Use `--stats` to monitor CRC rate in real time. Target: > 85% for a clean
-environment, 70-90% typical for busy 2.4 GHz bands.
 
 ## Building
 
@@ -190,6 +196,428 @@ deployments; RTL-SDR and Airspy receivers do not tune to 2.4 GHz.
 GPU acceleration on macOS requires Metal (future work -- OpenCL is
 deprecated on macOS and Metal backend is not yet implemented).
 
+### Feature flags
+
+Features are opt-in. Build only what you need:
+
+| Feature | Description | System Dependency |
+|---------|-------------|-------------------|
+| `usrp` | USRP B200/B210 support (default) | libuhd-dev |
+| `hackrf` | HackRF One support | libhackrf-dev |
+| `bladerf` | bladeRF 2.0 support | libbladerf-dev |
+| `soapysdr` | SoapySDR generic support | libsoapysdr-dev |
+| `zmq` | ZMQ packet streaming + C2 | libzmq3-dev |
+| `gps` | GPS tagging via gpsd | (no C lib -- uses TCP JSON) |
+| `gpu` | OpenCL GPU acceleration | ocl-icd-opencl-dev |
+| `hci` | Active GATT probing + LE scanning via HCI | libdbus-1-dev (for BlueZ D-Bus) |
+| `aaronia` | Spectran V6 support | RTSA Suite Pro |
+| `rfnm` | RFNM (Lime daughtercard) support | librfnm, spdlog |
+| `sidekiq` | Epiq Sidekiq family support | libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`) |
+| `espdr` | ESP32-S3 receiver over USB (eSpDR firmware) | libudev-dev |
+
+## Usage
+
+### Command-Line Options
+
+```
+Input (pick one):
+    -f, --file FILE         Read input from IQ file
+    --burst-file FILE       Replay a compact channelized burst capture
+    -l, --live              Capture live from SDR
+
+SDR settings:
+    -i, --interface IFACE   SDR device (e.g. usrp-B210-SERIAL)
+    -c, --center-freq FREQ  Center frequency in MHz (default: 2441)
+    -C, --channels N        Number of channels (default: 40)
+    -a, --all-channels      Full BLE band: sets -C 96 -c 2441
+    -g, --gain DB           SDR gain (default: 60)
+    -s, --squelch DB        Squelch threshold (default: -45)
+    --antenna PORT          RX port (USRP: RX2/TX/RX, bladeRF: RX1/RX2)
+    --hackrf-lna DB         HackRF LNA gain (default: 40)
+    --hackrf-vga DB         HackRF VGA gain (default: 20)
+    --aaronia-decim D       Spectran V6 decimation (1, 2, 4, ... 512)
+    --sidekiq-agc           Sidekiq: AD9361 AGC instead of the -g gain index
+    --sidekiq-no-dc         Sidekiq: disable FPGA DC offset correction
+    --sidekiq-gpsdo         Sidekiq: enable the card's GPSDO
+    --espdr-load            ESP32-S3: load the firmware into boards that need it
+    --espdr-image PATH      ESP32-S3: firmware image for --espdr-load
+
+Output:
+    -w, --write FILE        Output PCAP to file or FIFO
+    --write-bursts FILE     Record channelized IQ bursts for replay
+    --burst-limit-mb N      Stop burst recording at N MiB (default: 512; 0=unlimited)
+    --check-crc             Enable BLE CRC-24 validation (Classic payload CRC is always required)
+    --classic-address ADDR  Trust a known Classic BD_ADDR (repeatable)
+    --stats                 Print performance statistics
+    -v, --verbose           Verbose output
+
+Network streaming:
+    -Z, --zmq ENDPOINT     Stream to collector (e.g. tcp://collector:5555)
+    --zmq-curve-key FILE   CurveZMQ encryption keyfile
+    --sensor-id NAME       Sensor identity for multi-sensor deployments
+
+GPS:
+    --gpsd                  Tag packets with GPS from gpsd
+
+IQ file options:
+    --format FORMAT         Sample format: ci8, ci16, cf32 (default: ci16)
+    --sample-rate HZ        Sample rate of the file
+
+BLE 5 Long Range:
+    --coded-scan            Continuous LE Coded scan on advertising channels
+
+GPU:
+    --no-gpu                Disable GPU acceleration (CPU-only)
+
+HCI:
+    --hci                   Enable active GATT probing via system Bluetooth adapter
+    --active-scan           Enable LE active scanning to enrich device data
+
+Wireshark:
+    --install               Install as Wireshark extcap plugin
+    --list                  List available SDR interfaces
+```
+
+### Examples
+
+Capture 40 channels centered on 2441 MHz using a USRP B210:
+
+    blue-dragon -l -i usrp-B210-SERIAL -c 2441 -C 40 -w capture.pcap
+
+Capture with CRC validation and stats:
+
+    blue-dragon -l -i usrp-B210-SERIAL -c 2441 -C 40 --check-crc --stats
+
+Capture using HackRF (20 MHz max):
+
+    blue-dragon -l -i hackrf-0000000000000000 -c 2441 -C 20 --check-crc --stats
+
+Stream packets over ZMQ to a remote dashboard:
+
+    blue-dragon -l -c 2441 -C 40 --zmq tcp://collector:5555 --check-crc
+
+Stream with CURVE encryption:
+
+    blue-dragon -l -c 2441 -C 40 --zmq tcp://collector:5555 --zmq-curve-key server.key
+
+Capture with GPS tagging:
+
+    blue-dragon -l -c 2441 -C 40 --gpsd --zmq tcp://collector:5555
+
+Capture 92 MHz with Spectran V6:
+
+    blue-dragon -l -i aaronia -C 92 --check-crc --stats
+
+Capture full BLE band with bladeRF at recommended OTA gain:
+
+    blue-dragon -l -i bladerf0 -a -g 30 --check-crc --stats
+
+Capture full BLE band (all 40 channels) with RFNM:
+
+    blue-dragon -l -i rfnm -C 122 -c 2441 -g 30 --check-crc --stats
+
+Capture the whole band with five ESP32-S3 boards, loading their firmware:
+
+    BD_ESPDR_GAINS=44,28,44,44,56 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats --espdr-load
+
+Capture with active BLE scanning for device enrichment:
+
+    blue-dragon -l -c 2441 -C 40 --hci --active-scan --zmq tcp://dashboard:5555 --check-crc
+
+Capture BLE 5 Long Range (LE Coded PHY) on advertising channels:
+
+    blue-dragon -l -i usrp-B210-SERIAL -c 2402 -C 4 --check-crc --coded-scan --stats
+
+Without `--coded-scan`, coded decoding still runs on any squelch-triggered
+burst that fails LE 1M and BT decode. The flag adds continuous sampling on
+channels 37/38/39 to catch weak coded signals below the normal squelch
+threshold. Overlapping scan windows and the normal squelch path are
+de-duplicated, so one RF transmission is reported once.
+
+Read from a previously recorded IQ file:
+
+    blue-dragon -f recording.ci16 -c 2441 -C 20 -w output.pcap --check-crc --stats
+
+Record a bounded regression capture with a bladeRF, then replay it later:
+
+    blue-dragon -l -i bladerf0 -a -g 30 --write-bursts lab.bdb --burst-limit-mb 512 --check-crc
+    blue-dragon --burst-file lab.bdb -w replay.pcap --check-crc --stats
+
+Supply a Classic address known from an independent source when validating
+header and payload decoding:
+
+    blue-dragon --burst-file lab.bdb --classic-address 10:20:30:40:50:60 -w replay.pcap
+
+`--classic-address` supplies trusted LAP/UAP ground truth. It does not claim
+that the address was recovered from RF, and it does not bypass payload CRC
+validation.
+
+Compact burst files contain only the 2 Msps channelized windows selected by
+the squelch or coded scanner, with timestamps, frequency, RSSI, and noise
+metadata. IQ is scaled per record and stored as interleaved signed 16-bit
+samples. This makes them practical regression artifacts while retaining both
+successful decodes and rejected bursts needed to check false positives.
+
+## Choosing settings
+
+### Channel count (`-C`)
+
+The `-C` flag sets both the SDR sample rate and the number of 1 MHz FFT
+bins in the polyphase channelizer: **`-C 40` = 40 MHz bandwidth at
+40 Msps, split into 40 channels**.
+
+BLE channels are spaced every **2 MHz** (ch 0 = 2402 MHz, ch 1 = 2404 MHz,
+..., ch 39 = 2480 MHz), so only half the FFT bins land on BLE channel
+centers. The other half sit between BLE channels (these still catch
+Classic Bluetooth, which uses 1 MHz spacing). This means you need
+roughly **2x the FFT bins to cover N BLE channels**:
+
+| `-C` | Bandwidth | BLE Channels | Notes |
+|------|-----------|-------------|-------|
+| 4 | 4 MHz | ~2 of 40 | Minimal, for testing |
+| 20 | 20 MHz | ~10 of 40 | HackRF maximum |
+| 40 | 40 MHz | ~20 of 40 | Good starting point |
+| 48 | 48 MHz | ~24 of 40 | Better coverage |
+| 56 | 56 MHz | ~28 of 40 | Near full coverage |
+| 60 | 60 MHz | ~30 of 40 | Best CRC rates |
+| 80 | 80 MHz | 40 of 40 | Full BLE band (2402-2480 MHz) |
+| 96 | 96 MHz | 40 of 40 | Full band + 8 MHz guard on each side |
+
+**Why `-C 80` for full coverage?** The BLE band spans 2402-2480 MHz
+(78 MHz). At 80 MHz centered on 2441 MHz, all 40 BLE channels fit
+within the captured bandwidth.
+
+**Why `-C 96` for bladeRF?** The extra 16 MHz (8 MHz per side) acts as
+a guard band, preventing filter roll-off from degrading channels at the
+band edges. The bladeRF 2.0 supports the wider sample rate natively.
+
+**Tradeoff:** More channels = more CPU. At `-C 40` you capture half the
+BLE band at half the compute cost. On constrained hardware (Raspberry Pi,
+HackRF's 20 MHz limit), smaller values are necessary.
+
+Best CRC validation rates are at channel counts that are multiples of 4
+near 40, 48, and 60. This is a characteristic of the PFBCH2 filterbank,
+not a bug. Use `--stats` to monitor real-time performance.
+
+### Gain (`-g`)
+
+The `-g` flag sets the SDR's receive gain in dB. The optimal value depends on
+the SDR hardware and environment. **Too high clips the ADC (zero packets);
+too low buries the signal in the noise floor (low CRC rate).**
+
+| SDR | Default | OTA Recommended | Cabled (30 dB atten) | Notes |
+|-----|---------|-----------------|----------------------|-------|
+| USRP B210 | 60 | 40-50 | 60 | UHD auto-AGC not used |
+| bladeRF 2.0 | 60 | **25-35** | 50-60 | Clips at 60 OTA -- use 30 |
+| HackRF | 40 LNA / 20 VGA | TBD | TBD | Separate `--hackrf-lna` / `--hackrf-vga` |
+| Spectran V6 | 60 | 30-60 | 20-30 | `-g N` → reflevel -N dBm, clamped [-36, 10]; preamp=Auto, auto-scaled f32→i16 |
+| RFNM (Lime) | 30 | 20-30 | 30 | Lime gain range -24 to 30 dB |
+| Epiq Sidekiq | varies | **30-35** | TBD | `-g` is the device's RX gain *index* (range varies per model, read from the SDK at open time). On AD9361-based cards (Stretch / m.2-2280, m.2-3042, mPCIe) each step ≈ 1 dB; indices 30-35 measured highest CRC on a populated office BLE band in our testing. `--sidekiq-agc` switches to the SDK's auto-gain, `--sidekiq-no-dc` disables FPGA DC offset correction (on by default), `--sidekiq-gpsdo` enables FPGA GPSDO on cards with an integrated GPS receiver. **Recommended production config: build with `--features sidekiq,zmq,gps,gpu` and run `-C 60 -g 30`** for 85%+ CRC at 60 MHz of in-band BLE capture with the Intel/AMD integrated GPU PFB. Avoid prime-number `-C` values (e.g. 53, 59, 61) with the GPU PFB; CPU path handles them fine. |
+| SoapySDR | 60 | Device-dependent | Device-dependent | Depends on underlying hardware |
+| ESP32-S3 | 60 (too high) | 20-30 with an antenna, 44-56 on a PCB antenna | TBD | `-g` is a gain-table selector (0-127, not dB) and not linear; tune per board with `BD_ESPDR_GAINS` |
+
+**Symptoms of gain too high:** BLE count = 0, all bursts fail decode (ADC saturation
+clips the waveform so preamble/AA correlation fails). Fix: lower `-g`.
+
+**Symptoms of gain too low:** Low CRC pass rate (< 50%), low BLE packet count.
+Fix: raise `-g`.
+
+Use `--stats` to monitor CRC rate in real time. Target: > 85% for a clean
+environment, 70-90% typical for busy 2.4 GHz bands.
+
+## What Blue Dragon decodes
+
+### BLE 5 PHYs
+
+Blue Dragon decodes all three BLE PHY modes automatically. No flags
+are needed -- all PHYs are tried on every burst.
+
+| PHY | Data Rate | Range | Use Case |
+|-----|-----------|-------|----------|
+| LE 1M | 1 Mbps | Standard | Legacy advertising, most BLE traffic |
+| LE 2M | 2 Mbps | Shorter | High-throughput data connections |
+| LE Coded (S=8) | 125 kbps | 4x range | Long-range IoT, asset tracking |
+| LE Coded (S=2) | 500 kbps | 2x range | Long-range with higher throughput |
+
+The `--stats` output shows a per-PHY breakdown:
+
+    BLE: 1523 (2M:47 coded:12)  BT: 8  CRC: 94.2%
+
+### Extended Advertising
+
+BLE 5 Extended Advertising (ADV_EXT_IND, PDU type 7) is parsed
+automatically. The Common Extended Header is decoded to extract:
+
+- AuxPtr: secondary advertising channel, offset, and PHY
+- AdvA / TargetA: advertiser and target addresses
+- ADI: advertising data identifier
+- TxPower: transmit power level
+
+Since Blue Dragon captures all channels simultaneously, both primary
+and secondary advertisements are captured without needing to follow
+AuxPtr chains.
+
+### Classic Bluetooth
+
+Classic (BR/EDR) packets are decoded alongside BLE from the same capture.
+Classic links hop across 79 channels, 1 MHz apart, up to 1,600 times a
+second, so the wider the capture, the more of a link is heard. Basic-rate
+packets are decoded and must pass their payload CRC; Enhanced Data Rate (EDR)
+decoding is experimental (see [Status](#status)).
+
+A Classic device address (BD_ADDR) has three parts, and each reaches a
+passive receiver differently:
+
+| Part | Bits | How Blue Dragon gets it |
+|---|---|---|
+| LAP (lower address part) | 24 | Read directly: it is encoded in the sync word at the start of every packet. |
+| UAP (upper address part) | 8 | Recovered, as described below: it is never sent, but it seeds each packet's header check (HEC) and payload CRC. |
+| NAP (non-significant address part) | 16 | Read from FHS packets, which devices send while paging and answering inquiries; heard only when that happens in range. |
+
+**Recovering the UAP.** Each packet header is whitened with six bits of the
+master's clock (CLK6-1) and ends with an 8-bit HEC seeded with the UAP. For
+one header, Blue Dragon undoes the whitening for each of the 64 possible
+clock values and computes the UAP each would imply, so a header leaves 64
+candidates. The clock advances by one every 625 us slot, so between two
+packets of the same link the right clock value moves by a known amount, and
+only the true UAP stays consistent across packets. While this narrows down
+the UAP is tentative. It is confirmed by either an FHS packet, which also
+carries the NAP and the master's clock, or two payloads that pass their CRC
+(16 bits, also seeded with the UAP) at consistent clock values; decoded
+payloads are only exposed once it is confirmed. The search is small and
+involves nothing secret (no keys, no decryption); the per-header step is the
+same as libbtbb's.
+
+**Why it matters.** A link's hop sequence follows from the LAP, the low four
+bits of the UAP and the master's clock, so recovering them is what makes it
+possible to identify a link across channels and to follow it. To validate
+decoding against a device whose address you already know, pass it with
+`--classic-address`; it is used as ground truth and is not reported as
+recovered from RF.
+
+With ESP32-S3 receivers, a Classic packet reported at a channel that may be a
+16 MHz image is flagged in the output (see [ESP32-S3](#esp32-s3-espdr)).
+
+### PCAP PHY Encoding
+
+PCAP output uses LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR (DLT 256).
+PHY type is encoded in the RF header flags (bits 14-15):
+
+| Bits 14-15 | PHY | Wireshark Display |
+|-----------|-----|-------------------|
+| 0b00 | LE 1M | `LE 1M` |
+| 0b01 | LE 2M | `LE 2M` |
+| 0b10 | LE Coded | `LE Coded` |
+
+LE Coded packets include a CI (Coding Indicator) byte between the
+Access Address and PDU, per the PCAP specification. Wireshark 3.6+
+recognizes all three PHY types natively.
+
+## Output and integrations
+
+### Wireshark
+
+Install as a Wireshark extcap plugin:
+
+    blue-dragon --install
+
+This detects Wireshark's personal extcap path (via `tshark -G folders`)
+and creates a symlink there. On Wireshark 4.2+ this is typically
+`~/.local/lib/wireshark/extcap/`. After installation, plug in your SDR
+and launch Wireshark -- Blue Dragon will appear in the interface list
+with one entry per connected SDR.
+
+### ZMQ streaming and the web dashboard
+
+Blue Dragon streams packets over ZMQ to the bundled Python web dashboard.
+
+    # Start dashboard (binds data on 5555, C2 on 5556):
+    pip install pyzmq
+    python3 tools/zmq_web_dashboard.py tcp://*:5555
+
+    # Start sensor(s):
+    blue-dragon -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --sensor-id roof --check-crc
+    blue-dragon -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --sensor-id lobby --check-crc
+
+    # Open http://localhost:8099
+
+The dashboard device table includes a PHY column showing which BLE PHY
+was used by each device (1M, 2M, or Coded).
+
+#### Sensor C2 (Command and Control)
+
+When connected via `--zmq`, a C2 control channel is automatically
+established on data_port + 1 (e.g. 5556). Each sensor sends a JSON
+heartbeat every 5 seconds. The dashboard Nodes tab shows live sensor
+status, gain/squelch controls, and packet rate monitoring.
+
+Runtime-tunable: SDR gain, squelch threshold.
+Restart-required: center frequency, channel count (sensor restarts automatically).
+
+#### CURVE Encryption
+
+CURVE encryption requires `libzmq3-dev` (system libzmq with libsodium).
+The `.cargo/config.toml` overrides the Rust crate's vendored libzmq build
+to link against the system library, which has full CURVE support.
+
+    # Generate a keypair:
+    python3 tools/zmq_keygen.py server.key
+
+    # Start sensor with CURVE:
+    blue-dragon -l ... --zmq tcp://collector:5555 --zmq-curve-key server.key
+
+    # Start dashboard with CURVE:
+    python3 tools/zmq_web_dashboard.py tcp://*:5555 --server-key server.key
+
+The `server.key` contains both public and secret keys (keep it on the sensor
+and dashboard hosts). The `server.key.pub` contains only the public key and
+is safe to distribute.
+
+### GPS tagging
+
+Requires a gpsd instance running with a USB GPS receiver:
+
+    sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock
+    blue-dragon -l -c 2441 -C 40 --gpsd --zmq tcp://collector:5555
+
+GPS coordinates are embedded in the PCAP using PPI (Per-Packet Information)
+headers, compatible with Wireshark and Kismet. The dashboard `--gps` flag
+enables a live map display.
+
+No `libgps-dev` is needed -- Blue Dragon connects directly to gpsd via
+TCP JSON protocol on port 2947.
+
+### HCI GATT probing
+
+With `--hci`, Blue Dragon can actively query GATT services and
+characteristics on connectable BLE devices using the system's Bluetooth
+adapter (hci0). This is opt-in -- without the flag, the sniffer is
+100% passive.
+
+    cargo build --release --features "usrp,zmq,hci"
+    blue-dragon -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --hci --check-crc
+
+The dashboard marks connectable devices (ADV_IND, ADV_DIRECT_IND) with
+a blue badge. Click a device row to open the detail panel, then click
+"Query GATT" to enumerate services and characteristics via BlueZ.
+
+GATT queries are routed only to the sensor(s) that have seen the target
+device, not broadcast to all sensors.
+
+**Range limitation:** The HCI adapter has a typical range of 10-30 meters,
+much shorter than the SDR's passive capture range. GATT queries will only
+succeed for devices within Bluetooth range of the sensor's hci0 adapter.
+This makes the feature most useful when the sensor is physically close to
+the target, or in deployments where sensors are distributed across a site.
+
+Requires a powered Bluetooth adapter visible to BlueZ (`hciconfig hci0 up`).
+The `bluer` crate communicates with BlueZ via D-Bus -- no raw HCI access
+or special permissions beyond D-Bus policy are needed.
+
+## Hardware guides
+
+Setup notes for radios that need more than `-i NAME`.
+
 ### Spectran V6
 
 Requires the RTSA Suite Pro installed to `/opt/aaronia-rtsa-suite/`.
@@ -296,6 +724,43 @@ The 122.88 MHz base clock doesn't divide evenly into 1 MHz channels
 (122.88/61 = 2.0144 Msps per channel). The FSK demodulator automatically
 resamples to correct the timing drift. This is transparent and does not
 affect other SDR backends.
+
+### Epiq Sidekiq
+
+Opt-in `--features sidekiq`, built against the libsidekiq SDK (see
+[Supported Hardware](#supported-hardware) for the card family and
+[Gain](#gain--g) for the gain index).
+
+#### DMA buffer tuning (high-rate capture only)
+
+PCIe-attached Sidekiq cards stream IQ samples through a fixed-size DMA
+ring buffer in kernel memory. The default `RingBufferPacketCount=2048`
+gives 8 MB of buffer (~33 ms at 61 Msps), which is enough at low rates
+on a quiet host but can overflow at the AD9361's 61 Msps ceiling when
+the host has any latency jitter (VMs, browsers, builds, etc.). Symptom
+is a non-zero **drops** counter rising in the periodic Sidekiq log line.
+
+To raise the buffer:
+
+```
+sudo rmmod dmadriver
+sudo insmod /home/$USER/sidekiq_image_current/driver/$(uname -r)/dmadriver.ko \
+    RingBufferPacketCount=8192   # 32 MB, ~130 ms at 61 Msps
+cat /sys/module/dmadriver/parameters/RingBufferPacketCount   # verify
+```
+
+To persist across reboots, drop a config file into the SDK's driver
+config directory (the load script picks it up via `modprobe --config`):
+
+```
+echo 'options dmadriver RingBufferPacketCount=8192' \
+    | sudo tee $HOME/sidekiq_image_current/driver/driver_config/dmadriver.conf
+```
+
+Recommendation by card type:
+- High-rate AD9361 cards (Stretch / m.2-2280, m.2-3042, mPCIe): 8192
+- 16-bit / wider cards (Nv100, Nvm2, X4, X40): 8192 or higher
+- Low-rate or embedded targets (Z2/Z3u): default is fine, do not raise
 
 ### ESP32-S3 (eSpDR)
 
@@ -481,383 +946,9 @@ two outer positions of a single 16 Msps receiver. The flag preserves the
 packet and its observed channel while making the uncertainty explicit; it
 does not guess which of the two RF channels transmitted it.
 
-### Feature Flags
+## How it works
 
-Features are opt-in. Build only what you need:
-
-| Feature | Description | System Dependency |
-|---------|-------------|-------------------|
-| `usrp` | USRP B200/B210 support (default) | libuhd-dev |
-| `hackrf` | HackRF One support | libhackrf-dev |
-| `bladerf` | bladeRF 2.0 support | libbladerf-dev |
-| `soapysdr` | SoapySDR generic support | libsoapysdr-dev |
-| `zmq` | ZMQ packet streaming + C2 | libzmq3-dev |
-| `gps` | GPS tagging via gpsd | (no C lib -- uses TCP JSON) |
-| `gpu` | OpenCL GPU acceleration | ocl-icd-opencl-dev |
-| `hci` | Active GATT probing + LE scanning via HCI | libdbus-1-dev (for BlueZ D-Bus) |
-| `aaronia` | Spectran V6 support | RTSA Suite Pro |
-| `rfnm` | RFNM (Lime daughtercard) support | librfnm, spdlog |
-| `sidekiq` | Epiq Sidekiq family support | libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`) |
-| `espdr` | ESP32-S3 receiver over USB (eSpDR firmware) | libudev-dev |
-
-#### Sidekiq DMA buffer tuning (high-rate capture only)
-
-PCIe-attached Sidekiq cards stream IQ samples through a fixed-size DMA
-ring buffer in kernel memory. The default `RingBufferPacketCount=2048`
-gives 8 MB of buffer (~33 ms at 61 Msps), which is enough at low rates
-on a quiet host but can overflow at the AD9361's 61 Msps ceiling when
-the host has any latency jitter (VMs, browsers, builds, etc.). Symptom
-is a non-zero **drops** counter rising in the periodic Sidekiq log line.
-
-To raise the buffer:
-
-```
-sudo rmmod dmadriver
-sudo insmod /home/$USER/sidekiq_image_current/driver/$(uname -r)/dmadriver.ko \
-    RingBufferPacketCount=8192   # 32 MB, ~130 ms at 61 Msps
-cat /sys/module/dmadriver/parameters/RingBufferPacketCount   # verify
-```
-
-To persist across reboots, drop a config file into the SDK's driver
-config directory (the load script picks it up via `modprobe --config`):
-
-```
-echo 'options dmadriver RingBufferPacketCount=8192' \
-    | sudo tee $HOME/sidekiq_image_current/driver/driver_config/dmadriver.conf
-```
-
-Recommendation by card type:
-- High-rate AD9361 cards (Stretch / m.2-2280, m.2-3042, mPCIe): 8192
-- 16-bit / wider cards (Nv100, Nvm2, X4, X40): 8192 or higher
-- Low-rate or embedded targets (Z2/Z3u): default is fine, do not raise
-
-## BLE 5 PHY Support
-
-Blue Dragon decodes all three BLE PHY modes automatically. No flags
-are needed -- all PHYs are tried on every burst.
-
-| PHY | Data Rate | Range | Use Case |
-|-----|-----------|-------|----------|
-| LE 1M | 1 Mbps | Standard | Legacy advertising, most BLE traffic |
-| LE 2M | 2 Mbps | Shorter | High-throughput data connections |
-| LE Coded (S=8) | 125 kbps | 4x range | Long-range IoT, asset tracking |
-| LE Coded (S=2) | 500 kbps | 2x range | Long-range with higher throughput |
-
-The `--stats` output shows a per-PHY breakdown:
-
-    BLE: 1523 (2M:47 coded:12)  BT: 8  CRC: 94.2%
-
-### Extended Advertising
-
-BLE 5 Extended Advertising (ADV_EXT_IND, PDU type 7) is parsed
-automatically. The Common Extended Header is decoded to extract:
-
-- AuxPtr: secondary advertising channel, offset, and PHY
-- AdvA / TargetA: advertiser and target addresses
-- ADI: advertising data identifier
-- TxPower: transmit power level
-
-Since Blue Dragon captures all channels simultaneously, both primary
-and secondary advertisements are captured without needing to follow
-AuxPtr chains.
-
-### PCAP PHY Encoding
-
-PCAP output uses LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR (DLT 256).
-PHY type is encoded in the RF header flags (bits 14-15):
-
-| Bits 14-15 | PHY | Wireshark Display |
-|-----------|-----|-------------------|
-| 0b00 | LE 1M | `LE 1M` |
-| 0b01 | LE 2M | `LE 2M` |
-| 0b10 | LE Coded | `LE Coded` |
-
-LE Coded packets include a CI (Coding Indicator) byte between the
-Access Address and PDU, per the PCAP specification. Wireshark 3.6+
-recognizes all three PHY types natively.
-
-## Usage
-
-### Command-Line Options
-
-```
-Input (pick one):
-    -f, --file FILE         Read input from IQ file
-    --burst-file FILE       Replay a compact channelized burst capture
-    -l, --live              Capture live from SDR
-
-SDR settings:
-    -i, --interface IFACE   SDR device (e.g. usrp-B210-SERIAL)
-    -c, --center-freq FREQ  Center frequency in MHz (default: 2441)
-    -C, --channels N        Number of channels (default: 40)
-    -a, --all-channels      Full BLE band: sets -C 96 -c 2441
-    -g, --gain DB           SDR gain (default: 60)
-    -s, --squelch DB        Squelch threshold (default: -45)
-    --antenna PORT          RX port (USRP: RX2/TX/RX, bladeRF: RX1/RX2)
-    --hackrf-lna DB         HackRF LNA gain (default: 40)
-    --hackrf-vga DB         HackRF VGA gain (default: 20)
-    --aaronia-decim D       Spectran V6 decimation (1, 2, 4, ... 512)
-    --sidekiq-agc           Sidekiq: AD9361 AGC instead of the -g gain index
-    --sidekiq-no-dc         Sidekiq: disable FPGA DC offset correction
-    --sidekiq-gpsdo         Sidekiq: enable the card's GPSDO
-    --espdr-load            ESP32-S3: load the firmware into boards that need it
-    --espdr-image PATH      ESP32-S3: firmware image for --espdr-load
-
-Output:
-    -w, --write FILE        Output PCAP to file or FIFO
-    --write-bursts FILE     Record channelized IQ bursts for replay
-    --burst-limit-mb N      Stop burst recording at N MiB (default: 512; 0=unlimited)
-    --check-crc             Enable BLE CRC-24 validation (Classic payload CRC is always required)
-    --classic-address ADDR  Trust a known Classic BD_ADDR (repeatable)
-    --stats                 Print performance statistics
-    -v, --verbose           Verbose output
-
-Network streaming:
-    -Z, --zmq ENDPOINT     Stream to collector (e.g. tcp://collector:5555)
-    --zmq-curve-key FILE   CurveZMQ encryption keyfile
-    --sensor-id NAME       Sensor identity for multi-sensor deployments
-
-GPS:
-    --gpsd                  Tag packets with GPS from gpsd
-
-IQ file options:
-    --format FORMAT         Sample format: ci8, ci16, cf32 (default: ci16)
-    --sample-rate HZ        Sample rate of the file
-
-BLE 5 Long Range:
-    --coded-scan            Continuous LE Coded scan on advertising channels
-
-GPU:
-    --no-gpu                Disable GPU acceleration (CPU-only)
-
-HCI:
-    --hci                   Enable active GATT probing via system Bluetooth adapter
-    --active-scan           Enable LE active scanning to enrich device data
-
-Wireshark:
-    --install               Install as Wireshark extcap plugin
-    --list                  List available SDR interfaces
-```
-
-### Examples
-
-Capture 40 channels centered on 2441 MHz using a USRP B210:
-
-    blue-dragon -l -i usrp-B210-SERIAL -c 2441 -C 40 -w capture.pcap
-
-Capture with CRC validation and stats:
-
-    blue-dragon -l -i usrp-B210-SERIAL -c 2441 -C 40 --check-crc --stats
-
-Capture using HackRF (20 MHz max):
-
-    blue-dragon -l -i hackrf-0000000000000000 -c 2441 -C 20 --check-crc --stats
-
-Stream packets over ZMQ to a remote dashboard:
-
-    blue-dragon -l -c 2441 -C 40 --zmq tcp://collector:5555 --check-crc
-
-Stream with CURVE encryption:
-
-    blue-dragon -l -c 2441 -C 40 --zmq tcp://collector:5555 --zmq-curve-key server.key
-
-Capture with GPS tagging:
-
-    blue-dragon -l -c 2441 -C 40 --gpsd --zmq tcp://collector:5555
-
-Capture 92 MHz with Spectran V6:
-
-    blue-dragon -l -i aaronia -C 92 --check-crc --stats
-
-Capture full BLE band with bladeRF at recommended OTA gain:
-
-    blue-dragon -l -i bladerf0 -a -g 30 --check-crc --stats
-
-Capture full BLE band (all 40 channels) with RFNM:
-
-    blue-dragon -l -i rfnm -C 122 -c 2441 -g 30 --check-crc --stats
-
-Capture the whole band with five ESP32-S3 boards, loading their firmware:
-
-    BD_ESPDR_GAINS=44,28,44,44,56 blue-dragon -l -i espdr -C 80 -c 2441 --check-crc --stats --espdr-load
-
-Capture with active BLE scanning for device enrichment:
-
-    blue-dragon -l -c 2441 -C 40 --hci --active-scan --zmq tcp://dashboard:5555 --check-crc
-
-Capture BLE 5 Long Range (LE Coded PHY) on advertising channels:
-
-    blue-dragon -l -i usrp-B210-SERIAL -c 2402 -C 4 --check-crc --coded-scan --stats
-
-Without `--coded-scan`, coded decoding still runs on any squelch-triggered
-burst that fails LE 1M and BT decode. The flag adds continuous sampling on
-channels 37/38/39 to catch weak coded signals below the normal squelch
-threshold. Overlapping scan windows and the normal squelch path are
-de-duplicated, so one RF transmission is reported once.
-
-Read from a previously recorded IQ file:
-
-    blue-dragon -f recording.ci16 -c 2441 -C 20 -w output.pcap --check-crc --stats
-
-Record a bounded regression capture with a bladeRF, then replay it later:
-
-    blue-dragon -l -i bladerf0 -a -g 30 --write-bursts lab.bdb --burst-limit-mb 512 --check-crc
-    blue-dragon --burst-file lab.bdb -w replay.pcap --check-crc --stats
-
-Supply a Classic address known from an independent source when validating
-header and payload decoding:
-
-    blue-dragon --burst-file lab.bdb --classic-address 10:20:30:40:50:60 -w replay.pcap
-
-`--classic-address` supplies trusted LAP/UAP ground truth. It does not claim
-that the address was recovered from RF, and it does not bypass payload CRC
-validation.
-
-Compact burst files contain only the 2 Msps channelized windows selected by
-the squelch or coded scanner, with timestamps, frequency, RSSI, and noise
-metadata. IQ is scaled per record and stored as interleaved signed 16-bit
-samples. This makes them practical regression artifacts while retaining both
-successful decodes and rejected bursts needed to check false positives.
-
-### Channel Count Guidelines
-
-The `-C` flag sets both the SDR sample rate and the number of 1 MHz FFT
-bins in the polyphase channelizer: **`-C 40` = 40 MHz bandwidth at
-40 Msps, split into 40 channels**.
-
-BLE channels are spaced every **2 MHz** (ch 0 = 2402 MHz, ch 1 = 2404 MHz,
-..., ch 39 = 2480 MHz), so only half the FFT bins land on BLE channel
-centers. The other half sit between BLE channels (these still catch
-Classic Bluetooth, which uses 1 MHz spacing). This means you need
-roughly **2x the FFT bins to cover N BLE channels**:
-
-| `-C` | Bandwidth | BLE Channels | Notes |
-|------|-----------|-------------|-------|
-| 4 | 4 MHz | ~2 of 40 | Minimal, for testing |
-| 20 | 20 MHz | ~10 of 40 | HackRF maximum |
-| 40 | 40 MHz | ~20 of 40 | Good starting point |
-| 48 | 48 MHz | ~24 of 40 | Better coverage |
-| 56 | 56 MHz | ~28 of 40 | Near full coverage |
-| 60 | 60 MHz | ~30 of 40 | Best CRC rates |
-| 80 | 80 MHz | 40 of 40 | Full BLE band (2402-2480 MHz) |
-| 96 | 96 MHz | 40 of 40 | Full band + 8 MHz guard on each side |
-
-**Why `-C 80` for full coverage?** The BLE band spans 2402-2480 MHz
-(78 MHz). At 80 MHz centered on 2441 MHz, all 40 BLE channels fit
-within the captured bandwidth.
-
-**Why `-C 96` for bladeRF?** The extra 16 MHz (8 MHz per side) acts as
-a guard band, preventing filter roll-off from degrading channels at the
-band edges. The bladeRF 2.0 supports the wider sample rate natively.
-
-**Tradeoff:** More channels = more CPU. At `-C 40` you capture half the
-BLE band at half the compute cost. On constrained hardware (Raspberry Pi,
-HackRF's 20 MHz limit), smaller values are necessary.
-
-Best CRC validation rates are at channel counts that are multiples of 4
-near 40, 48, and 60. This is a characteristic of the PFBCH2 filterbank,
-not a bug. Use `--stats` to monitor real-time performance.
-
-### Wireshark Integration
-
-Install as a Wireshark extcap plugin:
-
-    blue-dragon --install
-
-This detects Wireshark's personal extcap path (via `tshark -G folders`)
-and creates a symlink there. On Wireshark 4.2+ this is typically
-`~/.local/lib/wireshark/extcap/`. After installation, plug in your SDR
-and launch Wireshark -- Blue Dragon will appear in the interface list
-with one entry per connected SDR.
-
-## ZMQ Streaming and Dashboard
-
-Blue Dragon streams packets over ZMQ to the bundled Python web dashboard.
-
-    # Start dashboard (binds data on 5555, C2 on 5556):
-    pip install pyzmq
-    python3 tools/zmq_web_dashboard.py tcp://*:5555
-
-    # Start sensor(s):
-    blue-dragon -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --sensor-id roof --check-crc
-    blue-dragon -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --sensor-id lobby --check-crc
-
-    # Open http://localhost:8099
-
-The dashboard device table includes a PHY column showing which BLE PHY
-was used by each device (1M, 2M, or Coded).
-
-### Sensor C2 (Command and Control)
-
-When connected via `--zmq`, a C2 control channel is automatically
-established on data_port + 1 (e.g. 5556). Each sensor sends a JSON
-heartbeat every 5 seconds. The dashboard Nodes tab shows live sensor
-status, gain/squelch controls, and packet rate monitoring.
-
-Runtime-tunable: SDR gain, squelch threshold.
-Restart-required: center frequency, channel count (sensor restarts automatically).
-
-### CURVE Encryption
-
-CURVE encryption requires `libzmq3-dev` (system libzmq with libsodium).
-The `.cargo/config.toml` overrides the Rust crate's vendored libzmq build
-to link against the system library, which has full CURVE support.
-
-    # Generate a keypair:
-    python3 tools/zmq_keygen.py server.key
-
-    # Start sensor with CURVE:
-    blue-dragon -l ... --zmq tcp://collector:5555 --zmq-curve-key server.key
-
-    # Start dashboard with CURVE:
-    python3 tools/zmq_web_dashboard.py tcp://*:5555 --server-key server.key
-
-The `server.key` contains both public and secret keys (keep it on the sensor
-and dashboard hosts). The `server.key.pub` contains only the public key and
-is safe to distribute.
-
-## GPS Tagging
-
-Requires a gpsd instance running with a USB GPS receiver:
-
-    sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock
-    blue-dragon -l -c 2441 -C 40 --gpsd --zmq tcp://collector:5555
-
-GPS coordinates are embedded in the PCAP using PPI (Per-Packet Information)
-headers, compatible with Wireshark and Kismet. The dashboard `--gps` flag
-enables a live map display.
-
-No `libgps-dev` is needed -- Blue Dragon connects directly to gpsd via
-TCP JSON protocol on port 2947.
-
-## HCI GATT Probing
-
-With `--hci`, Blue Dragon can actively query GATT services and
-characteristics on connectable BLE devices using the system's Bluetooth
-adapter (hci0). This is opt-in -- without the flag, the sniffer is
-100% passive.
-
-    cargo build --release --features "usrp,zmq,hci"
-    blue-dragon -l -c 2441 -C 40 --zmq tcp://dashboard:5555 --hci --check-crc
-
-The dashboard marks connectable devices (ADV_IND, ADV_DIRECT_IND) with
-a blue badge. Click a device row to open the detail panel, then click
-"Query GATT" to enumerate services and characteristics via BlueZ.
-
-GATT queries are routed only to the sensor(s) that have seen the target
-device, not broadcast to all sensors.
-
-**Range limitation:** The HCI adapter has a typical range of 10-30 meters,
-much shorter than the SDR's passive capture range. GATT queries will only
-succeed for devices within Bluetooth range of the sensor's hci0 adapter.
-This makes the feature most useful when the sensor is physically close to
-the target, or in deployments where sensors are distributed across a site.
-
-Requires a powered Bluetooth adapter visible to BlueZ (`hciconfig hci0 up`).
-The `bluer` crate communicates with BlueZ via D-Bus -- no raw HCI access
-or special permissions beyond D-Bus policy are needed.
-
-## Architecture
+### Architecture
 
 ```
 SDR (USRP / HackRF / bladeRF / SoapySDR / Spectran V6 / RFNM / Sidekiq,
@@ -896,7 +987,7 @@ Output
     |-- HCI LE active scanner (opt-in, enriches device data)
 ```
 
-## Performance
+### Performance
 
 Tested on Intel i7-12700H, USRP B210, -C 40 (20 BLE channels, 40 MHz),
 WHAD ButteRFly advertiser through 30 dB attenuator:
@@ -908,7 +999,7 @@ WHAD ButteRFly advertiser through 30 dB attenuator:
 | Classic BT UAP recovery | Autonomous CRC/clock recovery confirmed OTA |
 | Memory usage | ~40 MB RSS |
 
-### GPU vs CPU Performance
+#### GPU vs CPU Performance
 
 The polyphase channelizer + FFT is the compute bottleneck. The CPU
 path uses SIMD (AVX2/SSE2/NEON) and handles high channel counts well
@@ -939,7 +1030,7 @@ LE 2M and LE Coded decoding adds negligible overhead -- the additional
 PHY decoders only run when LE 1M decode fails on a burst, and the
 preamble checks fail fast on non-matching bursts.
 
-## Sample Precision
+### Sample precision
 
 The CPU pipeline receives int16 (i16) IQ samples from all backends,
 preserving native ADC resolution where possible. The GPU pipeline
