@@ -3,10 +3,10 @@
 Wideband BLE and Classic Bluetooth passive sniffer written in Rust.
 
 Most BLE sniffers capture one channel at a time. Blue Dragon uses a
-polyphase filterbank channelizer to capture **up to 40 BLE channels
-simultaneously** from a single SDR, decoding BLE 5 LE 1M, LE 2M, and
-LE Coded PHYs plus Classic Bluetooth BR/EDR detection in the same
-passband. Wideband capture avoids receiver-side channel hopping, subject to
+polyphase filterbank channelizer to capture **the whole 2.4 GHz Bluetooth
+band at once, all 40 BLE and all 79 Classic channels**, from a single SDR
+wide enough (less with narrower radios), decoding BLE 5 LE 1M, LE 2M and
+LE Coded PHYs and Classic Bluetooth BR/EDR in the same passband. Wideband capture avoids receiver-side channel hopping, subject to
 the SDR bandwidth, squelch, signal quality, and decoder limits.
 
 Output is Wireshark-compatible PCAP with optional ZMQ streaming for
@@ -67,7 +67,7 @@ receives nothing.
 | bladeRF backend | Tested | 88.7% CRC OTA at -g 30 |
 | SoapySDR backend | Tested | |
 | Spectran V6 | Tested | 245 MHz BW, ~91% CRC OTA (`-C 245 --aaronia-decim 2`) |
-| RFNM (Lime) | Tested | Full BLE band (122.88 Msps), 71-78% CRC OTA |
+| RFNM (Lime) | Tested | Whole band (122.88 Msps), 71-78% CRC OTA |
 | HCI GATT probing | Untested | Compiles, needs end-to-end test with --hci |
 | HCI active scanning | Tested | --active-scan enriches device data |
 | Channel counts -C 60+ | Tested | -C 40 and -C 60 validated on USRP and bladeRF |
@@ -82,7 +82,7 @@ receives nothing.
 | bladeRF 2.0 | `-i bladerf0` | 4-56 MHz (normal), up to 122 MHz (oversample) | 12-bit (normal) / 8-bit (oversample) | AD9361 (oversample overclocks beyond AD spec) |
 | SoapySDR | `-i soapy-N` | Varies | Varies | Generic SDR support |
 | Spectran V6 | `-i aaronia` | 46-245 MHz | f32 | Supported `-C` values: 46, 61, 77, 92, 122, 184, 245 (device-dependent). Other values snap up to the nearest supported clock automatically. |
-| RFNM (Lime) | `-i rfnm` or `-i rfnm-SERIAL` | 122 MHz | 12-bit | 122.88 Msps base clock, all 40 BLE channels |
+| RFNM (Lime) | `-i rfnm` or `-i rfnm-SERIAL` | 122 MHz | 12-bit | 122.88 Msps base clock, the whole band (all 40 BLE and 79 Classic channels) |
 | Epiq Sidekiq family | `-i sidekiq-SERIAL` | per-device | 12 or 16 (per-device) | Bit depth, LO range, sample-rate range and gain index range are queried from the device at open; the recv path scales samples to i16 per the reported ADC resolution. Family includes Stretch / m.2-2280 / m.2 (3042) / mPCIe (AD9361/4, 12-bit); X2 / X4 / X40 / Nv100 / Nvm2 (16-bit). Opt-in `--features sidekiq`; requires libsidekiq SDK (`$Sidekiq_DIR` or `~/sidekiq_sdk_current`). |
 | ESP32-S3 (eSpDR, USB) | `-i espdr0` or `-i espdr:/dev/ttyACM0` | 16 MHz | 10-bit | Experimental. The ESP's own radio as a receiver, over its USB port with no extra hardware; the ESP sends bursts cut to their channel. Five ESPs tile the whole band (`-i espdr -C 80`); one to four share it through the ESP's 80 MHz fold. `--espdr-load` loads the firmware. Opt-in `--features espdr`; see [ESP32-S3](#esp32-s3-espdr). |
 
@@ -229,7 +229,7 @@ SDR settings:
     -i, --interface IFACE   SDR device (e.g. usrp-B210-SERIAL)
     -c, --center-freq FREQ  Center frequency in MHz (default: 2441)
     -C, --channels N        Number of channels (default: 40)
-    -a, --all-channels      Full BLE band: sets -C 96 -c 2441
+    -a, --all-channels      Whole band (all BLE and Classic channels): sets -C 96 -c 2441
     -g, --gain DB           SDR gain (default: 60)
     -s, --squelch DB        Squelch threshold (default: -45)
     --antenna PORT          RX port (USRP: RX2/TX/RX, bladeRF: RX1/RX2)
@@ -308,11 +308,11 @@ Capture 92 MHz with Spectran V6:
 
     blue-dragon -l -i aaronia -C 92 --check-crc --stats
 
-Capture full BLE band with bladeRF at recommended OTA gain:
+Capture the whole band with bladeRF at recommended OTA gain:
 
     blue-dragon -l -i bladerf0 -a -g 30 --check-crc --stats
 
-Capture full BLE band (all 40 channels) with RFNM:
+Capture the whole band (all 40 BLE and 79 Classic channels) with RFNM:
 
     blue-dragon -l -i rfnm -C 122 -c 2441 -g 30 --check-crc --stats
 
@@ -366,33 +366,41 @@ The `-C` flag sets both the SDR sample rate and the number of 1 MHz FFT
 bins in the polyphase channelizer: **`-C 40` = 40 MHz bandwidth at
 40 Msps, split into 40 channels**.
 
-BLE channels are spaced every **2 MHz** (ch 0 = 2402 MHz, ch 1 = 2404 MHz,
-..., ch 39 = 2480 MHz), so only half the FFT bins land on BLE channel
-centers. The other half sit between BLE channels (these still catch
-Classic Bluetooth, which uses 1 MHz spacing). This means you need
-roughly **2x the FFT bins to cover N BLE channels**:
+Classic Bluetooth uses 79 channels 1 MHz apart (2402-2480 MHz), so every
+bin inside that range is a Classic channel. BLE uses 40 channels 2 MHz apart
+(RF channel 0 = 2402 MHz, 1 = 2404 MHz, ..., 39 = 2480 MHz), so every other
+bin is also a BLE channel. Coverage centred on 2441 MHz (`-c 2441`), as
+Blue Dragon reports it at startup (`channels: ...`):
 
-| `-C` | Bandwidth | BLE Channels | Notes |
-|------|-----------|-------------|-------|
-| 4 | 4 MHz | ~2 of 40 | Minimal, for testing |
-| 20 | 20 MHz | ~10 of 40 | HackRF maximum |
-| 40 | 40 MHz | ~20 of 40 | Good starting point |
-| 48 | 48 MHz | ~24 of 40 | Better coverage |
-| 56 | 56 MHz | ~28 of 40 | Near full coverage |
-| 60 | 60 MHz | ~30 of 40 | Best CRC rates |
-| 80 | 80 MHz | 40 of 40 | Full BLE band (2402-2480 MHz) |
-| 96 | 96 MHz | 40 of 40 | Full band + 8 MHz guard on each side |
+| `-C` | Bandwidth | Classic channels | BLE channels | Range | Notes |
+|------|-----------|------------------|--------------|-------|-------|
+| 4 | 4 MHz | 4 of 79 | 2 of 40 | 2440-2442 MHz | Minimal, for testing |
+| 20 | 20 MHz | 20 of 79 | 10 of 40 | 2432-2450 MHz | HackRF maximum |
+| 40 | 40 MHz | 40 of 79 | 20 of 40 | 2422-2460 MHz | Good starting point |
+| 48 | 48 MHz | 48 of 79 | 24 of 40 | 2418-2464 MHz | |
+| 56 | 56 MHz | 56 of 79 | 28 of 40 | 2414-2468 MHz | AD9361 analog bandwidth (USRP B210, bladeRF 2.0) |
+| 60 | 60 MHz | 60 of 79 | 30 of 40 | 2412-2470 MHz | Best CRC rates |
+| 80 | 80 MHz | 79 of 79 | 40 of 40 | 2402-2480 MHz | Whole band |
+| 96 | 96 MHz | 79 of 79 | 40 of 40 | 2402-2480 MHz | Whole band + 8 MHz guard on each side (`-a`) |
 
-**Why `-C 80` for full coverage?** The BLE band spans 2402-2480 MHz
-(78 MHz). At 80 MHz centered on 2441 MHz, all 40 BLE channels fit
+Moving `-c` moves the range: for example `-C 40 -c 2414` covers 2402-2433 MHz
+(Classic channels 0-31), which includes BLE advertising channels 37 and 38.
+
+**Why `-C 80` for full coverage?** The band spans 2402-2480 MHz (78 MHz).
+At 80 MHz centered on 2441 MHz, all 79 Classic and 40 BLE channels fit
 within the captured bandwidth.
 
 **Why `-C 96` for bladeRF?** The extra 16 MHz (8 MHz per side) acts as
 a guard band, preventing filter roll-off from degrading channels at the
-band edges. The bladeRF 2.0 supports the wider sample rate natively.
+band edges. Above 61.44 Msps the bladeRF 2.0 runs in its oversample mode
+with 8-bit samples, which Blue Dragon selects automatically. On a bladeRF
+2.0 micro xA4 (firmware 2.6.0, FPGA 0.16.0), `-a` detected bursts but
+decoded no packets in testing while `-C 56` decoded normally; if `-a` shows
+the same, use `-C 56` (56 of 79 Classic, 28 of 40 BLE channels).
 
 **Tradeoff:** More channels = more CPU. At `-C 40` you capture half the
-BLE band at half the compute cost. On constrained hardware (Raspberry Pi,
+band (40 of 79 Classic, 20 of 40 BLE channels) at half the compute cost. On
+constrained hardware (Raspberry Pi,
 HackRF's 20 MHz limit), smaller values are necessary.
 
 Best CRC validation rates are at channel counts that are multiples of 4
@@ -628,7 +636,7 @@ so the binary finds the library at runtime without `LD_LIBRARY_PATH`.
     cargo build --release --features "aaronia,zmq"
 
 The Spectran V6 backend uses `spectranv6/raw` mode with `outputformat=iq`
-to get wideband IQ samples. Quick start (recommended for full BLE band):
+to get wideband IQ samples. Quick start (recommended for the whole band):
 
     blue-dragon -l -i aaronia -C 92 --aaronia-decim 2 --check-crc --stats
 
@@ -639,7 +647,7 @@ internal DC notch and consistently outperforms the Full-decimation mode.
 Other shortcuts:
 
     blue-dragon -l -i aaronia -C 92 --check-crc --stats             # Full decim, ~85-87% OTA
-    blue-dragon -l -i aaronia -a --check-crc --stats                # all 40 BLE channels
+    blue-dragon -l -i aaronia -a --check-crc --stats                # whole band
 
 #### `-C` (channels / sample rate)
 
@@ -651,7 +659,7 @@ firmware or non-ECO models may not support 46/61/77 MHz; the backend
 falls back to the next-higher clock automatically and tells you on stderr.
 
 `-a` / `--all-channels` resolves to `-C 92` on Aaronia (the 92.16 MHz
-clock comfortably covers the full 78 MHz BLE band, 2402-2480 MHz). Other
+clock comfortably covers the full 78 MHz band, 2402-2480 MHz). Other
 backends keep the historical `-C 96`.
 
 The device's actual sample rate is read from `packet.stepFrequency`
@@ -676,7 +684,7 @@ actually produces after decimation.
 Examples:
 
     -C 46  --aaronia-decim 2    # clock 92 MHz / 2 = 46.08 MS/s + DC notch
-    -C 92  --aaronia-decim 2    # clock 184 MHz / 2 = 92.16 MS/s, full BLE band
+    -C 92  --aaronia-decim 2    # clock 184 MHz / 2 = 92.16 MS/s, whole band
     -C 122 --aaronia-decim 2    # clock 245 MHz / 2 = 122.88 MS/s
     -C 184 --aaronia-decim 2    # 245 / 2 = 122 effective; -C snaps down to 122
     -C 92  --aaronia-decim 4    # clock 245 / 4 = 61 effective; -C snaps to 61
@@ -713,7 +721,7 @@ device rate may differ from the requested clock.
 
 Requires librfnm and spdlog installed (typically from source to
 `/usr/local`). The RFNM with Lime daughtercard runs at 122.88 Msps,
-covering the entire BLE band (all 40 channels) simultaneously. GPU
+covering the whole band (all 40 BLE and 79 Classic channels) simultaneously. GPU
 acceleration is required at this sample rate.
 
     cargo build --release --features "rfnm,gpu,zmq"
@@ -989,7 +997,7 @@ Output
 
 ### Performance
 
-Tested on Intel i7-12700H, USRP B210, -C 40 (20 BLE channels, 40 MHz),
+Tested on Intel i7-12700H, USRP B210, -C 40 (40 MHz: 40 Classic and 20 BLE channels),
 WHAD ButteRFly advertiser through 30 dB attenuator:
 
 | Metric | Result |
@@ -1006,7 +1014,7 @@ path uses SIMD (AVX2/SSE2/NEON) and handles high channel counts well
 on modern hardware. GPU acceleration (OpenCL) offloads this work and
 may help on slower CPUs or at very high channel counts.
 
-Comparison at -C 40 (20 BLE channels), USRP B210, i7-12700H:
+Comparison at -C 40 (40 Classic and 20 BLE channels), USRP B210, i7-12700H:
 
 | Compute backend | BLE/30s | CRC% | Overflow |
 |-----------------|---------|------|----------|
