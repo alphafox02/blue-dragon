@@ -102,7 +102,20 @@ class DeviceDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_devices_last_seen
                     ON devices(last_seen);
+                CREATE TABLE IF NOT EXISTS device_channels (
+                    dev_key TEXT NOT NULL,
+                    channel INTEGER NOT NULL,
+                    pkts INTEGER DEFAULT 0,
+                    PRIMARY KEY (dev_key, channel)
+                );
             """)
+            # Columns added after the first release; older databases gain
+            # them here and keep their rows.
+            have = {row[1] for row in self.conn.execute("PRAGMA table_info(devices)")}
+            for col in ("hec_ok", "crc_ok", "uap_verified"):
+                if col not in have:
+                    self.conn.execute(
+                        f"ALTER TABLE devices ADD COLUMN {col} INTEGER DEFAULT 0")
 
     def _start_session(self):
         with self.conn:
@@ -120,14 +133,16 @@ class DeviceDB:
 
     def upsert(self, dev_key, protocol, now, name="", mfr="", identity=None,
                mac_type="", rssi=-127, services="", observations=1,
-               first_seen=None):
+               first_seen=None, chans=None, hec_ok=0, crc_ok=0,
+               uap_verified=False):
         first_seen = now if first_seen is None else first_seen
         with self.lock:
             self.conn.execute("""
                 INSERT INTO devices
                     (dev_key, protocol, first_seen, last_seen, name, mfr,
-                     identity, mac_type, total_pkts, best_rssi, services)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     identity, mac_type, total_pkts, best_rssi, services,
+                     hec_ok, crc_ok, uap_verified)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dev_key) DO UPDATE SET
                     last_seen = MAX(excluded.last_seen, last_seen),
                     total_pkts = total_pkts + excluded.total_pkts,
@@ -138,9 +153,20 @@ class DeviceDB:
                                ELSE mfr END,
                     identity = COALESCE(excluded.identity, identity),
                     services = CASE WHEN length(excluded.services) > length(services)
-                                    THEN excluded.services ELSE services END
+                                    THEN excluded.services ELSE services END,
+                    hec_ok = hec_ok + excluded.hec_ok,
+                    crc_ok = crc_ok + excluded.crc_ok,
+                    uap_verified = MAX(uap_verified, excluded.uap_verified)
             """, (dev_key, protocol, first_seen, now, name, mfr, identity,
-                  mac_type, observations, rssi, services))
+                  mac_type, observations, rssi, services,
+                  hec_ok, crc_ok, int(bool(uap_verified))))
+            for ch, n in (chans or {}).items():
+                self.conn.execute("""
+                    INSERT INTO device_channels (dev_key, channel, pkts)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(dev_key, channel) DO UPDATE SET
+                        pkts = pkts + excluded.pkts
+                """, (dev_key, int(ch), n))
             self._known_keys.add(dev_key)
             self._changes += 1
             if self._changes % 100 == 0:
@@ -178,8 +204,24 @@ class DeviceDB:
                     WHERE dev_key = ?
                 """, (old[2], old[3], old[4], old[5], old[6], old[7],
                       old[8], old[9], old[10], old[10], new_key))
+                self.conn.execute("""
+                    UPDATE devices SET
+                        hec_ok = hec_ok + (SELECT hec_ok FROM devices WHERE dev_key = ?),
+                        crc_ok = crc_ok + (SELECT crc_ok FROM devices WHERE dev_key = ?),
+                        uap_verified = MAX(uap_verified,
+                            (SELECT uap_verified FROM devices WHERE dev_key = ?))
+                    WHERE dev_key = ?
+                """, (old_key, old_key, old_key, new_key))
                 self.conn.execute(
                     "DELETE FROM devices WHERE dev_key = ?", (old_key,))
+            self.conn.execute("""
+                INSERT INTO device_channels (dev_key, channel, pkts)
+                SELECT ?, channel, pkts FROM device_channels WHERE dev_key = ?
+                ON CONFLICT(dev_key, channel) DO UPDATE SET
+                    pkts = pkts + excluded.pkts
+            """, (new_key, old_key))
+            self.conn.execute(
+                "DELETE FROM device_channels WHERE dev_key = ?", (old_key,))
             self._known_keys.discard(old_key)
             self._known_keys.add(new_key)
             self.conn.commit()
@@ -469,6 +511,17 @@ BT_PENDING_MIN_PACKETS = 3
 BT_PENDING_WINDOW_SECONDS = 5.0
 
 
+# LAPs reserved for inquiry access codes (0x9E8B00-0x9E8B3F; the general
+# inquiry code is 0x9E8B33). Any device searching for others sends them, so
+# they are inquiry activity, not a device's own address.
+BT_INQUIRY_LAP_FIRST = 0x9E8B00
+BT_INQUIRY_LAP_LAST = 0x9E8B3F
+
+
+def is_inquiry_lap(lap):
+    return BT_INQUIRY_LAP_FIRST <= lap <= BT_INQUIRY_LAP_LAST
+
+
 def parse_bt_packet(data):
     """Parse a sensor-validated Classic BT ZMQ/PCAP record."""
     if len(data) < PCAP_REC_HDR.size + BREDR_BB_HDR.size:
@@ -516,6 +569,7 @@ def parse_bt_packet(data):
         "lap": lap,
         "uap": uap,
         "uap_verified": uap_verified,
+        "header_verified": header_verified,
         "ac_errors": ac_offenses,
         "mac": mac,
         "mac_type": "bt-lap",
@@ -1451,6 +1505,7 @@ class DashboardState:
         self.crc_valid = 0
         self.crc_invalid = 0
         self.data_packets = 0
+        self.inquiry_packets = 0  # Classic inquiry access codes (not devices)
         self.gps_count = 0
         self.last_gps = None
         self.start_time = time.time()
@@ -1514,6 +1569,13 @@ class DashboardState:
                 else:
                     self.ble_channel_counts[rf_ch] = self.ble_channel_counts.get(rf_ch, 0) + 1
 
+            # Inquiry access codes come from devices searching for others;
+            # count them, but they are not a device.
+            if protocol == "BT" and is_inquiry_lap(pkt.get("lap", 0)):
+                self.inquiry_packets += 1
+                self._dirty = True
+                return
+
             # Track CONNECT_IND -> connection table
             conn_info = pkt.get("conn_info")
             if conn_info:
@@ -1574,7 +1636,8 @@ class DashboardState:
                     identities.add(dev_key)
                     if dev_key not in self.devices:
                         admitted = self._record_pending_bt(
-                            mac, now, rssi, pkt["crc_valid"], sensor_id)
+                            mac, now, rssi, pkt["crc_valid"], sensor_id,
+                            pkt.get("rf_channel"), pkt.get("header_verified"))
                         self.bt_pending.pop(mac, None)
                 elif len(identities) == 1:
                     dev_key = next(iter(identities))
@@ -1584,7 +1647,8 @@ class DashboardState:
                     return
                 elif dev_key not in self.devices:
                     admitted = self._record_pending_bt(
-                        mac, now, rssi, pkt["crc_valid"], sensor_id)
+                        mac, now, rssi, pkt["crc_valid"], sensor_id,
+                        pkt.get("rf_channel"), pkt.get("header_verified"))
                     if admitted["count"] < BT_PENDING_MIN_PACKETS:
                         return
                     self.bt_pending.pop(mac, None)
@@ -1610,6 +1674,13 @@ class DashboardState:
                     d["crc_ok"] += 1
                 elif pkt["crc_valid"] is False:
                     d["crc_bad"] += 1
+                rf = pkt.get("rf_channel")
+                if rf is not None:
+                    d["chans"][rf] = d["chans"].get(rf, 0) + 1
+                if pkt.get("header_verified"):
+                    d["hec_ok"] += 1
+                if pkt.get("uap_verified"):
+                    d["uap_verified"] = True
                 if gps_info:
                     d["lat"] = round(gps_info[0], 6)
                     d["lon"] = round(gps_info[1], 6)
@@ -1691,6 +1762,13 @@ class DashboardState:
                     "pkts": initial_count,
                     "crc_ok": initial_crc_ok,
                     "crc_bad": initial_crc_bad,
+                    # Packets per RF channel, and for Classic how many
+                    # passed the header check (confidence it is a device).
+                    "chans": dict(admitted["chans"]) if admitted else (
+                        {pkt["rf_channel"]: 1} if pkt.get("rf_channel") is not None else {}),
+                    "hec_ok": admitted["hec_ok"] if admitted else (
+                        1 if pkt.get("header_verified") else 0),
+                    "uap_verified": bool(pkt.get("uap_verified")),
                     "mac_type": pkt.get("mac_type", ""),
                     "name": fp.get("name") or "",
                     "mfr": fp.get("manufacturer") or "",
@@ -1759,6 +1837,11 @@ class DashboardState:
                     services=svc_str,
                     observations=admitted["count"] if admitted else 1,
                     first_seen=admitted["first"] if admitted else now,
+                    chans=admitted["chans"] if admitted else (
+                        {pkt["rf_channel"]: 1} if pkt.get("rf_channel") is not None else {}),
+                    hec_ok=admitted["hec_ok"] if admitted else (1 if pkt.get("header_verified") else 0),
+                    crc_ok=admitted["crc_ok"] if admitted else (1 if pkt["crc_valid"] else 0),
+                    uap_verified=bool(pkt.get("uap_verified")),
                 )
 
             # Alerting
@@ -1767,13 +1850,15 @@ class DashboardState:
 
             self._dirty = True
 
-    def _record_pending_bt(self, mac, now, rssi, crc_valid, sensor_id):
+    def _record_pending_bt(self, mac, now, rssi, crc_valid, sensor_id,
+                           channel=None, header_ok=False):
         pending = self.bt_pending.get(mac)
         if pending is None or now - pending["first"] > BT_PENDING_WINDOW_SECONDS:
             pending = {
                 "count": 0, "first": now, "last": now,
                 "rssi_sum": 0, "rssi_min": rssi, "rssi_max": rssi,
                 "crc_ok": 0, "crc_bad": 0, "sensors": {},
+                "hec_ok": 0, "chans": {},
             }
             self.bt_pending[mac] = pending
         pending["count"] += 1
@@ -1783,6 +1868,9 @@ class DashboardState:
         pending["rssi_max"] = max(pending["rssi_max"], rssi)
         pending["crc_ok"] += 1 if crc_valid else 0
         pending["crc_bad"] += 1 if crc_valid is False else 0
+        pending["hec_ok"] += 1 if header_ok else 0
+        if channel is not None:
+            pending["chans"][channel] = pending["chans"].get(channel, 0) + 1
         if sensor_id:
             obs = pending["sensors"].setdefault(
                 sensor_id, {"rssi_sum": 0, "rssi_cnt": 0, "last": 0})
@@ -1806,6 +1894,10 @@ class DashboardState:
             new["rssi_cnt"] += old["rssi_cnt"]
             new["crc_ok"] += old["crc_ok"]
             new["crc_bad"] += old["crc_bad"]
+            new["hec_ok"] += old["hec_ok"]
+            new["uap_verified"] = new["uap_verified"] or old["uap_verified"]
+            for ch, n in old["chans"].items():
+                new["chans"][ch] = new["chans"].get(ch, 0) + n
         else:
             self.devices[new_key] = old
 
@@ -1832,6 +1924,7 @@ class DashboardState:
                 "crc_invalid": self.crc_invalid,
                 "macs": len(self.devices),
                 "data_pkts": self.data_packets,
+                "inquiry_pkts": self.inquiry_packets,
                 "connections": len(self.ble_connections),
                 "gps_count": self.gps_count,
                 "last_gps": list(self.last_gps[:2]) if self.last_gps else None,
@@ -3069,6 +3162,7 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
   <span>crc: <span class="val" id="sCrc">--</span></span>
   <span>devices: <span class="val" id="sMacs">0</span></span>
   <span>data: <span class="val" id="sData">0</span></span>
+  <span>inquiry: <span class="val" id="sInq">0</span></span>
   <span>conns: <span class="val" id="sConns">0</span></span>
   <span>up: <span class="val" id="sUp">0s</span></span>
 </div>
@@ -3086,6 +3180,7 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
         <th data-col="services">services</th>
         <th data-col="type">type</th>
         <th data-col="phy">phy</th>
+        <th title="BLE: advertising channels heard (37/38/39) and other channels; Classic: channels heard, packets passing the header check and CRC">ch</th>
         <th data-col="rssi">rssi</th>
         <th data-col="est_dist">dist</th>
         <th data-col="num_sensors">sensors</th>
@@ -3258,6 +3353,23 @@ function addrCls(t) {
   return 'dim';
 }
 
+// Channels a device was heard on. BLE RF channels 0, 12 and 39 are the
+// advertising channels 37, 38 and 39; Classic adds how many packets passed
+// the header check and the payload CRC (a guide to whether it is a device).
+function chLabel(d) {
+  const chans = d.chans || {};
+  const keys = Object.keys(chans).map(Number);
+  if (d.protocol === 'BT') {
+    let s = keys.length + ' ch, ' + (d.hec_ok||0) + ' hdr, ' + (d.crc_ok||0) + ' crc';
+    if (d.uap_verified) s += ', UAP';
+    return s;
+  }
+  const adv = {0: 37, 12: 38, 39: 39};
+  const advHeard = keys.filter(k => k in adv).map(k => adv[k]).sort((a, b) => a - b);
+  const other = keys.filter(k => !(k in adv)).length;
+  return (advHeard.join(',') || '-') + (other ? ' +' + other : '');
+}
+
 function mfrLabel(d) {
   let s = d.mfr || '';
   if (d.apple_model) {
@@ -3395,6 +3507,7 @@ function renderDevices() {
       `<td class="dim">${esc(svcLabel(d))}</td>`+
       `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
       `<td class="${d.phy!=='1M'?'org':'dim'}">${d.phy||'1M'}</td>`+
+      `<td class="dim">${chLabel(d)}</td>`+
       `<td>${rssiLabel(d)}</td>`+
       `<td class="dim">${dist}</td>`+
       `<td class="dim">${d.num_sensors||''}</td>`+
@@ -3492,6 +3605,7 @@ function updStats(s) {
   document.getElementById('sCrc').textContent = s.crc_pct!==null ? s.crc_pct+'%' : '--';
   document.getElementById('sMacs').textContent = s.macs;
   document.getElementById('sData').textContent = s.data_pkts.toLocaleString();
+  document.getElementById('sInq').textContent = (s.inquiry_pkts || 0).toLocaleString();
   document.getElementById('sConns').textContent = s.connections || 0;
   document.getElementById('sUp').textContent = fmtUp(s.uptime);
   if (GPS && s.last_gps && map) {
