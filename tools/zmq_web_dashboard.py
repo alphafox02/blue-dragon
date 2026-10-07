@@ -112,7 +112,7 @@ class DeviceDB:
             # Columns added after the first release; older databases gain
             # them here and keep their rows.
             have = {row[1] for row in self.conn.execute("PRAGMA table_info(devices)")}
-            for col in ("hec_ok", "crc_ok", "uap_verified"):
+            for col in ("hec_ok", "crc_ok", "uap_verified", "ac_clean"):
                 if col not in have:
                     self.conn.execute(
                         f"ALTER TABLE devices ADD COLUMN {col} INTEGER DEFAULT 0")
@@ -134,15 +134,15 @@ class DeviceDB:
     def upsert(self, dev_key, protocol, now, name="", mfr="", identity=None,
                mac_type="", rssi=-127, services="", observations=1,
                first_seen=None, chans=None, hec_ok=0, crc_ok=0,
-               uap_verified=False):
+               uap_verified=False, ac_clean=0):
         first_seen = now if first_seen is None else first_seen
         with self.lock:
             self.conn.execute("""
                 INSERT INTO devices
                     (dev_key, protocol, first_seen, last_seen, name, mfr,
                      identity, mac_type, total_pkts, best_rssi, services,
-                     hec_ok, crc_ok, uap_verified)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     hec_ok, crc_ok, uap_verified, ac_clean)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dev_key) DO UPDATE SET
                     last_seen = MAX(excluded.last_seen, last_seen),
                     total_pkts = total_pkts + excluded.total_pkts,
@@ -156,10 +156,11 @@ class DeviceDB:
                                     THEN excluded.services ELSE services END,
                     hec_ok = hec_ok + excluded.hec_ok,
                     crc_ok = crc_ok + excluded.crc_ok,
-                    uap_verified = MAX(uap_verified, excluded.uap_verified)
+                    uap_verified = MAX(uap_verified, excluded.uap_verified),
+                    ac_clean = ac_clean + excluded.ac_clean
             """, (dev_key, protocol, first_seen, now, name, mfr, identity,
                   mac_type, observations, rssi, services,
-                  hec_ok, crc_ok, int(bool(uap_verified))))
+                  hec_ok, crc_ok, int(bool(uap_verified)), ac_clean))
             for ch, n in (chans or {}).items():
                 self.conn.execute("""
                     INSERT INTO device_channels (dev_key, channel, pkts)
@@ -209,9 +210,10 @@ class DeviceDB:
                         hec_ok = hec_ok + (SELECT hec_ok FROM devices WHERE dev_key = ?),
                         crc_ok = crc_ok + (SELECT crc_ok FROM devices WHERE dev_key = ?),
                         uap_verified = MAX(uap_verified,
-                            (SELECT uap_verified FROM devices WHERE dev_key = ?))
+                            (SELECT uap_verified FROM devices WHERE dev_key = ?)),
+                        ac_clean = ac_clean + (SELECT ac_clean FROM devices WHERE dev_key = ?)
                     WHERE dev_key = ?
-                """, (old_key, old_key, old_key, new_key))
+                """, (old_key, old_key, old_key, old_key, new_key))
                 self.conn.execute(
                     "DELETE FROM devices WHERE dev_key = ?", (old_key,))
             self.conn.execute("""
@@ -1637,7 +1639,7 @@ class DashboardState:
                     if dev_key not in self.devices:
                         admitted = self._record_pending_bt(
                             mac, now, rssi, pkt["crc_valid"], sensor_id,
-                            pkt.get("rf_channel"), pkt.get("header_verified"))
+                            pkt.get("rf_channel"), pkt.get("header_verified"), pkt.get("ac_errors"))
                         self.bt_pending.pop(mac, None)
                 elif len(identities) == 1:
                     dev_key = next(iter(identities))
@@ -1648,7 +1650,7 @@ class DashboardState:
                 elif dev_key not in self.devices:
                     admitted = self._record_pending_bt(
                         mac, now, rssi, pkt["crc_valid"], sensor_id,
-                        pkt.get("rf_channel"), pkt.get("header_verified"))
+                        pkt.get("rf_channel"), pkt.get("header_verified"), pkt.get("ac_errors"))
                     if admitted["count"] < BT_PENDING_MIN_PACKETS:
                         return
                     self.bt_pending.pop(mac, None)
@@ -1679,6 +1681,8 @@ class DashboardState:
                     d["chans"][rf] = d["chans"].get(rf, 0) + 1
                 if pkt.get("header_verified"):
                     d["hec_ok"] += 1
+                if pkt.get("ac_errors") == 0:
+                    d["ac_clean"] += 1
                 if pkt.get("uap_verified"):
                     d["uap_verified"] = True
                 if gps_info:
@@ -1768,6 +1772,10 @@ class DashboardState:
                         {pkt["rf_channel"]: 1} if pkt.get("rf_channel") is not None else {}),
                     "hec_ok": admitted["hec_ok"] if admitted else (
                         1 if pkt.get("header_verified") else 0),
+                    # Classic packets whose sync word matched with no bit
+                    # error (the sensor accepts at most one).
+                    "ac_clean": admitted["ac_clean"] if admitted else (
+                        1 if pkt.get("ac_errors") == 0 else 0),
                     "uap_verified": bool(pkt.get("uap_verified")),
                     "mac_type": pkt.get("mac_type", ""),
                     "name": fp.get("name") or "",
@@ -1840,6 +1848,7 @@ class DashboardState:
                     chans=admitted["chans"] if admitted else (
                         {pkt["rf_channel"]: 1} if pkt.get("rf_channel") is not None else {}),
                     hec_ok=admitted["hec_ok"] if admitted else (1 if pkt.get("header_verified") else 0),
+                    ac_clean=admitted["ac_clean"] if admitted else (1 if pkt.get("ac_errors") == 0 else 0),
                     crc_ok=admitted["crc_ok"] if admitted else (1 if pkt["crc_valid"] else 0),
                     uap_verified=bool(pkt.get("uap_verified")),
                 )
@@ -1851,14 +1860,14 @@ class DashboardState:
             self._dirty = True
 
     def _record_pending_bt(self, mac, now, rssi, crc_valid, sensor_id,
-                           channel=None, header_ok=False):
+                           channel=None, header_ok=False, ac_errors=None):
         pending = self.bt_pending.get(mac)
         if pending is None or now - pending["first"] > BT_PENDING_WINDOW_SECONDS:
             pending = {
                 "count": 0, "first": now, "last": now,
                 "rssi_sum": 0, "rssi_min": rssi, "rssi_max": rssi,
                 "crc_ok": 0, "crc_bad": 0, "sensors": {},
-                "hec_ok": 0, "chans": {},
+                "hec_ok": 0, "chans": {}, "ac_clean": 0,
             }
             self.bt_pending[mac] = pending
         pending["count"] += 1
@@ -1869,6 +1878,7 @@ class DashboardState:
         pending["crc_ok"] += 1 if crc_valid else 0
         pending["crc_bad"] += 1 if crc_valid is False else 0
         pending["hec_ok"] += 1 if header_ok else 0
+        pending["ac_clean"] += 1 if ac_errors == 0 else 0
         if channel is not None:
             pending["chans"][channel] = pending["chans"].get(channel, 0) + 1
         if sensor_id:
@@ -1895,6 +1905,7 @@ class DashboardState:
             new["crc_ok"] += old["crc_ok"]
             new["crc_bad"] += old["crc_bad"]
             new["hec_ok"] += old["hec_ok"]
+            new["ac_clean"] += old["ac_clean"]
             new["uap_verified"] = new["uap_verified"] or old["uap_verified"]
             for ch, n in old["chans"].items():
                 new["chans"][ch] = new["chans"].get(ch, 0) + n
@@ -3180,7 +3191,7 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
         <th data-col="services">services</th>
         <th data-col="type">type</th>
         <th data-col="phy">phy</th>
-        <th title="BLE: advertising channels heard (37/38/39) and other channels; Classic: channels heard, packets passing the header check and CRC">ch</th>
+        <th title="BLE: advertising channels heard (37/38/39) and how many other channels. Classic: channels heard and the share of packets whose sync word matched with no bit error; with a confirmed UAP, packets passing the header check and CRC.">ch</th>
         <th data-col="rssi">rssi</th>
         <th data-col="est_dist">dist</th>
         <th data-col="num_sensors">sensors</th>
@@ -3354,14 +3365,17 @@ function addrCls(t) {
 }
 
 // Channels a device was heard on. BLE RF channels 0, 12 and 39 are the
-// advertising channels 37, 38 and 39; Classic adds how many packets passed
-// the header check and the payload CRC (a guide to whether it is a device).
+// advertising channels 37, 38 and 39. For Classic, the share of packets whose
+// sync word matched with no bit error (a signal-quality guide), and once the
+// UAP is confirmed, packets passing the header check and payload CRC (both
+// need the UAP, so they are not counted before it).
 function chLabel(d) {
   const chans = d.chans || {};
   const keys = Object.keys(chans).map(Number);
   if (d.protocol === 'BT') {
-    let s = keys.length + ' ch, ' + (d.hec_ok||0) + ' hdr, ' + (d.crc_ok||0) + ' crc';
-    if (d.uap_verified) s += ', UAP';
+    let s = keys.length + ' ch';
+    if (d.pkts) s += ', ' + Math.round(100 * (d.ac_clean||0) / d.pkts) + '% clean';
+    if (d.uap_verified) s += ', UAP, ' + (d.hec_ok||0) + ' hdr, ' + (d.crc_ok||0) + ' crc';
     return s;
   }
   const adv = {0: 37, 12: 38, 39: 39};
