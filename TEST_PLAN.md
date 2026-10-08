@@ -28,6 +28,11 @@
 - [x] File input: `blue-dragon -f recording.ci16 --sample-rate 40M -c 2441 --format ci16 --stats --check-crc`
   - BLE + BT packets decoded, 86% CRC from ci16 file
 
+### GPU batch metadata
+- [ ] Verify timestamps during a live GPU capture, including a partial final
+  batch and flush. The metadata helper test does not exercise the live loop
+  timestamp anchor or GPU hardware, and this change does not enable GPU EDR.
+
 ### PCAP Output
 - [x] Write PCAP: `-w output.pcap`, open in Wireshark
   - Packets from file and live capture. tshark decodes BLE + BT correctly

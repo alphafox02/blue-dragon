@@ -2449,6 +2449,70 @@ fn broadcast_batch(
     }
 }
 
+/// Keep metadata in the same one-batch pipeline as GpuChannelizer::submit.
+/// Passing no submitted batch forwards the final result from flush().
+#[cfg(any(feature = "gpu", test))]
+fn forward_gpu_batch(
+    txs: &[channel::Sender<BatchMsg>],
+    pending: &mut Option<(Timespec, Option<Vec<i16>>)>,
+    completed: Option<&[f32]>,
+    submitted: Option<(Timespec, Option<Vec<i16>>)>,
+    batch_steps: usize,
+) {
+    let completed_metadata = std::mem::replace(pending, submitted);
+    debug_assert!(
+        completed.is_none() || completed_metadata.is_some(),
+        "completed GPU batch has no matching metadata"
+    );
+    if let (Some(result), Some((timestamp, raw_iq))) = (completed, completed_metadata) {
+        broadcast_batch(txs, result.to_vec(), raw_iq, batch_steps, &timestamp);
+    }
+}
+
+#[cfg(test)]
+mod gpu_batch_tests {
+    use super::{channel_samples_after, forward_gpu_batch};
+    use bd_protocol::Timespec;
+
+    #[test]
+    fn gpu_double_buffer_pairs_completed_iq_and_timestamp_through_flush() {
+        let (sender, receiver) = crossbeam::channel::unbounded();
+        let senders = [sender];
+        let mut pending = None;
+        let first = Timespec {
+            tv_sec: 10,
+            tv_nsec: 0,
+        };
+        let second = channel_samples_after(&first, 1);
+        forward_gpu_batch(
+            &senders,
+            &mut pending,
+            None,
+            Some((first, Some(vec![1, 2]))),
+            1,
+        );
+        assert!(receiver.try_recv().is_err());
+        forward_gpu_batch(
+            &senders,
+            &mut pending,
+            Some(&[11.0, 12.0]),
+            Some((second, Some(vec![3, 4]))),
+            1,
+        );
+        let completed = receiver.try_recv().unwrap();
+        assert_eq!(&**completed.data, &[11.0, 12.0]);
+        assert_eq!(&**completed.raw_iq.unwrap(), &[1, 2]);
+        assert_eq!((completed.ts.tv_sec, completed.ts.tv_nsec), (10, 0));
+        forward_gpu_batch(&senders, &mut pending, Some(&[13.0, 14.0]), None, 1);
+        let completed = receiver.try_recv().unwrap();
+        assert_eq!(&**completed.data, &[13.0, 14.0]);
+        assert_eq!(&**completed.raw_iq.unwrap(), &[3, 4]);
+        assert_eq!((completed.ts.tv_sec, completed.ts.tv_nsec), (10, 500));
+        assert!(pending.is_none());
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
 fn channel_samples_after(start: &Timespec, samples: usize) -> Timespec {
     const CHANNEL_SAMPLE_PERIOD_NS: u64 = 500;
     let offset_ns = samples as u64 * CHANNEL_SAMPLE_PERIOD_NS;
@@ -3685,6 +3749,9 @@ fn run_live_gpu_loop(
     let mut pos: usize = 0;
     let mut raw_buf = gpu.raw_buffer();
     let mut next_batch_ts: Option<Timespec> = None;
+    // submit() returns the preceding batch, so its raw IQ and timestamp must
+    // be retained for one submission alongside the GPU's double buffer.
+    let mut pending_batch: Option<(Timespec, Option<Vec<i16>>)> = None;
 
     for i16_buf in sdr_rx.iter() {
         // Copy i16 data into GPU raw buffer, handling partial fills
@@ -3699,12 +3766,15 @@ fn run_live_gpu_loop(
             if pos >= buffer_len {
                 // Capture the raw batch before submit() reborrows the GPU.
                 let raw = edr_wideband_enabled.then(|| raw_buf[..buffer_len].to_vec());
-                if let Some(result) = gpu.submit() {
-                    let ts = next_batch_ts
-                        .unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
-                    next_batch_ts = Some(channel_samples_after(&ts, GPU_BATCH_SIZE));
-                    broadcast_batch(&batch_txs, result.to_vec(), raw, GPU_BATCH_SIZE, &ts);
-                }
+                let ts = next_batch_ts.unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
+                next_batch_ts = Some(channel_samples_after(&ts, GPU_BATCH_SIZE));
+                forward_gpu_batch(
+                    &batch_txs,
+                    &mut pending_batch,
+                    gpu.submit(),
+                    Some((ts, raw)),
+                    GPU_BATCH_SIZE,
+                );
                 pos = 0;
                 raw_buf = gpu.raw_buffer();
             }
@@ -3716,18 +3786,23 @@ fn run_live_gpu_loop(
             raw_buf[i] = 0;
         }
         let raw = edr_wideband_enabled.then(|| raw_buf[..buffer_len].to_vec());
-        if let Some(result) = gpu.submit() {
-            let ts = next_batch_ts
-                .unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
-            next_batch_ts = Some(channel_samples_after(&ts, GPU_BATCH_SIZE));
-            broadcast_batch(&batch_txs, result.to_vec(), raw, GPU_BATCH_SIZE, &ts);
-        }
+        let ts = next_batch_ts.unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
+        forward_gpu_batch(
+            &batch_txs,
+            &mut pending_batch,
+            gpu.submit(),
+            Some((ts, raw)),
+            GPU_BATCH_SIZE,
+        );
     }
 
-    if let Some(result) = gpu.flush() {
-        let ts = next_batch_ts.unwrap_or_else(|| initial_batch_timestamp(GPU_BATCH_SIZE));
-        broadcast_batch(&batch_txs, result.to_vec(), None, GPU_BATCH_SIZE, &ts);
-    }
+    forward_gpu_batch(
+        &batch_txs,
+        &mut pending_batch,
+        gpu.flush(),
+        None,
+        GPU_BATCH_SIZE,
+    );
 
     drop(batch_txs);
     for h in worker_handles {
