@@ -585,6 +585,20 @@ The `server.key` contains both public and secret keys (keep it on the sensor
 and dashboard hosts). The `server.key.pub` contains only the public key and
 is safe to distribute.
 
+### ZMQ packet capture
+
+Both collectors keep JSON topics (`gatt:`, `scan:`, `smp:` and future
+colon-terminated topic names) out of packet captures. Those topic names
+are reserved and cannot also be sensor IDs. Packet records with invalid
+lengths or type prefixes are discarded. Supported layouts are a record
+alone, sensor ID plus record, legacy GPS plus record, or sensor ID plus GPS
+plus record. In ambiguous two-frame messages, printable UTF-8 identifies a
+sensor ID, including a 24-byte ID; binary GPS is validated separately.
+
+Dashboard captures use PPI with per-record Bluetooth link types. Subscriber
+captures without `--gps` retain the legacy DLT-256 format, suitable only for
+BLE; use `--gps` for mixed BLE/Classic PPI records and received coordinates.
+
 ### GPS tagging
 
 Requires a gpsd instance running with a USB GPS receiver:
@@ -593,8 +607,10 @@ Requires a gpsd instance running with a USB GPS receiver:
     blue-dragon -l -c 2441 -C 40 --gpsd --zmq tcp://collector:5555
 
 GPS coordinates are embedded in the PCAP using PPI (Per-Packet Information)
-headers, compatible with Wireshark and Kismet. The dashboard `--gps` flag
-enables a live map display.
+headers, compatible with Wireshark and Kismet. Dashboard captures preserve
+valid received coordinates regardless of `--gps`; that option controls GPS
+columns and the live map. Subscriber `--gps` includes coordinates in its
+PPI capture records.
 
 No `libgps-dev` is needed -- Blue Dragon connects directly to gpsd via
 TCP JSON protocol on port 2947.

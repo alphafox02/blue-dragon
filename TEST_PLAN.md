@@ -35,6 +35,16 @@
 - [ ] PCAP with GPS: `--gpsd`, verify GPS coordinates in PPI headers
 - [ ] PCAP error logging: fill disk, verify error message on stderr
 
+### ZMQ Capture Validation
+
+- [ ] Mocked subscriber/dashboard loops skip JSON topics and malformed records,
+      then accept a valid packet; exercise normal and GPS capture modes.
+- [ ] BLE and Classic captures preserve timestamps, payloads, record lengths
+      and all multipart layouts, including 24-byte sensor IDs.
+- [ ] Inspect synthetic mixed `--gps` captures with tshark for inner DLT 256/255,
+      Bluetooth protocols and GPS coordinates; compare both consumers.
+- [ ] Live ZMQ transport and sensor capture qualification.
+
 ### Wireshark Extcap
 - [ ] `blue-dragon --extcap-interfaces` lists available SDRs
 - [ ] Live capture in Wireshark via extcap
