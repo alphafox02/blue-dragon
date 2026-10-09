@@ -43,6 +43,8 @@
       and all multipart layouts, including 24-byte sensor IDs.
 - [ ] Inspect synthetic mixed `--gps` captures with tshark for inner DLT 256/255,
       Bluetooth protocols and GPS coordinates; compare both consumers.
+- [ ] Default subscriber captures use PPI with per-record DLT 256/255 and
+      no GPS fields; `--gps` adds coordinates without changing inner packets.
 - [ ] Live ZMQ transport and sensor capture qualification.
 
 ### Wireshark Extcap

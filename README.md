@@ -508,8 +508,10 @@ With ESP32-S3 receivers, a Classic packet reported at a channel that may be a
 
 ### PCAP PHY Encoding
 
-PCAP output uses LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR (DLT 256).
-PHY type is encoded in the RF header flags (bits 14-15):
+PCAP files use PPI (DLT 192) with an inner link type per packet:
+DLT 256 (`LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`) for BLE and DLT 255
+(`LINKTYPE_BLUETOOTH_BREDR_BB`) for Classic. BLE PHY type is encoded
+in the RF header flags (bits 14-15):
 
 | Bits 14-15 | PHY | Wireshark Display |
 |-----------|-----|-------------------|
@@ -587,6 +589,17 @@ is safe to distribute.
 
 ### ZMQ packet capture
 
+The subscriber and dashboard write mixed BLE/Classic PPI captures:
+
+    python3 tools/zmq_subscriber.py 'tcp://*:5555' -w capture.pcap
+    python3 tools/zmq_subscriber.py 'tcp://*:5555' -w capture-gps.pcap --gps
+
+The subscriber now defaults to PPI/DLT 192, matching the sensor, dashboard
+and extcap output. Its previous DLT-256 default mislabeled Classic records.
+Tools reading subscriber files must inspect each PPI record's inner DLT
+(255 or 256). Record timestamps and inner packet bytes are preserved; file
+bytes change because of the PPI headers. The ZMQ packet stream is unchanged.
+
 Both collectors keep JSON topics (`gatt:`, `scan:`, `smp:` and future
 colon-terminated topic names) out of packet captures. Those topic names
 are reserved and cannot also be sensor IDs. Packet records with invalid
@@ -594,10 +607,6 @@ lengths or type prefixes are discarded. Supported layouts are a record
 alone, sensor ID plus record, legacy GPS plus record, or sensor ID plus GPS
 plus record. In ambiguous two-frame messages, printable UTF-8 identifies a
 sensor ID, including a 24-byte ID; binary GPS is validated separately.
-
-Dashboard captures use PPI with per-record Bluetooth link types. Subscriber
-captures without `--gps` retain the legacy DLT-256 format, suitable only for
-BLE; use `--gps` for mixed BLE/Classic PPI records and received coordinates.
 
 ### GPS tagging
 
@@ -608,9 +617,10 @@ Requires a gpsd instance running with a USB GPS receiver:
 
 GPS coordinates are embedded in the PCAP using PPI (Per-Packet Information)
 headers, compatible with Wireshark and Kismet. Dashboard captures preserve
-valid received coordinates regardless of `--gps`; that option controls GPS
-columns and the live map. Subscriber `--gps` includes coordinates in its
-PPI capture records.
+valid received GPS coordinates regardless of its `--gps` display flag; that
+flag enables GPS columns and a live map. Subscriber `--gps` includes received
+coordinates in its capture; without it, PPI still identifies the inner link
+type but omits GPS fields.
 
 No `libgps-dev` is needed -- Blue Dragon connects directly to gpsd via
 TCP JSON protocol on port 2947.
@@ -1008,7 +1018,7 @@ Protocol Decoder
     |-- Classic BT BR/EDR: Barker code, FEC/HEC, DPSK sync, payload CRC
     v
 Output
-    |-- PCAP file (DLT 256 with PPI wrapping, PHY flags)
+    |-- PCAP file (PPI DLT 192, inner DLT 256 BLE / 255 Classic)
     |-- ZMQ PUB (multipart: sensor_id + GPS + PCAP record)
     |-- C2 heartbeat (JSON over ZMQ DEALER)
     |-- HCI GATT prober (opt-in, via system hci0 adapter)

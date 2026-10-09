@@ -228,13 +228,12 @@ class CaptureLoopTests(unittest.TestCase):
             frames = [[SENSOR_24, GPS_FRAME, message]]
             subscriber_data, _ = capture_subscriber(frames, gps=gps)
             dashboard_data, _ = capture_dashboard(frames, gps=gps)
-            for data, expected_ppi in ((subscriber_data, 36 if gps else 0),
+            for data, expected_ppi in ((subscriber_data, 36 if gps else 8),
                                        (dashboard_data, 36)):
                 header, wrapped = records(data)[0]
                 self.assertEqual(header[:2], (1000, 1234))
-                if expected_ppi:
-                    self.assertEqual(subscriber.PPI_HDR.unpack_from(wrapped),
-                                     (0, 0, expected_ppi, 255))
+                self.assertEqual(subscriber.PPI_HDR.unpack_from(wrapped),
+                                 (0, 0, expected_ppi, 255))
                 self.assertEqual(wrapped[expected_ppi:], payload)
                 self.assertEqual(header[3], header[2])
                 self.assertGreater(header[2], 300)
@@ -264,13 +263,17 @@ class CaptureLoopTests(unittest.TestCase):
             if index >= 2:
                 self.assertEqual(payload[:ppi[2]], subscriber.build_ppi_gps_header(*GPS, dlt=dlt))
 
-    def test_default_subscriber_encapsulation_is_unchanged(self):
-        messages = [[SENSOR_24, GPS_FRAME, ble_message()], [CLASSIC_MESSAGE]]
+    def test_default_subscriber_uses_ppi_without_gps_fields(self):
+        messages = [[SENSOR_24, ble_message()], [CLASSIC_MESSAGE]]
         data, summary = capture_subscriber(messages)
+        other, _ = capture_dashboard(messages)
         self.assertIn("2 packets in", summary)
-        self.assertEqual(subscriber.PCAP_GLOBAL_HDR.unpack_from(data)[6], 256)
-        self.assertEqual(data[24:], ble_message()[1:] + CLASSIC_MESSAGE[1:])
-        # The separate PPI-default change corrects default Classic labeling.
+        self.assertEqual(data, other)
+        self.assertEqual(subscriber.PCAP_GLOBAL_HDR.unpack_from(data)[6], 192)
+        for (header, payload), dlt, message in zip(
+                records(data), (256, 255), (ble_message(), CLASSIC_MESSAGE)):
+            self.assertEqual(subscriber.PPI_HDR.unpack_from(payload), (0, 0, 8, dlt))
+            self.assertEqual(payload[8:], message[17:])
 
     def test_dashboard_preserves_received_gps_without_display_flag(self):
         captures = []

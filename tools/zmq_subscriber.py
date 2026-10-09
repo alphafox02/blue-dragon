@@ -12,7 +12,7 @@ Usage:
     # Display live packets (sensors connect to us on port 5555):
     python3 zmq_subscriber.py tcp://*:5555
 
-    # Write to PCAP file:
+    # Write mixed BLE/Classic PCAP (PPI, DLT 192):
     python3 zmq_subscriber.py tcp://*:5555 -w output.pcap
 
     # Quiet mode (only write PCAP, no terminal output):
@@ -21,7 +21,7 @@ Usage:
     # Encrypted connection (CURVE):
     python3 zmq_subscriber.py tcp://*:5555 --server-key server.key
 
-    # Write PCAP with GPS tagging (PPI headers, DLT 192):
+    # Include received GPS metadata in the PPI capture:
     python3 zmq_subscriber.py tcp://*:5555 -w output.pcap --gps
 
 Requirements:
@@ -161,16 +161,15 @@ def parse_ble_packet(data):
     }
 
 
-def write_pcap_header(f, use_ppi=False):
-    """Write PCAP global header."""
-    dlt = DLT_PPI if use_ppi else DLT_BLUETOOTH_LE_LL_WITH_PHDR
+def write_pcap_header(f):
+    """Write the mixed Bluetooth PPI capture header."""
     f.write(PCAP_GLOBAL_HDR.pack(
         0xA1B2C3D4,  # magic
         2, 4,         # version
         0,            # timezone
         0,            # sigfigs
         PCAP_SNAPLEN,
-        dlt,
+        DLT_PPI,
     ))
     f.flush()
 
@@ -295,7 +294,7 @@ def main():
     parser.add_argument("--server-key", metavar="FILE",
                         help="Server public key file for CURVE encryption")
     parser.add_argument("--gps", action="store_true",
-                        help="Write PCAP with PPI GPS headers (DLT 192)")
+                        help="Include received GPS metadata in PPI capture records")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -323,9 +322,9 @@ def main():
     pcap_file = None
     if args.write:
         pcap_file = open(args.write, "wb")
-        write_pcap_header(pcap_file, use_ppi=args.gps)
+        write_pcap_header(pcap_file)
         if not args.quiet:
-            dlt_name = "DLT 192 (PPI+GPS)" if args.gps else "DLT 256 (BLE)"
+            dlt_name = "DLT 192 (PPI, mixed BLE/Classic)"
             print(f"Writing PCAP to {args.write} ({dlt_name})", file=sys.stderr)
 
     pkt_count = 0
@@ -363,13 +362,9 @@ def main():
 
         # Write to PCAP file
         if pcap_file:
-            if args.gps:
-                write_ppi_pcap_record(
-                    pcap_file, pcap_data, gps_info,
-                    DLT_BLUETOOTH_BREDR_BB if pkt_type else DLT_BLUETOOTH_LE_LL_WITH_PHDR)
-            else:
-                pcap_file.write(pcap_data)
-                pcap_file.flush()
+            write_ppi_pcap_record(
+                pcap_file, pcap_data, gps_info if args.gps else None,
+                DLT_BLUETOOTH_BREDR_BB if pkt_type else DLT_BLUETOOTH_LE_LL_WITH_PHDR)
 
         if pkt_type == 1:
             pkt_count += 1
