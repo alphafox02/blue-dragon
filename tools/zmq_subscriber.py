@@ -42,6 +42,7 @@ except ImportError:
 
 # PCAP structures (matching pcap.c)
 PCAP_GLOBAL_HDR = struct.Struct("<IHHiIII")
+PCAP_SNAPLEN = 65535
 PCAP_REC_HDR = struct.Struct("<IIII")      # ts_sec, ts_usec, incl_len, orig_len
 BLE_RF_HDR = struct.Struct("<bbbBIH")      # rf_channel, signal_power, noise_power,
                                             # aa_offenses, ref_aa, flags
@@ -161,15 +162,12 @@ def parse_ble_packet(data):
 def write_pcap_header(f, use_ppi=False):
     """Write PCAP global header."""
     dlt = DLT_PPI if use_ppi else DLT_BLUETOOTH_LE_LL_WITH_PHDR
-    snaplen = 4 + 2 + 255 + 3
-    if use_ppi:
-        snaplen += PPI_GPS_SIZE
     f.write(PCAP_GLOBAL_HDR.pack(
         0xA1B2C3D4,  # magic
         2, 4,         # version
         0,            # timezone
         0,            # sigfigs
-        snaplen,
+        PCAP_SNAPLEN,
         dlt,
     ))
     f.flush()

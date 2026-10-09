@@ -523,6 +523,10 @@ recognizes all three PHY types natively.
 
 ## Output and integrations
 
+PCAP files written by the sensor and both collectors declare a 65,535-byte
+snapshot length, so larger Classic records fit without reader truncation.
+This header limit does not change the selected link type or encapsulation.
+
 ### Wireshark
 
 Install as a Wireshark extcap plugin:

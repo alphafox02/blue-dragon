@@ -29,6 +29,7 @@
   - BLE + BT packets decoded, 86% CRC from ci16 file
 
 ### PCAP Output
+- [ ] Inspect sensor and collector file headers for a 65,535-byte snaplen.
 - [x] Write PCAP: `-w output.pcap`, open in Wireshark
   - Packets from file and live capture. tshark decodes BLE + BT correctly
 - [ ] PCAP with GPS: `--gpsd`, verify GPS coordinates in PPI headers

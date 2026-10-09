@@ -431,6 +431,7 @@ def _resolve_rpa(mac_str):
 # BLE / PCAP structures (matching pcap.c / zmq_subscriber.py)
 # ---------------------------------------------------------------------------
 PCAP_GLOBAL_HDR = struct.Struct("<IHHiIII")
+PCAP_SNAPLEN = 65535
 PCAP_REC_HDR = struct.Struct("<IIII")
 BLE_RF_HDR = struct.Struct("<bbbBIH")
 ZMQ_GPS_FRAME = struct.Struct("<ddd")
@@ -4206,8 +4207,7 @@ def main():
     if args.write:
         pcap_file = open(args.write, "wb")
         # Always PPI (DLT 192) to support mixed BLE + Classic BT per-packet DLT
-        snaplen = PPI_GPS_SIZE + 4 + 2 + 255 + 3
-        pcap_file.write(PCAP_GLOBAL_HDR.pack(0xA1B2C3D4, 2, 4, 0, 0, snaplen, DLT_PPI))
+        pcap_file.write(PCAP_GLOBAL_HDR.pack(0xA1B2C3D4, 2, 4, 0, 0, PCAP_SNAPLEN, DLT_PPI))
         pcap_file.flush()
 
     # Start ZMQ receiver thread (always binds, sensors connect to us)
