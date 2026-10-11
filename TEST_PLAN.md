@@ -25,8 +25,35 @@
 - [ ] RFNM RX
 - [ ] SoapySDR RX
 - [ ] VITA 49 UDP input: `blue-dragon -l -i vita49 -C 40 -c 2441 --stats`
+  - RF-fed and cross-host VITA 49 input remain untested; synthetic loopback checks are listed separately.
 - [x] File input: `blue-dragon -f recording.ci16 --sample-rate 40M -c 2441 --format ci16 --stats --check-crc`
   - BLE + BT packets decoded, 86% CRC from ci16 file
+
+### GPU batch metadata
+- [x] GPU startup/shutdown smoke:
+  ```sh
+  env -u BD_EDR_WIDEBAND blue-dragon -l \
+    -i vita49:127.0.0.1:PORT -C 16 -c 2441 --stats --check-crc
+  ```
+  - Unmodified GPU debug build (`--no-default-features --features gpu`), Apple M1,
+    loopback VITA 49 (synthetic): GPU initialized, no panic, clean SIGINT exit only.
+    All `BD_*` variables were absent from the test environment.
+  - The synthetic sender is not in the repository; the macOS build used a local
+    `CL/opencl.h` shim for Apple's OpenCL framework.
+- [x] GPU metadata (temporary logging build):
+  ```sh
+  BD_EDR_WIDEBAND=1 blue-dragon -l \
+    -i vita49:127.0.0.1:PORT -C 16 -c 2441 --stats --check-crc
+  ```
+  - Temporary stderr-only logging: 15 assertions cover first timestamp anchor,
+    sample-based advancement, completed-batch IQ, partial final submission and flush;
+    five deliberate regressions detected.
+  - The setting carries raw IQ and enables burst-catcher EDR continuation; GPU EDR
+    decoding remains disabled. Metadata assertions were not run with the setting unset.
+  - The logging changes and synthetic VITA 49 sender are not in the repository.
+    macOS builds used a local `CL/opencl.h` shim for Apple's OpenCL framework.
+- [ ] Live SDR / cross-host VITA 49 GPU capture: RF timestamp accuracy, partial-only
+  streams, throughput and latency. Linux OpenCL runtime and GPU EDR decoding remain unqualified.
 
 ### PCAP Output
 - [x] Write PCAP: `-w output.pcap`, open in Wireshark
