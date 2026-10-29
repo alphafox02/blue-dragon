@@ -3565,8 +3565,11 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     let mut batch_steps: usize = 0;
     let mut next_batch_ts: Option<Timespec> = None;
     let samples_per_step = (num_channels / 2).max(1) as u64;
+    // Samples left over when a buffer is not a whole number of PFB steps;
+    // they start the next buffer so the stream stays continuous.
+    let mut carry: Vec<i16> = Vec::new();
 
-    for (i16_buf, gap) in sdr_rx.iter() {
+    for (recv_buf, gap) in sdr_rx.iter() {
         // Samples lost before this buffer: move the clock past them. The gap
         // lands on the next batch boundary, at most one batch (about 2 ms)
         // from where it happened.
@@ -3574,11 +3577,20 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
             if let Some(ts) = next_batch_ts.as_mut() {
                 *ts = channel_samples_after(ts, (gap / samples_per_step) as usize);
             }
+            carry.clear();
         }
+        let i16_buf = if carry.is_empty() {
+            recv_buf
+        } else {
+            let mut joined = std::mem::take(&mut carry);
+            joined.extend_from_slice(&recv_buf);
+            joined
+        };
         let n = i16_buf.len();
 
         let step = num_channels;
         let num_blocks = n / step;
+        carry.extend_from_slice(&i16_buf[num_blocks * step..]);
 
         for block in 0..num_blocks {
             let offset = block * step;
