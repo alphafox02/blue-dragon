@@ -612,13 +612,14 @@ pub fn run_burst_file(
         .read_burst()
         .map_err(|e| format!("failed to read {}: {}", path.display(), e))?
     {
+        let demod = demodulate_burst(&burst, &mut fsk);
         process_burst(
             &burst,
+            demod,
             None,
             0,
             1,
             &[],
-            &mut fsk,
             &aa_correlator,
             &aa_correlator_2m,
             &syndrome_map,
@@ -1272,11 +1273,11 @@ fn try_enrich_edr(
 #[allow(clippy::too_many_arguments)]
 fn process_burst(
     burst: &bd_dsp::burst::Burst,
+    demod: BurstDemod,
     wideband: Option<&[Complex32]>,
     center_freq_mhz: u32,
     raw_sample_rate: u32,
     classic_alias_channels: &[u32],
-    fsk: &mut FskDemod,
     aa_correlator: &AaCorrelator,
     aa_correlator_2m: &AaCorrelator,
     syndrome_map: &SyndromeMap,
@@ -1291,7 +1292,9 @@ fn process_burst(
 ) {
     // Scan bursts: coded PHY search only (no BT/BLE 1M/2M)
     if burst.scan {
-        let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
+        let BurstDemod::Raw(Some(raw_demod)) = demod else {
+            return;
+        };
         stats.coded_attempts += 1;
         if let Some(mut p) = ble::ble_coded_burst_search(
             &raw_demod,
@@ -1330,19 +1333,14 @@ fn process_burst(
         5000..=49999 => stats.burst_5k_50k += 1,
         _ => stats.burst_50k_plus += 1,
     }
-    if blen < 132 {
-        return;
-    }
-
-    let normal_samples = &burst.samples[burst.edr_lead_samples.min(burst.samples.len())..];
-    let fsk_result = match fsk.demodulate(normal_samples) {
-        Some(r) => r,
-        None => {
+    let fsk_result = match demod {
+        BurstDemod::Skip => return,
+        BurstDemod::Fsk(r) => r,
+        BurstDemod::Raw(raw_demod) => {
             // FSK demod failed. Try raw FM + coded for any burst >= 1500 samples
             // (coded S=2 min ~2000 samples, S=8 min ~4000 samples).
-            if blen >= 1500 {
+            if let Some(raw_demod) = raw_demod {
                 stats.fsk_reject_long += 1;
-                let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
                 stats.coded_attempts += 1;
                 let search_depth = 0; // 0 = search full burst (coarse stride handles perf)
                 if let Some(mut p) = ble::ble_coded_burst_search(
@@ -1746,7 +1744,38 @@ struct BatchMsg {
 
 struct BurstMsg {
     burst: bd_dsp::burst::Burst,
+    demod: BurstDemod,
     wideband: Option<Vec<Complex32>>,
+}
+
+/// FM demodulation of a burst. It needs no shared state and is the costly
+/// part of decoding, so live capture runs it on the burst workers and leaves
+/// only the stateful decode (Classic UAP tracking, BLE connections, output)
+/// to the single decode thread.
+enum BurstDemod {
+    /// Too short to decode.
+    Skip,
+    /// Full FSK demodulation.
+    Fsk(FskResult),
+    /// Raw discriminator output for the LE Coded search: scan bursts, and
+    /// bursts long enough to be coded whose FSK demodulation failed.
+    Raw(Option<Vec<f32>>),
+}
+
+fn demodulate_burst(burst: &bd_dsp::burst::Burst, fsk: &mut FskDemod) -> BurstDemod {
+    let blen = burst.samples.len();
+    if burst.scan {
+        return BurstDemod::Raw(Some(fsk.fm_discriminate_raw(&burst.samples)));
+    }
+    if blen < 132 {
+        return BurstDemod::Skip;
+    }
+    let normal_samples = &burst.samples[burst.edr_lead_samples.min(blen)..];
+    match fsk.demodulate(normal_samples) {
+        Some(r) => BurstDemod::Fsk(r),
+        None if blen >= 1500 => BurstDemod::Raw(Some(fsk.fm_discriminate_raw(&burst.samples))),
+        None => BurstDemod::Raw(None),
+    }
 }
 
 struct RawBatch {
@@ -2023,6 +2052,7 @@ fn spawn_parallel_pipeline(
             .collect();
 
         let burst_tx = burst_tx.clone();
+        let mut fsk = fsk.clone();
         let num_ch = num_channels;
         let scale = fft_scale;
         let sq_pending = squelch_pending.clone();
@@ -2080,13 +2110,16 @@ fn spawn_parallel_pipeline(
                                 } else {
                                     None
                                 };
-                                let _ = burst_tx.send(BurstMsg { burst, wideband });
+                                let demod = demodulate_burst(&burst, &mut fsk);
+                                let _ = burst_tx.send(BurstMsg { burst, demod, wideband });
                             }
                         }
                         // Emit scan bursts for advertising channels
                         if let Some(scan_burst) = catcher.take_scan_burst() {
+                            let demod = demodulate_burst(&scan_burst, &mut fsk);
                             let _ = burst_tx.send(BurstMsg {
                                 burst: scan_burst,
+                                demod,
                                 wideband: None,
                             });
                         }
@@ -2142,7 +2175,7 @@ fn spawn_parallel_pipeline(
             let lost_s = rx_lost_proc.load(Ordering::Relaxed) as f64 / raw_sample_rate as f64;
             if elapsed > 0.0 { (100.0 * lost_s / elapsed).min(100.0) } else { 0.0 }
         };
-        let mut fsk = fsk;
+        drop(fsk);
         let aa_correlator = aa_correlator;
         let aa_correlator_2m = aa_correlator_2m;
         let syndrome_map = syndrome_map;
@@ -2189,6 +2222,7 @@ fn spawn_parallel_pipeline(
                 let mut wideband_shed: u64 = 0;
                 while let Ok(burst_msg) = burst_rx.recv() {
                     let burst = burst_msg.burst;
+                    let demod = burst_msg.demod;
                     record_burst(&mut burst_writer, &burst);
                     #[cfg(feature = "gps")]
                     let gps_fix = gps_client.as_ref().map(|c| c.get_fix());
@@ -2207,11 +2241,11 @@ fn spawn_parallel_pipeline(
 
                     process_burst(
                         &burst,
+                        demod,
                         wideband,
                         center_freq_mhz,
                         raw_sample_rate,
                         &classic_alias_channels,
-                        &mut fsk,
                         &aa_correlator,
                         &aa_correlator_2m,
                         &syndrome_map,
