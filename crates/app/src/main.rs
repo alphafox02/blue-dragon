@@ -2,6 +2,7 @@
 
 mod burst_file;
 mod pipeline;
+mod rx_clock;
 
 use clap::Parser;
 use std::path::PathBuf;

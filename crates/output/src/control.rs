@@ -80,6 +80,8 @@ pub struct HeartbeatState {
     pub total_pkts: u64,
     pub pkt_rate: f64,
     pub crc_pct: f64,
+    /// Share of run time whose samples never reached the channelizer.
+    pub rx_lost_pct: f64,
     pub gps: Option<(f64, f64, f64)>, // lat, lon, alt
 }
 
@@ -97,6 +99,7 @@ impl HeartbeatState {
             total_pkts: 0,
             pkt_rate: 0.0,
             crc_pct: 0.0,
+            rx_lost_pct: 0.0,
             gps: None,
         }
     }
@@ -217,6 +220,7 @@ impl ControlClient {
             "total_pkts": state.total_pkts as f64,
             "pkt_rate": (state.pkt_rate * 10.0).round() / 10.0,
             "crc_pct": (state.crc_pct * 10.0).round() / 10.0,
+            "rx_lost_pct": (state.rx_lost_pct * 10.0).round() / 10.0,
             "uptime": uptime,
         });
 

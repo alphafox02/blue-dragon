@@ -26,6 +26,7 @@ use bd_sdr::file::{FileSource, SampleFormat};
 use bd_sdr::SdrSource;
 
 use crate::burst_file::{FileBurstReader, FileBurstWriter};
+use crate::rx_clock::RxClock;
 
 fn open_burst_writer(
     path: Option<&Path>,
@@ -611,13 +612,14 @@ pub fn run_burst_file(
         .read_burst()
         .map_err(|e| format!("failed to read {}: {}", path.display(), e))?
     {
+        let demod = demodulate_burst(&burst, &mut fsk);
         process_burst(
             &burst,
+            demod,
             None,
             0,
             1,
             &[],
-            &mut fsk,
             &aa_correlator,
             &aa_correlator_2m,
             &syndrome_map,
@@ -1271,11 +1273,11 @@ fn try_enrich_edr(
 #[allow(clippy::too_many_arguments)]
 fn process_burst(
     burst: &bd_dsp::burst::Burst,
+    demod: BurstDemod,
     wideband: Option<&[Complex32]>,
     center_freq_mhz: u32,
     raw_sample_rate: u32,
     classic_alias_channels: &[u32],
-    fsk: &mut FskDemod,
     aa_correlator: &AaCorrelator,
     aa_correlator_2m: &AaCorrelator,
     syndrome_map: &SyndromeMap,
@@ -1290,7 +1292,9 @@ fn process_burst(
 ) {
     // Scan bursts: coded PHY search only (no BT/BLE 1M/2M)
     if burst.scan {
-        let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
+        let BurstDemod::Raw(Some(raw_demod)) = demod else {
+            return;
+        };
         stats.coded_attempts += 1;
         if let Some(mut p) = ble::ble_coded_burst_search(
             &raw_demod,
@@ -1329,19 +1333,14 @@ fn process_burst(
         5000..=49999 => stats.burst_5k_50k += 1,
         _ => stats.burst_50k_plus += 1,
     }
-    if blen < 132 {
-        return;
-    }
-
-    let normal_samples = &burst.samples[burst.edr_lead_samples.min(burst.samples.len())..];
-    let fsk_result = match fsk.demodulate(normal_samples) {
-        Some(r) => r,
-        None => {
+    let fsk_result = match demod {
+        BurstDemod::Skip => return,
+        BurstDemod::Fsk(r) => r,
+        BurstDemod::Raw(raw_demod) => {
             // FSK demod failed. Try raw FM + coded for any burst >= 1500 samples
             // (coded S=2 min ~2000 samples, S=8 min ~4000 samples).
-            if blen >= 1500 {
+            if let Some(raw_demod) = raw_demod {
                 stats.fsk_reject_long += 1;
-                let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
                 stats.coded_attempts += 1;
                 let search_depth = 0; // 0 = search full burst (coarse stride handles perf)
                 if let Some(mut p) = ble::ble_coded_burst_search(
@@ -1745,7 +1744,38 @@ struct BatchMsg {
 
 struct BurstMsg {
     burst: bd_dsp::burst::Burst,
+    demod: BurstDemod,
     wideband: Option<Vec<Complex32>>,
+}
+
+/// FM demodulation of a burst. It needs no shared state and is the costly
+/// part of decoding, so live capture runs it on the burst workers and leaves
+/// only the stateful decode (Classic UAP tracking, BLE connections, output)
+/// to the single decode thread.
+enum BurstDemod {
+    /// Too short to decode.
+    Skip,
+    /// Full FSK demodulation.
+    Fsk(FskResult),
+    /// Raw discriminator output for the LE Coded search: scan bursts, and
+    /// bursts long enough to be coded whose FSK demodulation failed.
+    Raw(Option<Vec<f32>>),
+}
+
+fn demodulate_burst(burst: &bd_dsp::burst::Burst, fsk: &mut FskDemod) -> BurstDemod {
+    let blen = burst.samples.len();
+    if burst.scan {
+        return BurstDemod::Raw(Some(fsk.fm_discriminate_raw(&burst.samples)));
+    }
+    if blen < 132 {
+        return BurstDemod::Skip;
+    }
+    let normal_samples = &burst.samples[burst.edr_lead_samples.min(blen)..];
+    match fsk.demodulate(normal_samples) {
+        Some(r) => BurstDemod::Fsk(r),
+        None if blen >= 1500 => BurstDemod::Raw(Some(fsk.fm_discriminate_raw(&burst.samples))),
+        None => BurstDemod::Raw(None),
+    }
 }
 
 struct RawBatch {
@@ -1967,6 +1997,7 @@ fn spawn_parallel_pipeline(
     check_crc: bool,
     print_stats: bool,
     overflow_count: Arc<std::sync::atomic::AtomicU64>,
+    rx_lost: Arc<std::sync::atomic::AtomicU64>,
     squelch_pending: Arc<AtomicI32>,
     #[cfg(feature = "zmq")] zmq_config: Option<(String, Option<String>, Option<String>)>,
     #[cfg(feature = "zmq")] hb_state: Option<Arc<Mutex<bd_output::control::HeartbeatState>>>,
@@ -2021,6 +2052,7 @@ fn spawn_parallel_pipeline(
             .collect();
 
         let burst_tx = burst_tx.clone();
+        let mut fsk = fsk.clone();
         let num_ch = num_channels;
         let scale = fft_scale;
         let sq_pending = squelch_pending.clone();
@@ -2078,13 +2110,16 @@ fn spawn_parallel_pipeline(
                                 } else {
                                     None
                                 };
-                                let _ = burst_tx.send(BurstMsg { burst, wideband });
+                                let demod = demodulate_burst(&burst, &mut fsk);
+                                let _ = burst_tx.send(BurstMsg { burst, demod, wideband });
                             }
                         }
                         // Emit scan bursts for advertising channels
                         if let Some(scan_burst) = catcher.take_scan_burst() {
+                            let demod = demodulate_burst(&scan_burst, &mut fsk);
                             let _ = burst_tx.send(BurstMsg {
                                 burst: scan_burst,
+                                demod,
                                 wideband: None,
                             });
                         }
@@ -2134,7 +2169,13 @@ fn spawn_parallel_pipeline(
     // Decode thread: FSK demod + BLE/BT protocol decode + output
     let decode_handle = {
         let overflow_proc = overflow_count;
-        let mut fsk = fsk;
+        let rx_lost_proc = rx_lost;
+        // Share of real time whose samples never reached the channelizer.
+        let lost_pct = move |elapsed: f64| -> f64 {
+            let lost_s = rx_lost_proc.load(Ordering::Relaxed) as f64 / raw_sample_rate as f64;
+            if elapsed > 0.0 { (100.0 * lost_s / elapsed).min(100.0) } else { 0.0 }
+        };
+        drop(fsk);
         let aa_correlator = aa_correlator;
         let aa_correlator_2m = aa_correlator_2m;
         let syndrome_map = syndrome_map;
@@ -2181,6 +2222,7 @@ fn spawn_parallel_pipeline(
                 let mut wideband_shed: u64 = 0;
                 while let Ok(burst_msg) = burst_rx.recv() {
                     let burst = burst_msg.burst;
+                    let demod = burst_msg.demod;
                     record_burst(&mut burst_writer, &burst);
                     #[cfg(feature = "gps")]
                     let gps_fix = gps_client.as_ref().map(|c| c.get_fix());
@@ -2199,11 +2241,11 @@ fn spawn_parallel_pipeline(
 
                     process_burst(
                         &burst,
+                        demod,
                         wideband,
                         center_freq_mhz,
                         raw_sample_rate,
                         &classic_alias_channels,
-                        &mut fsk,
                         &aa_correlator,
                         &aa_correlator_2m,
                         &syndrome_map,
@@ -2227,6 +2269,7 @@ fn spawn_parallel_pipeline(
                                 s.total_pkts = stats.total_ble + stats.total_bt;
                                 s.pkt_rate = (stats.total_ble + stats.total_bt) as f64 / elapsed;
                                 s.crc_pct = stats.crc_pct();
+                                s.rx_lost_pct = lost_pct(elapsed);
                             }
                         }
 
@@ -2244,7 +2287,7 @@ fn spawn_parallel_pipeline(
                             String::new()
                         };
                         eprint!(
-                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{} shed:{}\n",
+                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} lost: {:.1}% EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{} shed:{}\n",
                             elapsed,
                             stats.total_ble,
                             phy_str,
@@ -2255,6 +2298,7 @@ fn spawn_parallel_pipeline(
                             stats.total_crc,
                             conns,
                             overflows,
+                            lost_pct(elapsed),
                             stats.edr_attempts,
                             stats.edr_syncs,
                             stats.edr_crc_matches,
@@ -2304,7 +2348,7 @@ fn spawn_parallel_pipeline(
                         String::new()
                     };
                     eprintln!(
-                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} EDR: try={} sync={} crc={} best={:.3} shed={}{}{}",
+                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} lost: {:.1}% EDR: try={} sync={} crc={} best={:.3} shed={}{}{}",
                         elapsed,
                         stats.total_ble,
                         phy_str,
@@ -2314,6 +2358,7 @@ fn spawn_parallel_pipeline(
                         stats.valid_crc,
                         stats.total_crc,
                         overflows,
+                        lost_pct(elapsed),
                         stats.edr_attempts,
                         stats.edr_syncs,
                         stats.edr_crc_matches,
@@ -2625,6 +2670,19 @@ impl SdrHandle {
             #[cfg(feature = "espdr")]
             SdrHandle::Espdr(h) => h.overflow_count(),
             SdrHandle::Vita49(h) => h.overflow_count(),
+        }
+    }
+
+    /// True when samples arrive at the sample rate in real time, so a
+    /// shortfall against the wall clock means samples were lost. The ESP
+    /// backend builds its own timeline from the board's sample counter
+    /// (with noise between bursts, and faster than real time in snapshot
+    /// mode), so it keeps that clock instead.
+    fn real_time_stream(&self) -> bool {
+        match self {
+            #[cfg(feature = "espdr")]
+            SdrHandle::Espdr(_) => false,
+            _ => true,
         }
     }
 
@@ -3368,6 +3426,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     let max_samps = sdr.max_samps();
 
     let overflow_count = Arc::new(AtomicU64::new(0));
+    let rx_lost = Arc::new(AtomicU64::new(0));
 
     eprintln!("CPU: PFB+FFT (SIMD), max_recv={}", max_samps);
 
@@ -3393,6 +3452,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         check_crc,
         print_stats,
         overflow_count.clone(),
+        rx_lost.clone(),
         squelch_pending.clone(),
         #[cfg(feature = "zmq")]
         zmq_config,
@@ -3405,10 +3465,14 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     // SDR recv thread: continuously drains hardware, sends i16 buffers to PFB thread.
     // Accumulates multiple recv calls to ~4080 complex samples before sending,
     // compensating for smaller max_samps with SC16 wire format.
-    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(128);
+    // Each buffer carries the number of samples lost just before it.
+    let (sdr_tx, sdr_rx) = channel::bounded::<(Vec<i16>, u64)>(128);
     let sdr_overflow = overflow_count.clone();
+    let sdr_lost = rx_lost.clone();
     let sdr_running = running.clone();
     let sdr_buf_size = max_samps * 2; // i16 elements per recv
+    let sdr_rate = sample_rate;
+    let track_gaps = sdr.real_time_stream();
 
     let sdr_gain_pending = gain_pending.clone();
     let sdr_thread = std::thread::Builder::new()
@@ -3422,6 +3486,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
             let mut last_flag_log = Instant::now();
             let mut prev_flags: (u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0);
             let mut prev_sidekiq_drops: u64 = 0;
+            let mut rx_clock = RxClock::new(sdr_rate);
+            let mut pending_gap: u64 = 0;
 
             while sdr_running.load(Ordering::Relaxed) {
                 // Check for runtime gain change from C2
@@ -3436,6 +3502,10 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                     continue;
                 }
                 sdr_overflow.store(sdr.overflow_count(), Ordering::Relaxed);
+                if track_gaps {
+                    pending_gap += rx_clock.received(num_rx, Instant::now());
+                    sdr_lost.store(rx_clock.lost(), Ordering::Relaxed);
+                }
 
                 if last_flag_log.elapsed().as_secs() >= 5 {
                     if let Some(cur) = sdr.aaronia_flag_counts() {
@@ -3471,7 +3541,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                 send_pos += n;
 
                 if send_pos >= target_elems {
-                    if sdr_tx.send(send_buf[..send_pos].to_vec()).is_err() {
+                    let gap = std::mem::take(&mut pending_gap);
+                    if sdr_tx.send((send_buf[..send_pos].to_vec(), gap)).is_err() {
                         break;
                     }
                     send_pos = 0;
@@ -3493,12 +3564,33 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         .then(|| Vec::with_capacity(CPU_BATCH_STEPS * num_channels));
     let mut batch_steps: usize = 0;
     let mut next_batch_ts: Option<Timespec> = None;
+    let samples_per_step = (num_channels / 2).max(1) as u64;
+    // Samples left over when a buffer is not a whole number of PFB steps;
+    // they start the next buffer so the stream stays continuous.
+    let mut carry: Vec<i16> = Vec::new();
 
-    for i16_buf in sdr_rx.iter() {
+    for (recv_buf, gap) in sdr_rx.iter() {
+        // Samples lost before this buffer: move the clock past them. The gap
+        // lands on the next batch boundary, at most one batch (about 2 ms)
+        // from where it happened.
+        if gap > 0 {
+            if let Some(ts) = next_batch_ts.as_mut() {
+                *ts = channel_samples_after(ts, (gap / samples_per_step) as usize);
+            }
+            carry.clear();
+        }
+        let i16_buf = if carry.is_empty() {
+            recv_buf
+        } else {
+            let mut joined = std::mem::take(&mut carry);
+            joined.extend_from_slice(&recv_buf);
+            joined
+        };
         let n = i16_buf.len();
 
         let step = num_channels;
         let num_blocks = n / step;
+        carry.extend_from_slice(&i16_buf[num_blocks * step..]);
 
         for block in 0..num_blocks {
             let offset = block * step;
@@ -3600,6 +3692,7 @@ fn run_live_gpu_loop(
     );
 
     let overflow_count = Arc::new(AtomicU64::new(0));
+    let rx_lost = Arc::new(AtomicU64::new(0));
 
     // Spawn parallel burst workers + decode thread
     let (batch_txs, worker_handles, decode_handle) = spawn_parallel_pipeline(
@@ -3623,6 +3716,7 @@ fn run_live_gpu_loop(
         check_crc,
         print_stats,
         overflow_count.clone(),
+        rx_lost.clone(),
         squelch_pending,
         #[cfg(feature = "zmq")]
         zmq_config,
@@ -3634,10 +3728,14 @@ fn run_live_gpu_loop(
 
     // SDR recv thread: continuously drains hardware, prevents overflow during GPU submit.
     // Accumulates multiple recv calls to ~4080 complex samples before sending.
-    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(128);
+    // Each buffer carries the number of samples lost just before it.
+    let (sdr_tx, sdr_rx) = channel::bounded::<(Vec<i16>, u64)>(128);
     let sdr_overflow = overflow_count.clone();
+    let sdr_lost = rx_lost.clone();
     let sdr_running = running.clone();
     let sdr_buf_size = max_samps * 2;
+    let sdr_rate = num_channels as u32 * 1_000_000;
+    let track_gaps = sdr.real_time_stream();
 
     let sdr_gain_pending = gain_pending;
     let sdr_thread = std::thread::Builder::new()
@@ -3649,6 +3747,8 @@ fn run_live_gpu_loop(
             let mut recv_buf = vec![0i16; sdr_buf_size];
             let mut send_buf = vec![0i16; target_elems + sdr_buf_size];
             let mut send_pos: usize = 0;
+            let mut rx_clock = RxClock::new(sdr_rate);
+            let mut pending_gap: u64 = 0;
 
             while sdr_running.load(Ordering::Relaxed) {
                 // Check for runtime gain change from C2
@@ -3663,12 +3763,17 @@ fn run_live_gpu_loop(
                     continue;
                 }
                 sdr_overflow.store(sdr.overflow_count(), Ordering::Relaxed);
+                if track_gaps {
+                    pending_gap += rx_clock.received(num_rx, Instant::now());
+                    sdr_lost.store(rx_clock.lost(), Ordering::Relaxed);
+                }
                 let n = num_rx * 2;
                 send_buf[send_pos..send_pos + n].copy_from_slice(&recv_buf[..n]);
                 send_pos += n;
 
                 if send_pos >= target_elems {
-                    if sdr_tx.send(send_buf[..send_pos].to_vec()).is_err() {
+                    let gap = std::mem::take(&mut pending_gap);
+                    if sdr_tx.send((send_buf[..send_pos].to_vec(), gap)).is_err() {
                         break;
                     }
                     send_pos = 0;
@@ -3685,8 +3790,16 @@ fn run_live_gpu_loop(
     let mut pos: usize = 0;
     let mut raw_buf = gpu.raw_buffer();
     let mut next_batch_ts: Option<Timespec> = None;
+    let samples_per_step = (num_channels / 2).max(1) as u64;
 
-    for i16_buf in sdr_rx.iter() {
+    for (i16_buf, gap) in sdr_rx.iter() {
+        // Samples lost before this buffer: move the clock past them (see the
+        // CPU loop).
+        if gap > 0 {
+            if let Some(ts) = next_batch_ts.as_mut() {
+                *ts = channel_samples_after(ts, (gap / samples_per_step) as usize);
+            }
+        }
         // Copy i16 data into GPU raw buffer, handling partial fills
         let mut src_pos = 0usize;
         let n = i16_buf.len();

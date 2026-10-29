@@ -19,6 +19,7 @@ pub struct FskResult {
 }
 
 /// FSK demodulator: replaces liquid-dsp's freqdem
+#[derive(Clone)]
 pub struct FskDemod {
     prev_sample: Complex32,
     pos_points: Vec<f32>,

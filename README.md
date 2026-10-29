@@ -552,6 +552,13 @@ Blue Dragon streams packets over ZMQ to the bundled Python web dashboard.
 The dashboard device table includes a PHY column showing which BLE PHY
 was used by each device (1M, 2M, or Coded).
 
+For correlation with other sensors, `--packet-log FILE` appends one CSV
+row per packet: UTC time, sensor, protocol, address (BLE MAC, Classic LAP
+or UAP:LAP, or the inquiry code), access address, PDU, PHY, channel,
+RSSI, noise and CRC result. Times are the sensor's packet timestamps.
+
+    python3 tools/zmq_web_dashboard.py 'tcp://*:5555' --db ~/bluedragon.db --packet-log ~/packets.csv
+
 #### Sensor C2 (Command and Control)
 
 When connected via `--zmq`, a C2 control channel is automatically
@@ -1088,6 +1095,18 @@ quantization of its float samples instead of 8-bit.
 4. **Not using `--check-crc`.** Without this flag, CRC is never
    computed and shows `0/0`. This is not an error -- add `--check-crc`
    to enable validation.
+
+### `lost` above 0% in `--stats`
+
+`lost` is the share of run time whose samples never reached Blue Dragon:
+the SDR overran, or the host could not keep up. Blue Dragon measures it
+against the system clock, so it works for every SDR, and moves packet
+timestamps past each gap so they stay on real time. Anything heard
+during lost time is missed. A rising figure on a long run usually means
+the decode stage is falling behind: check per-thread CPU (`top -H`) and
+free memory, and reduce `-C` if the machine cannot keep up. The same
+figure is sent in the C2 heartbeat and shown as `lost %` in the
+dashboard's sensor table.
 
 ### ESP32-S3: "not running the eSpDR firmware"
 
