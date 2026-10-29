@@ -36,6 +36,7 @@ Requirements:
 """
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -522,6 +523,56 @@ BT_INQUIRY_LAP_LAST = 0x9E8B3F
 
 def is_inquiry_lap(lap):
     return BT_INQUIRY_LAP_FIRST <= lap <= BT_INQUIRY_LAP_LAST
+
+
+class PacketLog:
+    """One CSV row per packet received, with the sensor's timestamp."""
+
+    COLUMNS = ["time_utc", "epoch", "sensor", "protocol", "address",
+               "address_type", "access_address", "pdu", "phy", "rf_channel",
+               "freq_mhz", "rssi_dbm", "noise_dbm", "crc", "lat", "lon"]
+
+    def __init__(self, path):
+        new = not os.path.exists(path) or os.path.getsize(path) == 0
+        self.f = open(path, "a", newline="", buffering=1)
+        self.w = csv.writer(self.f)
+        if new:
+            self.w.writerow(self.COLUMNS)
+
+    def write(self, pkt, sensor_id, gps_info):
+        sec, usec = divmod(round(pkt["timestamp"] * 1e6), 1_000_000)
+        protocol = pkt.get("protocol", "BLE")
+        if protocol == "BT":
+            lap = pkt.get("lap", 0)
+            if is_inquiry_lap(lap):
+                address, addr_type = f"{lap:06x}", "inquiry"
+            elif pkt.get("uap_verified"):
+                address, addr_type = f"{pkt['uap']:02x}:{pkt['mac'][3:]}", "uap+lap"
+            else:
+                address, addr_type = pkt["mac"][3:], "lap"
+            aa = ""
+        else:
+            address = pkt.get("mac") or ""
+            addr_type = pkt.get("mac_type") or ""
+            aa = f"{pkt['aa']:08x}" if pkt.get("aa") is not None else ""
+        if not pkt["crc_checked"]:
+            crc = ""
+        else:
+            crc = "ok" if pkt["crc_valid"] else "bad"
+        lat, lon = (gps_info[0], gps_info[1]) if gps_info else ("", "")
+        self.w.writerow([
+            time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(sec)) + f".{usec:06d}Z",
+            f"{sec}.{usec:06d}", sensor_id or "", protocol, address, addr_type, aa,
+            pkt.get("pdu_type", ""), pkt.get("phy", ""), pkt.get("rf_channel", ""),
+            pkt.get("freq_mhz", ""), pkt.get("signal_power", ""),
+            pkt.get("noise_power", ""), crc, lat, lon,
+        ])
+
+    def close(self):
+        self.f.close()
+
+
+packet_log = None
 
 
 def parse_bt_packet(data):
@@ -2630,6 +2681,8 @@ def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
         pkt = parse_ble_packet(raw_pcap)
 
     if pkt:
+        if packet_log:
+            packet_log.write(pkt, sensor_id, gps_info)
         state.add_packet(pkt, gps_info, sensor_id)
 
 
@@ -4133,6 +4186,8 @@ def main():
                         help="SQLite database path (default: ~/.cache/blue-dragon/devices.db)")
     parser.add_argument("--no-db", action="store_true",
                         help="Disable SQLite device persistence")
+    parser.add_argument("--packet-log", metavar="FILE",
+                        help="Append one CSV row per packet (time, sensor, address, channel, RSSI, CRC)")
     # Device alerting
     parser.add_argument("--alert-file", metavar="FILE",
                         help="File of MAC/LAP/identity labels to watch (one per line)")
@@ -4207,6 +4262,10 @@ def main():
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
+    global packet_log
+    if args.packet_log:
+        packet_log = PacketLog(args.packet_log)
+
     pcap_file = None
     if args.write:
         pcap_file = open(args.write, "wb")
@@ -4278,6 +4337,8 @@ def main():
     if pcap_file:
         pcap_file.close()
         print(f"PCAP written to {args.write}", file=sys.stderr)
+    if packet_log:
+        packet_log.close()
 
     if state.db:
         state.db.close()

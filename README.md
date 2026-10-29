@@ -552,6 +552,13 @@ Blue Dragon streams packets over ZMQ to the bundled Python web dashboard.
 The dashboard device table includes a PHY column showing which BLE PHY
 was used by each device (1M, 2M, or Coded).
 
+For correlation with other sensors, `--packet-log FILE` appends one CSV
+row per packet: UTC time, sensor, protocol, address (BLE MAC, Classic LAP
+or UAP:LAP, or the inquiry code), access address, PDU, PHY, channel,
+RSSI, noise and CRC result. Times are the sensor's packet timestamps.
+
+    python3 tools/zmq_web_dashboard.py 'tcp://*:5555' --db ~/bluedragon.db --packet-log ~/packets.csv
+
 #### Sensor C2 (Command and Control)
 
 When connected via `--zmq`, a C2 control channel is automatically
