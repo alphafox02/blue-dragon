@@ -26,6 +26,7 @@ use bd_sdr::file::{FileSource, SampleFormat};
 use bd_sdr::SdrSource;
 
 use crate::burst_file::{FileBurstReader, FileBurstWriter};
+use crate::rx_clock::RxClock;
 
 fn open_burst_writer(
     path: Option<&Path>,
@@ -1967,6 +1968,7 @@ fn spawn_parallel_pipeline(
     check_crc: bool,
     print_stats: bool,
     overflow_count: Arc<std::sync::atomic::AtomicU64>,
+    rx_lost: Arc<std::sync::atomic::AtomicU64>,
     squelch_pending: Arc<AtomicI32>,
     #[cfg(feature = "zmq")] zmq_config: Option<(String, Option<String>, Option<String>)>,
     #[cfg(feature = "zmq")] hb_state: Option<Arc<Mutex<bd_output::control::HeartbeatState>>>,
@@ -2134,6 +2136,12 @@ fn spawn_parallel_pipeline(
     // Decode thread: FSK demod + BLE/BT protocol decode + output
     let decode_handle = {
         let overflow_proc = overflow_count;
+        let rx_lost_proc = rx_lost;
+        // Share of real time whose samples never reached the channelizer.
+        let lost_pct = move |elapsed: f64| -> f64 {
+            let lost_s = rx_lost_proc.load(Ordering::Relaxed) as f64 / raw_sample_rate as f64;
+            if elapsed > 0.0 { (100.0 * lost_s / elapsed).min(100.0) } else { 0.0 }
+        };
         let mut fsk = fsk;
         let aa_correlator = aa_correlator;
         let aa_correlator_2m = aa_correlator_2m;
@@ -2227,6 +2235,7 @@ fn spawn_parallel_pipeline(
                                 s.total_pkts = stats.total_ble + stats.total_bt;
                                 s.pkt_rate = (stats.total_ble + stats.total_bt) as f64 / elapsed;
                                 s.crc_pct = stats.crc_pct();
+                                s.rx_lost_pct = lost_pct(elapsed);
                             }
                         }
 
@@ -2244,7 +2253,7 @@ fn spawn_parallel_pipeline(
                             String::new()
                         };
                         eprint!(
-                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{} shed:{}\n",
+                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} lost: {:.1}% EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{} shed:{}\n",
                             elapsed,
                             stats.total_ble,
                             phy_str,
@@ -2255,6 +2264,7 @@ fn spawn_parallel_pipeline(
                             stats.total_crc,
                             conns,
                             overflows,
+                            lost_pct(elapsed),
                             stats.edr_attempts,
                             stats.edr_syncs,
                             stats.edr_crc_matches,
@@ -2304,7 +2314,7 @@ fn spawn_parallel_pipeline(
                         String::new()
                     };
                     eprintln!(
-                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} EDR: try={} sync={} crc={} best={:.3} shed={}{}{}",
+                        "done ({:.1}s): BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) overflow: {} lost: {:.1}% EDR: try={} sync={} crc={} best={:.3} shed={}{}{}",
                         elapsed,
                         stats.total_ble,
                         phy_str,
@@ -2314,6 +2324,7 @@ fn spawn_parallel_pipeline(
                         stats.valid_crc,
                         stats.total_crc,
                         overflows,
+                        lost_pct(elapsed),
                         stats.edr_attempts,
                         stats.edr_syncs,
                         stats.edr_crc_matches,
@@ -2625,6 +2636,19 @@ impl SdrHandle {
             #[cfg(feature = "espdr")]
             SdrHandle::Espdr(h) => h.overflow_count(),
             SdrHandle::Vita49(h) => h.overflow_count(),
+        }
+    }
+
+    /// True when samples arrive at the sample rate in real time, so a
+    /// shortfall against the wall clock means samples were lost. The ESP
+    /// backend builds its own timeline from the board's sample counter
+    /// (with noise between bursts, and faster than real time in snapshot
+    /// mode), so it keeps that clock instead.
+    fn real_time_stream(&self) -> bool {
+        match self {
+            #[cfg(feature = "espdr")]
+            SdrHandle::Espdr(_) => false,
+            _ => true,
         }
     }
 
@@ -3368,6 +3392,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     let max_samps = sdr.max_samps();
 
     let overflow_count = Arc::new(AtomicU64::new(0));
+    let rx_lost = Arc::new(AtomicU64::new(0));
 
     eprintln!("CPU: PFB+FFT (SIMD), max_recv={}", max_samps);
 
@@ -3393,6 +3418,7 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         check_crc,
         print_stats,
         overflow_count.clone(),
+        rx_lost.clone(),
         squelch_pending.clone(),
         #[cfg(feature = "zmq")]
         zmq_config,
@@ -3405,10 +3431,14 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     // SDR recv thread: continuously drains hardware, sends i16 buffers to PFB thread.
     // Accumulates multiple recv calls to ~4080 complex samples before sending,
     // compensating for smaller max_samps with SC16 wire format.
-    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(128);
+    // Each buffer carries the number of samples lost just before it.
+    let (sdr_tx, sdr_rx) = channel::bounded::<(Vec<i16>, u64)>(128);
     let sdr_overflow = overflow_count.clone();
+    let sdr_lost = rx_lost.clone();
     let sdr_running = running.clone();
     let sdr_buf_size = max_samps * 2; // i16 elements per recv
+    let sdr_rate = sample_rate;
+    let track_gaps = sdr.real_time_stream();
 
     let sdr_gain_pending = gain_pending.clone();
     let sdr_thread = std::thread::Builder::new()
@@ -3422,6 +3452,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
             let mut last_flag_log = Instant::now();
             let mut prev_flags: (u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0);
             let mut prev_sidekiq_drops: u64 = 0;
+            let mut rx_clock = RxClock::new(sdr_rate);
+            let mut pending_gap: u64 = 0;
 
             while sdr_running.load(Ordering::Relaxed) {
                 // Check for runtime gain change from C2
@@ -3436,6 +3468,10 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                     continue;
                 }
                 sdr_overflow.store(sdr.overflow_count(), Ordering::Relaxed);
+                if track_gaps {
+                    pending_gap += rx_clock.received(num_rx, Instant::now());
+                    sdr_lost.store(rx_clock.lost(), Ordering::Relaxed);
+                }
 
                 if last_flag_log.elapsed().as_secs() >= 5 {
                     if let Some(cur) = sdr.aaronia_flag_counts() {
@@ -3471,7 +3507,8 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
                 send_pos += n;
 
                 if send_pos >= target_elems {
-                    if sdr_tx.send(send_buf[..send_pos].to_vec()).is_err() {
+                    let gap = std::mem::take(&mut pending_gap);
+                    if sdr_tx.send((send_buf[..send_pos].to_vec(), gap)).is_err() {
                         break;
                     }
                     send_pos = 0;
@@ -3493,8 +3530,17 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         .then(|| Vec::with_capacity(CPU_BATCH_STEPS * num_channels));
     let mut batch_steps: usize = 0;
     let mut next_batch_ts: Option<Timespec> = None;
+    let samples_per_step = (num_channels / 2).max(1) as u64;
 
-    for i16_buf in sdr_rx.iter() {
+    for (i16_buf, gap) in sdr_rx.iter() {
+        // Samples lost before this buffer: move the clock past them. The gap
+        // lands on the next batch boundary, at most one batch (about 2 ms)
+        // from where it happened.
+        if gap > 0 {
+            if let Some(ts) = next_batch_ts.as_mut() {
+                *ts = channel_samples_after(ts, (gap / samples_per_step) as usize);
+            }
+        }
         let n = i16_buf.len();
 
         let step = num_channels;
@@ -3600,6 +3646,7 @@ fn run_live_gpu_loop(
     );
 
     let overflow_count = Arc::new(AtomicU64::new(0));
+    let rx_lost = Arc::new(AtomicU64::new(0));
 
     // Spawn parallel burst workers + decode thread
     let (batch_txs, worker_handles, decode_handle) = spawn_parallel_pipeline(
@@ -3623,6 +3670,7 @@ fn run_live_gpu_loop(
         check_crc,
         print_stats,
         overflow_count.clone(),
+        rx_lost.clone(),
         squelch_pending,
         #[cfg(feature = "zmq")]
         zmq_config,
@@ -3634,10 +3682,14 @@ fn run_live_gpu_loop(
 
     // SDR recv thread: continuously drains hardware, prevents overflow during GPU submit.
     // Accumulates multiple recv calls to ~4080 complex samples before sending.
-    let (sdr_tx, sdr_rx) = channel::bounded::<Vec<i16>>(128);
+    // Each buffer carries the number of samples lost just before it.
+    let (sdr_tx, sdr_rx) = channel::bounded::<(Vec<i16>, u64)>(128);
     let sdr_overflow = overflow_count.clone();
+    let sdr_lost = rx_lost.clone();
     let sdr_running = running.clone();
     let sdr_buf_size = max_samps * 2;
+    let sdr_rate = num_channels as u32 * 1_000_000;
+    let track_gaps = sdr.real_time_stream();
 
     let sdr_gain_pending = gain_pending;
     let sdr_thread = std::thread::Builder::new()
@@ -3649,6 +3701,8 @@ fn run_live_gpu_loop(
             let mut recv_buf = vec![0i16; sdr_buf_size];
             let mut send_buf = vec![0i16; target_elems + sdr_buf_size];
             let mut send_pos: usize = 0;
+            let mut rx_clock = RxClock::new(sdr_rate);
+            let mut pending_gap: u64 = 0;
 
             while sdr_running.load(Ordering::Relaxed) {
                 // Check for runtime gain change from C2
@@ -3663,12 +3717,17 @@ fn run_live_gpu_loop(
                     continue;
                 }
                 sdr_overflow.store(sdr.overflow_count(), Ordering::Relaxed);
+                if track_gaps {
+                    pending_gap += rx_clock.received(num_rx, Instant::now());
+                    sdr_lost.store(rx_clock.lost(), Ordering::Relaxed);
+                }
                 let n = num_rx * 2;
                 send_buf[send_pos..send_pos + n].copy_from_slice(&recv_buf[..n]);
                 send_pos += n;
 
                 if send_pos >= target_elems {
-                    if sdr_tx.send(send_buf[..send_pos].to_vec()).is_err() {
+                    let gap = std::mem::take(&mut pending_gap);
+                    if sdr_tx.send((send_buf[..send_pos].to_vec(), gap)).is_err() {
                         break;
                     }
                     send_pos = 0;
@@ -3685,8 +3744,16 @@ fn run_live_gpu_loop(
     let mut pos: usize = 0;
     let mut raw_buf = gpu.raw_buffer();
     let mut next_batch_ts: Option<Timespec> = None;
+    let samples_per_step = (num_channels / 2).max(1) as u64;
 
-    for i16_buf in sdr_rx.iter() {
+    for (i16_buf, gap) in sdr_rx.iter() {
+        // Samples lost before this buffer: move the clock past them (see the
+        // CPU loop).
+        if gap > 0 {
+            if let Some(ts) = next_batch_ts.as_mut() {
+                *ts = channel_samples_after(ts, (gap / samples_per_step) as usize);
+            }
+        }
         // Copy i16 data into GPU raw buffer, handling partial fills
         let mut src_pos = 0usize;
         let n = i16_buf.len();

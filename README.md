@@ -1089,6 +1089,18 @@ quantization of its float samples instead of 8-bit.
    computed and shows `0/0`. This is not an error -- add `--check-crc`
    to enable validation.
 
+### `lost` above 0% in `--stats`
+
+`lost` is the share of run time whose samples never reached Blue Dragon:
+the SDR overran, or the host could not keep up. Blue Dragon measures it
+against the system clock, so it works for every SDR, and moves packet
+timestamps past each gap so they stay on real time. Anything heard
+during lost time is missed. A rising figure on a long run usually means
+the decode stage is falling behind: check per-thread CPU (`top -H`) and
+free memory, and reduce `-C` if the machine cannot keep up. The same
+figure is sent in the C2 heartbeat and shown as `lost %` in the
+dashboard's sensor table.
+
 ### ESP32-S3: "not running the eSpDR firmware"
 
 The ESP did not answer the eSpDR handshake: it was power-cycled (the

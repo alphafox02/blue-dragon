@@ -2182,6 +2182,7 @@ class DashboardState:
                     n["squelch"] = hb.get("squelch")
                     n["pkt_rate"] = hb.get("pkt_rate")
                     n["crc_pct"] = hb.get("crc_pct")
+                    n["rx_lost_pct"] = hb.get("rx_lost_pct")
                     n["uptime"] = hb.get("uptime")
                     if hb.get("gps"):
                         n["lat"] = hb["gps"][0]
@@ -2199,6 +2200,7 @@ class DashboardState:
                         "squelch": hb.get("squelch"),
                         "pkt_rate": hb.get("pkt_rate"),
                         "crc_pct": hb.get("crc_pct"),
+                        "rx_lost_pct": hb.get("rx_lost_pct"),
                         "uptime": hb.get("uptime"),
                     }
             # Add static positions that haven't been seen
@@ -3246,6 +3248,7 @@ select.filter { font: 11px monospace; background: #333; color: #ccc; border: 1px
         <th>squelch</th>
         <th>pkt rate</th>
         <th>crc %</th>
+        <th title="share of run time whose samples never reached the receiver's channelizer">lost %</th>
         <th>uptime</th>
         <th>gps</th>
         <th>controls</th>
@@ -3801,6 +3804,7 @@ function renderNodes() {
     const gps = (n.lat != null && n.lon != null) ? n.lat.toFixed(4)+', '+n.lon.toFixed(4) : '-';
     const rate = n.pkt_rate != null ? n.pkt_rate.toFixed(1) : '-';
     const crc = n.crc_pct != null ? n.crc_pct.toFixed(1)+'%' : '-';
+    const lost = n.rx_lost_pct != null ? n.rx_lost_pct.toFixed(1)+'%' : '-';
     const up = n.uptime != null ? fmtUp(n.uptime) : '-';
     let gainHtml = '-';
     if (n.has_c2 && n.gain != null) {
@@ -3855,6 +3859,7 @@ function renderNodes() {
       '<td>'+sqlHtml+'</td>' +
       '<td>'+rate+'</td>' +
       '<td>'+crc+'</td>' +
+      '<td'+(n.rx_lost_pct >= 1 ? ' style="color:#f88"' : '')+'>'+lost+'</td>' +
       '<td>'+up+'</td>' +
       '<td class="dim">'+gps+'</td>' +
       '<td>'+ctrlHtml+'</td>';
