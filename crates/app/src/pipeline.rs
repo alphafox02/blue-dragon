@@ -473,7 +473,30 @@ pub fn run_file(
                                 );
                             }
 
-                            if let Some(mut p) = pkt {
+                            // Packets anywhere in an advertising-channel burst
+                            // (see process_burst).
+                            let mut found = Vec::new();
+                            if is_primary_adv(freq) {
+                                let lead = burst.edr_lead_samples;
+                                let per_sample = 1.0 / fsk_result.resample_ratio;
+                                let ts_at = |i: usize| {
+                                    channel_samples_after(
+                                        &burst_ts,
+                                        lead + (i as f64 * per_sample) as usize,
+                                    )
+                                };
+                                found = ble::ble_adv_search(&fsk_result.demod, freq, &ts_at, check_crc);
+                            }
+                            let mut pkts = Vec::new();
+                            if let Some(p) = pkt {
+                                if !(p.crc_checked && !p.crc_valid && !found.is_empty()) {
+                                    found.retain(|f| f.data != p.data);
+                                    pkts.push(p);
+                                }
+                            }
+                            pkts.extend(found);
+
+                            for mut p in pkts {
                                 p.rssi_db = rssi;
                                 p.noise_db = noise;
 
@@ -528,6 +551,36 @@ pub fn run_file(
                                         }
                                         pcap_errors += 1;
                                     }
+                                }
+                            }
+                        }
+                    } else if is_primary_adv(burst.freq) && burst.samples.len() >= 400 {
+                        // FSK demodulation gave up on the start of the burst;
+                        // advertising packets can still be inside it.
+                        let raw = fsk.fm_discriminate_raw(&burst.samples);
+                        let per_sample = burst.samples.len() as f64 / raw.len().max(1) as f64;
+                        let ts_at = |i: usize| {
+                            channel_samples_after(&burst.timestamp, (i as f64 * per_sample) as usize)
+                        };
+                        for mut p in ble::ble_adv_search(&raw, burst.freq, &ts_at, check_crc) {
+                            p.rssi_db = burst.rssi_db as i32;
+                            p.noise_db = burst.noise_db as i32;
+                            if p.crc_valid {
+                                conn_table.parse_connect_ind(&p, burst.timestamp.tv_sec);
+                            }
+                            if p.crc_checked {
+                                total_crc += 1;
+                                if p.crc_valid {
+                                    valid_crc += 1;
+                                }
+                            }
+                            total_ble += 1;
+                            if let Some(ref mut writer) = pcap_writer {
+                                if let Err(e) = writer.write_ble(&p, None) {
+                                    if pcap_errors == 0 {
+                                        eprintln!("PCAP write error: {}", e);
+                                    }
+                                    pcap_errors += 1;
                                 }
                             }
                         }
@@ -1339,7 +1392,10 @@ fn process_burst(
         BurstDemod::Raw(raw_demod) => {
             // FSK demod failed. Try raw FM + coded for any burst >= 1500 samples
             // (coded S=2 min ~2000 samples, S=8 min ~4000 samples).
-            if let Some(raw_demod) = raw_demod {
+            let Some(raw_demod) = raw_demod else {
+                return;
+            };
+            if blen >= 1500 {
                 stats.fsk_reject_long += 1;
                 stats.coded_attempts += 1;
                 let search_depth = 0; // 0 = search full burst (coarse stride handles perf)
@@ -1357,13 +1413,34 @@ fn process_burst(
                     // Require valid CRC for coded packets from noise bursts
                     // to avoid false positives (garbled AA/MAC = phantom devices)
                     if p.crc_checked && !p.crc_valid {
-                        return;
-                    }
-                    if conn_table.is_coded_copy(&p) {
+                        // drop it
+                    } else if conn_table.is_coded_copy(&p) {
                         stats.coded_copies += 1;
-                        return;
+                    } else {
+                        emit_ble(&p, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, gps_fix, stats);
                     }
-                    emit_ble(&p, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, gps_fix, stats);
+                }
+            }
+            if is_primary_adv(burst.freq) {
+                let per_sample = blen as f64 / raw_demod.len().max(1) as f64;
+                let ts_at = |i: usize| channel_samples_after(&burst.timestamp, (i as f64 * per_sample) as usize);
+                for mut p in ble::ble_adv_search(&raw_demod, burst.freq, &ts_at, check_crc) {
+                    stats.adv_search_found += 1;
+                    p.rssi_db = burst.rssi_db as i32;
+                    p.noise_db = burst.noise_db as i32;
+                    finish_ble(
+                        p,
+                        burst.freq,
+                        burst.rssi_db as i32,
+                        burst.timestamp.tv_sec,
+                        conn_table,
+                        smp_parser,
+                        pcap_writer,
+                        #[cfg(feature = "zmq")]
+                        zmq_pub,
+                        gps_fix,
+                        stats,
+                    );
                 }
             }
             return;
@@ -1494,108 +1571,159 @@ fn process_burst(
         );
     }
 
-    if let Some(mut p) = pkt {
+    // Packets anywhere in an advertising-channel burst, for bursts where
+    // the decoders above miss them or find only a failing copy.
+    let mut found = Vec::new();
+    if is_primary_adv(freq) {
+        let lead = burst.edr_lead_samples;
+        let per_sample = 1.0 / fsk_result.resample_ratio;
+        let ts_at = |i: usize| channel_samples_after(&burst_ts, lead + (i as f64 * per_sample) as usize);
+        found = ble::ble_adv_search(&fsk_result.demod, freq, &ts_at, check_crc);
+    }
+    let mut pkts = Vec::new();
+    if let Some(p) = pkt {
+        let failed = p.crc_checked && !p.crc_valid;
+        if failed && !found.is_empty() {
+            stats.adv_search_replaced += 1;
+        } else {
+            found.retain(|f| f.data != p.data);
+            pkts.push(p);
+        }
+    }
+    stats.adv_search_found += found.len() as u64;
+    pkts.extend(found);
+
+    for mut p in pkts {
         p.rssi_db = rssi;
         p.noise_db = noise;
+        finish_ble(
+            p,
+            freq,
+            rssi,
+            burst_ts.tv_sec,
+            conn_table,
+            smp_parser,
+            pcap_writer,
+            #[cfg(feature = "zmq")]
+            zmq_pub,
+            gps_fix,
+            stats,
+        );
+    }
+}
 
-        if conn_table.is_coded_copy(&p) {
-            stats.coded_copies += 1;
-            return;
-        }
+/// Copy checks, connection tracking and output for one decoded BLE packet.
+#[allow(clippy::too_many_arguments)]
+fn finish_ble(
+    p: ble::BlePacket,
+    freq: u32,
+    rssi: i32,
+    now_sec: u64,
+    conn_table: &mut ConnectionTable,
+    smp_parser: &mut bd_protocol::smp::SmpParser,
+    pcap_writer: &mut Option<PcapWriter<BufWriter<File>>>,
+    #[cfg(feature = "zmq")] zmq_pub: &Option<bd_output::zmq_pub::ZmqPublisher>,
+    gps_fix: Option<&bd_output::pcap::GpsFix>,
+    stats: &mut PipelineStats,
+) {
 
-        // A receiver that aliases hands the decoders the same packet at
-        // several channels (see bd_protocol::fold); only the copy dewhitened
-        // for its own channel passes the CRC. A failing copy of a packet
-        // already decoded is dropped; a failing packet seen first is held
-        // briefly in case its passing copy is still to come.
-        let failed = p.crc_checked && !p.crc_valid;
-        let copy = conn_table.is_fold_copy(&p);
-        if !failed {
-            stats.ble_fold_copies += conn_table.drop_held_copies_of(&p) as u64;
-        }
-        for held in conn_table.release_held(Some(&p)) {
-            emit_ble(&held, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, gps_fix, stats);
-        }
-        if failed {
-            if copy {
-                stats.ble_fold_copies += 1;
-            } else {
-                conn_table.hold_failed(p);
-            }
-            return;
-        }
+    if conn_table.is_coded_copy(&p) {
+        stats.coded_copies += 1;
+        return;
+    }
 
-        if p.aa == ble::BLE_ADV_AA && p.crc_valid {
-            conn_table.parse_connect_ind(&p, burst_ts.tv_sec);
+    // A receiver that aliases hands the decoders the same packet at
+    // several channels (see bd_protocol::fold); only the copy dewhitened
+    // for its own channel passes the CRC. A failing copy of a packet
+    // already decoded is dropped; a failing packet seen first is held
+    // briefly in case its passing copy is still to come.
+    let failed = p.crc_checked && !p.crc_valid;
+    let copy = conn_table.is_fold_copy(&p);
+    if !failed {
+        stats.ble_fold_copies += conn_table.drop_held_copies_of(&p) as u64;
+    }
+    for held in conn_table.release_held(Some(&p)) {
+        emit_ble(&held, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, gps_fix, stats);
+    }
+    if failed {
+        if copy {
+            stats.ble_fold_copies += 1;
+        } else {
+            conn_table.hold_failed(p);
         }
+        return;
+    }
 
-        // Parse SMP from data channel packets (non-advertising AA with valid CRC)
-        if p.aa != ble::BLE_ADV_AA && p.crc_valid && p.is_data {
-            if let Some((l2cap_cid, l2cap_payload)) = bd_protocol::smp::extract_l2cap(&p.data) {
-                // Direction: assume central is the initiator for now
-                // (proper direction tracking requires connection role from CONNECT_IND)
-                let from_central = true;
-                let smp_events =
-                    smp_parser.parse_l2cap(p.aa, l2cap_cid, l2cap_payload, from_central);
-                for event in &smp_events {
-                    // Log to stderr
-                    match event {
-                        bd_protocol::smp::SmpEvent::FeaturesExchanged {
-                            aa,
-                            method,
-                            security,
-                            ..
-                        } => {
-                            eprintln!(
-                                "SMP: connection 0x{:08X} pairing {:?} ({:?})",
-                                aa, method, security
-                            );
-                        }
-                        bd_protocol::smp::SmpEvent::WeakPairing { aa, reason } => {
-                            eprintln!("SMP WARNING: connection 0x{:08X}: {}", aa, reason);
-                        }
-                        bd_protocol::smp::SmpEvent::LtkDistributed { aa, .. } => {
-                            eprintln!("SMP: connection 0x{:08X} LTK captured", aa);
-                        }
-                        bd_protocol::smp::SmpEvent::IrkDistributed { aa, .. } => {
-                            eprintln!("SMP: connection 0x{:08X} IRK captured", aa);
-                        }
-                        bd_protocol::smp::SmpEvent::PairingFailed { aa, reason } => {
-                            eprintln!(
-                                "SMP: connection 0x{:08X} pairing failed (reason {})",
-                                aa, reason
-                            );
-                        }
-                        _ => {}
+    if p.aa == ble::BLE_ADV_AA && p.crc_valid {
+        conn_table.parse_connect_ind(&p, now_sec);
+    }
+
+    // Parse SMP from data channel packets (non-advertising AA with valid CRC)
+    if p.aa != ble::BLE_ADV_AA && p.crc_valid && p.is_data {
+        if let Some((l2cap_cid, l2cap_payload)) = bd_protocol::smp::extract_l2cap(&p.data) {
+            // Direction: assume central is the initiator for now
+            // (proper direction tracking requires connection role from CONNECT_IND)
+            let from_central = true;
+            let smp_events =
+                smp_parser.parse_l2cap(p.aa, l2cap_cid, l2cap_payload, from_central);
+            for event in &smp_events {
+                // Log to stderr
+                match event {
+                    bd_protocol::smp::SmpEvent::FeaturesExchanged {
+                        aa,
+                        method,
+                        security,
+                        ..
+                    } => {
+                        eprintln!(
+                            "SMP: connection 0x{:08X} pairing {:?} ({:?})",
+                            aa, method, security
+                        );
                     }
-                    // Stream to dashboard via ZMQ
-                    #[cfg(feature = "zmq")]
-                    if let Some(ref pub_socket) = zmq_pub {
-                        let json = format_smp_event(event);
-                        pub_socket.send_smp(&json);
+                    bd_protocol::smp::SmpEvent::WeakPairing { aa, reason } => {
+                        eprintln!("SMP WARNING: connection 0x{:08X}: {}", aa, reason);
                     }
+                    bd_protocol::smp::SmpEvent::LtkDistributed { aa, .. } => {
+                        eprintln!("SMP: connection 0x{:08X} LTK captured", aa);
+                    }
+                    bd_protocol::smp::SmpEvent::IrkDistributed { aa, .. } => {
+                        eprintln!("SMP: connection 0x{:08X} IRK captured", aa);
+                    }
+                    bd_protocol::smp::SmpEvent::PairingFailed { aa, reason } => {
+                        eprintln!(
+                            "SMP: connection 0x{:08X} pairing failed (reason {})",
+                            aa, reason
+                        );
+                    }
+                    _ => {}
+                }
+                // Stream to dashboard via ZMQ
+                #[cfg(feature = "zmq")]
+                if let Some(ref pub_socket) = zmq_pub {
+                    let json = format_smp_event(event);
+                    pub_socket.send_smp(&json);
                 }
             }
         }
-
-        // Debug: show ADV_EXT_IND packets with AuxPtr to find coded secondary channel
-        if let Some(ref eh) = p.ext_header {
-            if let Some(ref aux) = eh.aux_ptr {
-                let phy_str = match aux.phy {
-                    ble::BlePhy::Phy1M => "1M",
-                    ble::BlePhy::Phy2M => "2M",
-                    ble::BlePhy::PhyCoded => "Coded",
-                };
-                let ch_freq = 2402 + (aux.channel as u32) * 2;
-                eprintln!(
-                    "ADV_EXT_IND: freq={} rssi={} -> AuxPtr ch={} ({}MHz) phy={} offset={}us",
-                    freq, rssi, aux.channel, ch_freq, phy_str, aux.offset_usec
-                );
-            }
-        }
-
-        emit_ble(&p, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, gps_fix, stats);
     }
+
+    // Debug: show ADV_EXT_IND packets with AuxPtr to find coded secondary channel
+    if let Some(ref eh) = p.ext_header {
+        if let Some(ref aux) = eh.aux_ptr {
+            let phy_str = match aux.phy {
+                ble::BlePhy::Phy1M => "1M",
+                ble::BlePhy::Phy2M => "2M",
+                ble::BlePhy::PhyCoded => "Coded",
+            };
+            let ch_freq = 2402 + (aux.channel as u32) * 2;
+            eprintln!(
+                "ADV_EXT_IND: freq={} rssi={} -> AuxPtr ch={} ({}MHz) phy={} offset={}us",
+                freq, rssi, aux.channel, ch_freq, phy_str, aux.offset_usec
+            );
+        }
+    }
+
+    emit_ble(&p, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, gps_fix, stats);
 }
 
 /// Counts a BLE packet and writes it out.
@@ -1680,6 +1808,11 @@ struct PipelineStats {
     ble_fold_copies: u64,
     /// Coded packets decoded again through an overlapping continuous scan.
     coded_copies: u64,
+    /// Advertising packets found by the whole-burst search that the other
+    /// decoders missed.
+    adv_search_found: u64,
+    /// Failing packets replaced by a passing one from the whole-burst search.
+    adv_search_replaced: u64,
 }
 
 impl PipelineStats {
@@ -1709,6 +1842,8 @@ impl PipelineStats {
             bt_fold_copies: 0,
             ble_fold_copies: 0,
             coded_copies: 0,
+            adv_search_found: 0,
+            adv_search_replaced: 0,
         }
     }
 
@@ -1762,6 +1897,11 @@ enum BurstDemod {
     Raw(Option<Vec<f32>>),
 }
 
+/// BLE primary advertising channels 37, 38 and 39.
+fn is_primary_adv(freq: u32) -> bool {
+    matches!(freq, 2402 | 2426 | 2480)
+}
+
 fn demodulate_burst(burst: &bd_dsp::burst::Burst, fsk: &mut FskDemod) -> BurstDemod {
     let blen = burst.samples.len();
     if burst.scan {
@@ -1773,7 +1913,9 @@ fn demodulate_burst(burst: &bd_dsp::burst::Burst, fsk: &mut FskDemod) -> BurstDe
     let normal_samples = &burst.samples[burst.edr_lead_samples.min(blen)..];
     match fsk.demodulate(normal_samples) {
         Some(r) => BurstDemod::Fsk(r),
-        None if blen >= 1500 => BurstDemod::Raw(Some(fsk.fm_discriminate_raw(&burst.samples))),
+        None if blen >= 1500 || (is_primary_adv(burst.freq) && blen >= 400) => {
+            BurstDemod::Raw(Some(fsk.fm_discriminate_raw(&burst.samples)))
+        }
         None => BurstDemod::Raw(None),
     }
 }
@@ -2287,7 +2429,7 @@ fn spawn_parallel_pipeline(
                             String::new()
                         };
                         eprint!(
-                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} lost: {:.1}% EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{} shed:{}\n",
+                            "[{:.1}s] BLE: {}{} BT: {} bursts: {} CRC: {:.1}% ({}/{}) conns: {} overflow: {} lost: {:.1}% EDR:{}/{}/{} best:{:.3} coded_try:{} coded_ok:{} fsk_rej:{} max_burst:{} lens:<200:{} 200-1k:{} 1k-5k:{} 5k-50k:{} 50k+:{} shed:{} adv_search:{}/{}\n",
                             elapsed,
                             stats.total_ble,
                             phy_str,
@@ -2313,6 +2455,8 @@ fn spawn_parallel_pipeline(
                             stats.burst_5k_50k,
                             stats.burst_50k_plus,
                             wideband_shed,
+                            stats.adv_search_found,
+                            stats.adv_search_replaced,
                         );
 
                         last_stats = Instant::now();

@@ -69,15 +69,21 @@ impl FskDemod {
     /// The kf=0.5 normalization matches liquid-dsp's freqdem_create(0.5f),
     /// producing output in roughly [-1, 1] range for BLE signals.
     fn freq_discriminate(&mut self, burst: &[Complex32]) -> Vec<f32> {
+        let mut demod = Vec::with_capacity(burst.len());
+        self.freq_discriminate_into(burst, &mut demod);
+        demod
+    }
+
+    /// Append the discriminator output for `burst` to `demod`, continuing
+    /// from the previous sample.
+    fn freq_discriminate_into(&mut self, burst: &[Complex32], demod: &mut Vec<f32>) {
         // kf = 0.5 → normalization = 1/(2*pi*0.5) = 1/pi
         const KF_NORM: f32 = std::f32::consts::FRAC_1_PI;
-        let mut demod = Vec::with_capacity(burst.len());
         for &sample in burst {
             let product = sample * self.prev_sample.conj();
-            demod.push(product.arg() * KF_NORM);
+            demod.push(fast_atan2(product.im, product.re) * KF_NORM);
             self.prev_sample = sample;
         }
-        demod
     }
 
     /// Carrier frequency offset correction using median of positive/negative points.
@@ -166,9 +172,14 @@ impl FskDemod {
             return None;
         }
 
-        let mut demod = self.freq_discriminate(burst);
-
+        // The CFO estimate only looks at the start of the burst. Most bursts
+        // that fail it are noise, often long, so discriminate the rest only
+        // once it passes.
+        let head = 8 + self.median_size();
+        let mut demod = Vec::with_capacity(burst.len());
+        self.freq_discriminate_into(&burst[..head], &mut demod);
         let (cfo, deviation) = self.cfo_median(&demod)?;
+        self.freq_discriminate_into(&burst[head..], &mut demod);
 
         // CFO correction and normalization
         for val in demod.iter_mut() {
@@ -208,6 +219,37 @@ impl FskDemod {
     }
 }
 
+/// atan2 to within 4e-7 rad, several times cheaper than libm. The
+/// discriminator calls it once per burst sample.
+#[inline]
+fn fast_atan2(y: f32, x: f32) -> f32 {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let (ax, ay) = (x.abs(), y.abs());
+    let (num, den) = if ay > ax { (ax, ay) } else { (ay, ax) };
+    if !(den > 0.0 && den.is_finite()) {
+        // Zeros keep their IEEE signs, infinities and NaN their meaning.
+        return y.atan2(x);
+    }
+    // Minimax fit of atan(a) / a in a^2 on [0, 1].
+    let a = num / den;
+    let s = a * a;
+    let mut r = 0.006_811_8_f32;
+    r = r * s - 0.033_604_24;
+    r = r * s + 0.079_623_68;
+    r = r * s - 0.132_333_43;
+    r = r * s + 0.198_078_16;
+    r = r * s - 0.333_173_7;
+    r = r * s + 0.999_996_1;
+    r *= a;
+    if ay > ax {
+        r = FRAC_PI_2 - r;
+    }
+    if x.is_sign_negative() {
+        r = PI - r;
+    }
+    r.copysign(y)
+}
+
 /// Resample a signal using linear interpolation.
 /// `ratio` = target_rate / source_rate (< 1.0 means output is shorter).
 /// For each output sample i, the corresponding source position is i / ratio.
@@ -243,6 +285,23 @@ pub fn reslice(demod: &[f32], silence_offset: usize, sps: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fast_atan2_matches_libm() {
+        let mut worst = 0.0f32;
+        for i in -200..=200 {
+            for j in -200..=200 {
+                let (y, x) = (i as f32 * 0.37, j as f32 * 0.53);
+                let d = (fast_atan2(y, x) - y.atan2(x)).abs();
+                worst = worst.max(d);
+            }
+        }
+        assert!(worst < 1e-6, "max error {worst}");
+        for (y, x) in [(0.0f32, 0.0f32), (-0.0, 0.0), (0.0, -0.0), (-0.0, -0.0), (0.0, -1.0), (-0.0, -1.0), (1.0, 0.0), (-1.0, -0.0)] {
+            assert_eq!(fast_atan2(y, x).to_bits(), y.atan2(x).to_bits(), "atan2({y}, {x})");
+        }
+    }
+
     use super::*;
 
     #[test]

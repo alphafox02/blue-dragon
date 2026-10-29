@@ -767,6 +767,175 @@ pub fn ble_burst_2m(
     })
 }
 
+/// Find every CRC-valid LE 1M packet on the advertising access address in a
+/// burst, wherever it sits.
+///
+/// The other 1M decoders expect one packet at the start of the burst and
+/// take their frequency offset and timing from there. Where Wi-Fi is busy
+/// the squelch stays open across it, so packets arrive inside long bursts
+/// that start with something else. This search slides over the whole
+/// burst, fits frequency offset and deviation to the known preamble and
+/// access address of each candidate, tries sub-symbol timings, and keeps
+/// only packets whose CRC checks.
+///
+/// `demod` is FM discriminator output at 2 samples per symbol, in any scale
+/// or offset. `timestamp_at` gives the time of a sample index. Returns
+/// packets in burst order.
+pub fn ble_adv_search(
+    demod: &[f32],
+    freq: u32,
+    timestamp_at: &dyn Fn(usize) -> Timespec,
+    check_crc: bool,
+) -> Vec<BlePacket> {
+    const SPS: f32 = 2.0;
+    const HP_HALF: usize = 16;
+    let mut found = Vec::new();
+    let n = demod.len();
+    if n < 400 || freq < 2402 || freq > 2480 || freq % 2 != 0 {
+        return found;
+    }
+    let channel = freq_to_channel(freq);
+    let max_pdu_len: usize = if channel >= 37 { 37 } else { 255 };
+
+    let at = |d: &[f32], pos: f32| -> f32 {
+        let i = pos as usize;
+        let fr = pos - i as f32;
+        d[i] * (1.0 - fr) + d[i + 1] * fr
+    };
+
+    // Remove the carrier offset for the coarse search: subtract a centred
+    // 33-sample moving average.
+    let mut hp = vec![0.0f32; n];
+    let mut sum: f32 = demod[..HP_HALF.min(n)].iter().sum();
+    let mut lo = 0usize;
+    let mut hi = HP_HALF.min(n);
+    for i in 0..n {
+        let want_hi = (i + HP_HALF + 1).min(n);
+        while hi < want_hi {
+            sum += demod[hi];
+            hi += 1;
+        }
+        let want_lo = i.saturating_sub(HP_HALF);
+        while lo < want_lo {
+            sum -= demod[lo];
+            lo += 1;
+        }
+        hp[i] = demod[i] - sum / (hi - lo) as f32;
+    }
+
+    // Candidate access address positions at four sub-symbol phases,
+    // allowing one bit error.
+    let mut hits: Vec<f32> = Vec::new();
+    for phase in [0.0f32, 0.5, 1.0, 1.5] {
+        let mut window: u32 = 0;
+        let mut count = 0usize;
+        let mut pos = phase;
+        while pos + 1.0 < (n - 1) as f32 {
+            window = (window >> 1) | (((at(&hp, pos) > 0.0) as u32) << 31);
+            count += 1;
+            let x = window ^ BLE_ADV_AA;
+            if count >= 32 && x & x.wrapping_sub(1) == 0 {
+                hits.push(pos - 31.0 * SPS);
+            }
+            pos += SPS;
+        }
+    }
+    hits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Known symbols: 8 preamble bits alternating into AA bit 0, then the AA.
+    let aa0 = BLE_ADV_AA & 1;
+    let mut known = [0.0f32; 40];
+    for (k, v) in known.iter_mut().enumerate() {
+        let bit = if k < 8 {
+            aa0 ^ ((7 - k) % 2 == 0) as u32
+        } else {
+            (BLE_ADV_AA >> (k - 8)) & 1
+        };
+        *v = if bit == 1 { 1.0 } else { -1.0 };
+    }
+    let (sx, sxx) = known.iter().fold((0.0f32, 0.0f32), |(a, b), &v| (a + v, b + v * v));
+
+    let mut used_until = f32::MIN;
+    for &start in &hits {
+        if start <= used_until {
+            continue;
+        }
+        for off in [0.0f32, -0.25, 0.25, -0.5, 0.5] {
+            let s0 = start + off;
+            let first = s0 - 8.0 * SPS;
+            let data_start = s0 + 32.0 * SPS;
+            if first < 0.0 || data_start + 16.0 * SPS + 1.0 >= (n - 1) as f32 {
+                continue;
+            }
+            // Least-squares fit v = cfo + dev * symbol over the 40 known symbols.
+            let (mut sy, mut sxy) = (0.0f32, 0.0f32);
+            for (k, &sym) in known.iter().enumerate() {
+                let v = at(demod, first + k as f32 * SPS);
+                sy += v;
+                sxy += v * sym;
+            }
+            let nk = known.len() as f32;
+            let den = nk * sxx - sx * sx;
+            let dev = (nk * sxy - sx * sy) / den;
+            if !(dev > 0.0) {
+                continue;
+            }
+            let cfo = (sy - dev * sx) / nk;
+
+            let bit = |k: usize| -> u8 { (at(demod, data_start + k as f32 * SPS) > cfo) as u8 };
+            let mut len: usize = 0;
+            for j in 0..8 {
+                len |= ((bit(8 + j) ^ whitening_bit(channel, 8 + j as u32)) as usize) << j;
+            }
+            if len > max_pdu_len {
+                continue;
+            }
+            let total_bits = (2 + len + 3) * 8;
+            if data_start + total_bits as f32 * SPS + 1.0 >= (n - 1) as f32 {
+                continue;
+            }
+            let pkt_len = 4 + 2 + len + 3;
+            let mut data = vec![0u8; pkt_len];
+            data[..4].copy_from_slice(&BLE_ADV_AA.to_le_bytes());
+            for i in 0..pkt_len - 4 {
+                let mut byte = 0u8;
+                for j in 0..8 {
+                    let k = i * 8 + j;
+                    byte |= (bit(k) ^ whitening_bit(channel, k as u32)) << j;
+                }
+                data[4 + i] = byte;
+            }
+            let computed = crc24(&data[4..pkt_len - 3], 0x555555);
+            let received = data[pkt_len - 3] as u32
+                | (data[pkt_len - 2] as u32) << 8
+                | (data[pkt_len - 1] as u32) << 16;
+            if computed != received {
+                continue;
+            }
+            let first_sample = first.round().max(0.0) as usize;
+            let ext_header = parse_ext_adv(&data[4..]);
+            found.push(BlePacket {
+                aa: BLE_ADV_AA,
+                freq,
+                len: pkt_len,
+                data,
+                timestamp: timestamp_at(first_sample),
+                rssi_db: 0,
+                noise_db: 0,
+                crc_checked: check_crc,
+                crc_valid: check_crc,
+                is_data: false,
+                conn_valid: false,
+                phy: BlePhy::Phy1M,
+                ext_header,
+            });
+            used_until = data_start + total_bits as f32 * SPS;
+            break;
+        }
+    }
+    found
+}
+
 /// LE Coded PHY preamble: 80 symbols of repeating `00111100` (10 repetitions).
 /// At SPS=2 the preamble is 160 samples.
 const CODED_PREAMBLE_PATTERN: [u8; 8] = [0, 0, 1, 1, 1, 1, 0, 0];
@@ -811,79 +980,77 @@ pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: u
         sorted[n / 2]
     };
 
-    // Pattern: 00111100 at SPS=2 -> --++++-- (each symbol = 2 samples)
-    // We check symbols by averaging SPS samples centered on each symbol position.
-    // Require >= 5 consecutive pattern matches (out of 10 repetitions).
-    let pattern_len = 8; // 00111100
-    let pattern_samples = pattern_len * sps;
+    // Pattern 00111100, symbol k in bit k. A repetition counts when 7 of 8
+    // symbols match it or its inverse (11000011). Require >= 5 consecutive
+    // repetitions (out of 10).
+    const PATTERN_BITS: u8 = {
+        let mut bits = 0u8;
+        let mut k = 0;
+        while k < 8 {
+            bits |= CODED_PREAMBLE_PATTERN[k] << k;
+            k += 1;
+        }
+        bits
+    };
+    const WINDOW_OK: [bool; 256] = {
+        let mut table = [false; 256];
+        let mut w = 0;
+        while w < 256 {
+            let mismatches = (w as u8 ^ PATTERN_BITS).count_ones();
+            table[w] = mismatches <= 1 || mismatches >= 7;
+            w += 1;
+        }
+        table
+    };
+    let pattern_len = 8;
     let min_reps = 5;
 
     let mut best_pos: Option<usize> = None;
     let mut best_reps: usize = 0;
+    let mut ok: Vec<bool> = Vec::new();
 
-    // Try both sample phase offsets (0 and 1 within SPS=2)
-    for phase in 0..sps {
-        let mut i = phase;
-        while i + pattern_samples * (min_reps + 1) <= search_end {
-            // Extract symbols for this window
+    // Try each sample phase within a symbol. Every symbol is sliced once
+    // (the mean of its SPS samples against the DC offset), then each
+    // 8-symbol window is checked once, so the search is linear in the
+    // burst length.
+    for phase in 0..sps.min(search_end) {
+        let n_sym = (search_end - phase) / sps;
+        if n_sym < pattern_len {
+            continue;
+        }
+        ok.clear();
+        ok.reserve(n_sym);
+        let mut window: u8 = 0;
+        for symbol in demod[phase..phase + n_sym * sps].chunks_exact(sps) {
+            let mut val: f32 = 0.0;
+            for &v in symbol {
+                val += v;
+            }
+            val = val / sps as f32 - dc_offset;
+            window = (window >> 1) | (((val > 0.0) as u8) << 7);
+            ok.push(WINDOW_OK[window as usize]);
+        }
+
+        // ok[j + 7] covers symbols j..j+8. Start a candidate one symbol at
+        // a time while 6 repetitions still fit before search_end.
+        let mut j = 0;
+        while j + pattern_len * (min_reps + 1) <= n_sym {
             let mut reps = 0usize;
-
-            for rep in 0..10 {
-                let base = i + rep * pattern_samples;
-                if base + pattern_samples > search_end {
+            while reps < CODED_PREAMBLE_REPS {
+                let k = j + reps * pattern_len + pattern_len - 1;
+                if k >= n_sym || !ok[k] {
                     break;
                 }
-
-                let mut match_count = 0usize;
-                for sym_idx in 0..pattern_len {
-                    let sample_start = base + sym_idx * sps;
-                    // Average SPS samples for this symbol
-                    let mut val: f32 = 0.0;
-                    for s in 0..sps {
-                        val += demod[sample_start + s];
-                    }
-                    val = val / sps as f32 - dc_offset;
-
-                    let expected = if CODED_PREAMBLE_PATTERN[sym_idx] == 1 { 1 } else { 0 };
-                    let actual = if val > 0.0 { 1 } else { 0 };
-                    if actual == expected {
-                        match_count += 1;
-                    }
-                }
-
-                if match_count >= 7 { // 7 of 8 symbols match
-                    reps += 1;
-                } else {
-                    // Also check inverted pattern (11000011)
-                    let mut inv_match = 0usize;
-                    for sym_idx in 0..pattern_len {
-                        let sample_start = base + sym_idx * sps;
-                        let mut val: f32 = 0.0;
-                        for s in 0..sps {
-                            val += demod[sample_start + s];
-                        }
-                        val = val / sps as f32 - dc_offset;
-
-                        let expected = if CODED_PREAMBLE_PATTERN[sym_idx] == 1 { 0 } else { 1 };
-                        let actual = if val > 0.0 { 1 } else { 0 };
-                        if actual == expected {
-                            inv_match += 1;
-                        }
-                    }
-                    if inv_match >= 7 {
-                        reps += 1;
-                    } else {
-                        break; // pattern broken
-                    }
-                }
+                reps += 1;
             }
-
             if reps >= min_reps && reps > best_reps {
                 best_reps = reps;
-                best_pos = Some(i);
+                best_pos = Some(phase + j * sps);
+                if best_reps == CODED_PREAMBLE_REPS {
+                    return best_pos;
+                }
             }
-
-            i += sps; // advance one symbol at a time
+            j += 1;
         }
     }
 
@@ -1210,6 +1377,222 @@ pub fn ble_coded_burst_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The original per-position preamble search, kept to check the linear
+    /// one against.
+    fn find_coded_preamble_ref(demod: &[f32], sps: usize, max_search_samples: usize, _freq: u32) -> Option<usize> {
+        // Need at least preamble + Block 1 worth of samples
+        let min_samples = CODED_PREAMBLE_SYMBOLS * sps + 600 * sps;
+        if demod.len() < min_samples {
+            return None;
+        }
+
+        let max_search = if max_search_samples > 0 {
+            max_search_samples
+        } else {
+            demod.len()
+        };
+        let search_end = max_search.min(demod.len());
+
+        // Compute local DC offset (median-based CFO correction)
+        // Take median of first 200 samples to estimate DC offset from carrier offset
+        let dc_offset = {
+            let n = 200.min(demod.len());
+            let mut sorted: Vec<f32> = demod[..n].to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted[n / 2]
+        };
+
+        // Pattern: 00111100 at SPS=2 -> --++++-- (each symbol = 2 samples)
+        // We check symbols by averaging SPS samples centered on each symbol position.
+        // Require >= 5 consecutive pattern matches (out of 10 repetitions).
+        let pattern_len = 8; // 00111100
+        let pattern_samples = pattern_len * sps;
+        let min_reps = 5;
+
+        let mut best_pos: Option<usize> = None;
+        let mut best_reps: usize = 0;
+
+        // Try both sample phase offsets (0 and 1 within SPS=2)
+        for phase in 0..sps {
+            let mut i = phase;
+            while i + pattern_samples * (min_reps + 1) <= search_end {
+                // Extract symbols for this window
+                let mut reps = 0usize;
+
+                for rep in 0..10 {
+                    let base = i + rep * pattern_samples;
+                    if base + pattern_samples > search_end {
+                        break;
+                    }
+
+                    let mut match_count = 0usize;
+                    for sym_idx in 0..pattern_len {
+                        let sample_start = base + sym_idx * sps;
+                        // Average SPS samples for this symbol
+                        let mut val: f32 = 0.0;
+                        for s in 0..sps {
+                            val += demod[sample_start + s];
+                        }
+                        val = val / sps as f32 - dc_offset;
+
+                        let expected = if CODED_PREAMBLE_PATTERN[sym_idx] == 1 { 1 } else { 0 };
+                        let actual = if val > 0.0 { 1 } else { 0 };
+                        if actual == expected {
+                            match_count += 1;
+                        }
+                    }
+
+                    if match_count >= 7 { // 7 of 8 symbols match
+                        reps += 1;
+                    } else {
+                        // Also check inverted pattern (11000011)
+                        let mut inv_match = 0usize;
+                        for sym_idx in 0..pattern_len {
+                            let sample_start = base + sym_idx * sps;
+                            let mut val: f32 = 0.0;
+                            for s in 0..sps {
+                                val += demod[sample_start + s];
+                            }
+                            val = val / sps as f32 - dc_offset;
+
+                            let expected = if CODED_PREAMBLE_PATTERN[sym_idx] == 1 { 0 } else { 1 };
+                            let actual = if val > 0.0 { 1 } else { 0 };
+                            if actual == expected {
+                                inv_match += 1;
+                            }
+                        }
+                        if inv_match >= 7 {
+                            reps += 1;
+                        } else {
+                            break; // pattern broken
+                        }
+                    }
+                }
+
+                if reps >= min_reps && reps > best_reps {
+                    best_reps = reps;
+                    best_pos = Some(i);
+                }
+
+                i += sps; // advance one symbol at a time
+            }
+        }
+
+        best_pos
+    }
+
+    /// Discriminator samples (2 per symbol) for an advertising packet with
+    /// the given PDU, as a GFSK receiver sees it: offset by `cfo`, scaled by
+    /// `dev`, with a soft transition on the first sample of each symbol.
+    fn synth_adv(pdu: &[u8], channel: u32, cfo: f32, dev: f32) -> (Vec<u8>, Vec<f32>) {
+        let mut data = BLE_ADV_AA.to_le_bytes().to_vec();
+        data.extend_from_slice(pdu);
+        let crc = crc24(pdu, 0x555555);
+        data.extend_from_slice(&[crc as u8, (crc >> 8) as u8, (crc >> 16) as u8]);
+        let aa0 = (BLE_ADV_AA & 1) as u8;
+        let mut bits: Vec<u8> = (0..8).map(|k| aa0 ^ ((7 - k) % 2 == 0) as u8).collect();
+        for (i, &byte) in data.iter().enumerate() {
+            for j in 0..8 {
+                let mut b = (byte >> j) & 1;
+                if i >= 4 {
+                    b ^= whitening_bit(channel, ((i - 4) * 8 + j) as u32);
+                }
+                bits.push(b);
+            }
+        }
+        let mut out = Vec::new();
+        let mut prev = 0.0f32;
+        for &b in &bits {
+            let cur = if b == 1 { 1.0 } else { -1.0 };
+            out.push(cfo + dev * (prev + cur) / 2.0);
+            out.push(cfo + dev * cur);
+            prev = cur;
+        }
+        (data, out)
+    }
+
+    #[test]
+    fn adv_search_finds_packets_inside_a_burst() {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+        };
+        // ADV_NONCONN_IND and a SCAN_RSP-sized PDU on channel 38.
+        let pdu1: Vec<u8> = [0x42u8, 12].iter().copied().chain(1..=12u8).collect();
+        let pdu2: Vec<u8> = [0x44u8, 20].iter().copied().chain(40..60u8).collect();
+        let (data1, wave1) = synth_adv(&pdu1, 38, 0.21, 0.55);
+        let (data2, wave2) = synth_adv(&pdu2, 38, -0.12, 0.6);
+        let mut demod: Vec<f32> = (0..700).map(|_| rnd() * 2.0).collect();
+        let start1 = demod.len();
+        demod.extend(wave1.iter().map(|v| v + 0.08 * rnd()));
+        demod.extend((0..300).map(|_| rnd() * 2.0));
+        let start2 = demod.len();
+        demod.extend(wave2.iter().map(|v| v + 0.08 * rnd()));
+        demod.extend((0..500).map(|_| rnd() * 2.0));
+
+        let ts = |i: usize| Timespec { tv_sec: 0, tv_nsec: i as u64 * 500 };
+        let found = ble_adv_search(&demod, 2426, &ts, true);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].data, data1);
+        assert_eq!(found[1].data, data2);
+        assert!(found.iter().all(|p| p.crc_checked && p.crc_valid));
+        assert!((found[0].timestamp.tv_nsec as i64 - start1 as i64 * 500).abs() <= 1000);
+        assert!((found[1].timestamp.tv_nsec as i64 - start2 as i64 * 500).abs() <= 1000);
+
+        let noise: Vec<f32> = (0..20_000).map(|_| rnd() * 2.0).collect();
+        assert!(ble_adv_search(&noise, 2426, &ts, true).is_empty());
+    }
+
+    #[test]
+    fn coded_preamble_search_matches_reference() {
+        // Random noise with coded preamble runs of varying length and
+        // polarity, some with flipped symbols, at both sample phases.
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let pattern = [0u8, 0, 1, 1, 1, 1, 0, 0];
+        let mut found = 0;
+        for trial in 0..400 {
+            let sps = if trial % 4 == 3 { 1 } else { 2 };
+            let len = 1400 * sps + (rnd() * 6000.0) as usize;
+            let mut demod: Vec<f32> = (0..len).map(|_| rnd() - 0.5 + 0.1 * (trial % 3) as f32).collect();
+            for _ in 0..(rnd() * 4.0) as usize {
+                let reps = 3 + (rnd() * 8.0) as usize;
+                let invert = rnd() < 0.3;
+                let start = (rnd() * len as f32) as usize;
+                for r in 0..reps {
+                    for (k, &b) in pattern.iter().enumerate() {
+                        let flip = rnd() < 0.03;
+                        let bit = (b == 1) ^ invert ^ flip;
+                        for s in 0..sps {
+                            let idx = start + (r * 8 + k) * sps + s;
+                            if idx < len {
+                                demod[idx] = if bit { 0.8 } else { -0.8 } + 0.2 * (rnd() - 0.5);
+                            }
+                        }
+                    }
+                }
+            }
+            for &depth in &[0usize, 2000, len / 2, len + 100] {
+                let pos = find_coded_preamble_freq(&demod, sps, depth, 0);
+                assert_eq!(
+                    pos,
+                    find_coded_preamble_ref(&demod, sps, depth, 0),
+                    "trial {trial} sps {sps} depth {depth}"
+                );
+                found += pos.is_some() as usize;
+            }
+        }
+        assert!(found > 200 && found < 1500, "found {found} of 1600");
+    }
 
     #[test]
     fn test_crc24_known_value() {

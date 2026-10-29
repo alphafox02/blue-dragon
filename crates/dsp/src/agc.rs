@@ -16,6 +16,9 @@ pub struct Agc {
     signal_level: f32,
     /// Squelch threshold in dB
     squelch_threshold: f32,
+    /// Gain below which the signal is above the squelch threshold, so the
+    /// per-sample check needs no logarithm.
+    squelch_gain: f32,
     /// Squelch timeout in samples
     squelch_timeout: u32,
     /// Current squelch state
@@ -43,6 +46,7 @@ impl Agc {
             bandwidth,
             signal_level: 1e-3,
             squelch_threshold: squelch_threshold_db,
+            squelch_gain: squelch_gain(squelch_threshold_db),
             squelch_timeout,
             state: SquelchState::SignalLo,
             timer: 0,
@@ -59,8 +63,9 @@ impl Agc {
         // Apply gain
         let output = input * self.gain;
 
-        // Update signal level estimate (envelope follower)
-        let level = output.norm();
+        // Update signal level estimate (envelope follower). Plain sqrt
+        // instead of hypot: the magnitudes here cannot overflow.
+        let level = (output.re * output.re + output.im * output.im).sqrt();
         let alpha = self.bandwidth;
         self.signal_level = alpha * level + (1.0 - alpha) * self.signal_level;
 
@@ -68,13 +73,19 @@ impl Agc {
         // g *= exp(-0.5 * alpha * ln(y_hat))
         // Smoothly decreases gain when output > 1, increases when < 1.
         if self.signal_level > 1e-6 {
-            self.gain *= (-0.5 * alpha * self.signal_level.ln()).exp();
+            self.gain *= if alpha == 0.25 {
+                // exp(-0.125 * ln(y)) = y^(-1/8): three square roots are far
+                // cheaper than ln and exp, and this runs on every sample of
+                // every channel.
+                1.0 / self.signal_level.sqrt().sqrt().sqrt()
+            } else {
+                (-0.5 * alpha * self.signal_level.ln()).exp()
+            };
             self.gain = self.gain.clamp(1e-6, 1e6);
         }
 
-        // Squelch state machine
-        let rssi = self.rssi_db();
-        let above_threshold = rssi > self.squelch_threshold;
+        // Squelch state machine. rssi_db() > threshold, without the log.
+        let above_threshold = self.gain < self.squelch_gain;
 
         let prev_state = self.state;
         self.state = match prev_state {
@@ -122,7 +133,13 @@ impl Agc {
     /// Set squelch threshold
     pub fn set_squelch_threshold(&mut self, threshold_db: f32) {
         self.squelch_threshold = threshold_db;
+        self.squelch_gain = squelch_gain(threshold_db);
     }
+}
+
+/// -20 * log10(gain) > threshold_db  <=>  gain < 10^(-threshold_db / 20)
+fn squelch_gain(threshold_db: f32) -> f32 {
+    10f32.powf(-threshold_db / 20.0)
 }
 
 #[cfg(test)]
