@@ -12,7 +12,7 @@ Usage:
     # Display live packets (sensors connect to us on port 5555):
     python3 zmq_subscriber.py tcp://*:5555
 
-    # Write to PCAP file:
+    # Write mixed BLE/Classic PCAP (PPI, DLT 192):
     python3 zmq_subscriber.py tcp://*:5555 -w output.pcap
 
     # Quiet mode (only write PCAP, no terminal output):
@@ -21,7 +21,7 @@ Usage:
     # Encrypted connection (CURVE):
     python3 zmq_subscriber.py tcp://*:5555 --server-key server.key
 
-    # Write PCAP with GPS tagging (PPI headers, DLT 192):
+    # Include received GPS metadata in the PPI capture:
     python3 zmq_subscriber.py tcp://*:5555 -w output.pcap --gps
 
 Requirements:
@@ -29,6 +29,7 @@ Requirements:
 """
 
 import argparse
+import math
 import signal
 import struct
 import sys
@@ -42,6 +43,7 @@ except ImportError:
 
 # PCAP structures (matching pcap.c)
 PCAP_GLOBAL_HDR = struct.Struct("<IHHiIII")
+PCAP_SNAPLEN = 65535
 PCAP_REC_HDR = struct.Struct("<IIII")      # ts_sec, ts_usec, incl_len, orig_len
 BLE_RF_HDR = struct.Struct("<bbbBIH")      # rf_channel, signal_power, noise_power,
                                             # aa_offenses, ref_aa, flags
@@ -60,6 +62,7 @@ LE_CRC_VALID          = 0x0800
 BLE_ADV_AA = 0x8E89BED6
 
 DLT_BLUETOOTH_LE_LL_WITH_PHDR = 256
+DLT_BLUETOOTH_BREDR_BB = 255
 DLT_PPI = 192
 
 # PPI header structures
@@ -100,9 +103,9 @@ def ppi_fixed6_4(val):
     return int((val + 180000.0) * 1e4)
 
 
-def build_ppi_gps_header(lat, lon, alt):
+def build_ppi_gps_header(lat, lon, alt, dlt=DLT_BLUETOOTH_LE_LL_WITH_PHDR):
     """Build a PPI header with GPS field."""
-    ppi_hdr = PPI_HDR.pack(0, 0, PPI_GPS_SIZE, DLT_BLUETOOTH_LE_LL_WITH_PHDR)
+    ppi_hdr = PPI_HDR.pack(0, 0, PPI_GPS_SIZE, dlt)
     fld_hdr = PPI_FIELD_HDR.pack(PPI_FIELD_GPS, PPI_GPS.size)
     gps_data = PPI_GPS.pack(
         2, 0, PPI_GPS.size,
@@ -115,9 +118,9 @@ def build_ppi_gps_header(lat, lon, alt):
     return ppi_hdr + fld_hdr + gps_data
 
 
-def build_ppi_passthrough_header():
+def build_ppi_passthrough_header(dlt=DLT_BLUETOOTH_LE_LL_WITH_PHDR):
     """Build a minimal PPI header with no fields (passthrough)."""
-    return PPI_HDR.pack(0, 0, PPI_HDR_SIZE, DLT_BLUETOOTH_LE_LL_WITH_PHDR)
+    return PPI_HDR.pack(0, 0, PPI_HDR_SIZE, dlt)
 
 
 def parse_ble_packet(data):
@@ -158,40 +161,109 @@ def parse_ble_packet(data):
     }
 
 
-def write_pcap_header(f, use_ppi=False):
-    """Write PCAP global header."""
-    dlt = DLT_PPI if use_ppi else DLT_BLUETOOTH_LE_LL_WITH_PHDR
-    snaplen = 4 + 2 + 255 + 3
-    if use_ppi:
-        snaplen += PPI_GPS_SIZE
+def write_pcap_header(f):
+    """Write the mixed Bluetooth PPI capture header."""
     f.write(PCAP_GLOBAL_HDR.pack(
         0xA1B2C3D4,  # magic
         2, 4,         # version
         0,            # timezone
         0,            # sigfigs
-        snaplen,
-        dlt,
+        PCAP_SNAPLEN,
+        DLT_PPI,
     ))
     f.flush()
 
 
-def write_ppi_pcap_record(f, pcap_data, gps_info):
+def write_ppi_pcap_record(f, pcap_data, gps_info, dlt=DLT_BLUETOOTH_LE_LL_WITH_PHDR):
     """Write a PPI-wrapped PCAP record to file."""
     # Parse the original PCAP record header to get timestamps
     ts_sec, ts_usec, incl_len, orig_len = PCAP_REC_HDR.unpack_from(pcap_data, 0)
     payload = pcap_data[PCAP_REC_HDR.size:]
 
     if gps_info:
-        ppi_hdr = build_ppi_gps_header(gps_info[0], gps_info[1], gps_info[2])
+        ppi_hdr = build_ppi_gps_header(*gps_info, dlt=dlt)
     else:
-        ppi_hdr = build_ppi_passthrough_header()
+        ppi_hdr = build_ppi_passthrough_header(dlt=dlt)
 
     new_len = len(ppi_hdr) + len(payload)
-    new_rec_hdr = PCAP_REC_HDR.pack(ts_sec, ts_usec, new_len, new_len)
+    new_rec_hdr = PCAP_REC_HDR.pack(ts_sec, ts_usec, new_len, orig_len + len(ppi_hdr))
     f.write(new_rec_hdr)
     f.write(ppi_hdr)
     f.write(payload)
     f.flush()
+
+
+def parse_packet_message(data):
+    """Accept upstream 0x00/0x01 frames and legacy unprefixed BLE records.
+
+    Validate the complete record before deciding a low timestamp byte is a
+    type prefix. Neither format permits private trailers outside incl_len.
+    """
+    def valid_record(record, minimum_header):
+        if len(record) < PCAP_REC_HDR.size:
+            return False
+        _sec, usec, incl_len, orig_len = PCAP_REC_HDR.unpack_from(record)
+        return (usec < 1_000_000 and minimum_header <= incl_len <= PCAP_SNAPLEN - PPI_GPS_SIZE
+                and incl_len <= orig_len <= 0xFFFFFFFF - PPI_GPS_SIZE
+                and len(record) == PCAP_REC_HDR.size + incl_len)
+
+    if data and data[0] in (0, 1):
+        pkt_type = data[0]
+        record = data[1:]
+        if valid_record(record, 22 if pkt_type else BLE_RF_HDR.size):
+            return pkt_type, record
+    if valid_record(data, BLE_RF_HDR.size):
+        return 0, data
+    return None
+
+
+def _is_topic_marker(frame):
+    """Colon-terminated frames reserve the multiplexed JSON topic lane."""
+    if not isinstance(frame, bytes) or not frame.endswith(b":"):
+        return False
+    try:
+        return frame.decode("utf-8").isprintable()
+    except UnicodeDecodeError:
+        return False
+
+
+def _gps_from_frame(frame):
+    if len(frame) != ZMQ_GPS_FRAME.size:
+        return None
+    lat, lon, alt = ZMQ_GPS_FRAME.unpack(frame)
+    if (all(math.isfinite(value) for value in (lat, lon, alt))
+            and -90 <= lat <= 90 and -180 <= lon <= 180
+            and 0 <= (alt + 180000.0) * 1e4 <= 0xFFFFFFFF):
+        return lat, lon, alt
+    return None
+
+
+def parse_zmq_frames(frames):
+    """Parse producer [sensor_id?][GPS?][packet] and legacy [GPS][packet].
+
+    A three-frame message always puts GPS second, regardless of sensor-ID
+    length. The legacy two-frame layout is inherently ambiguous for a 24-byte
+    ID: prefer printable UTF-8 IDs, then recognize plausible binary GPS.
+    """
+    if frames and _is_topic_marker(frames[0]):
+        return None, None, None
+    if len(frames) == 1:
+        return None, None, frames[0]
+    if len(frames) == 3:
+        return (frames[0].decode("utf-8", errors="replace"),
+                _gps_from_frame(frames[1]), frames[2])
+    if len(frames) == 2:
+        try:
+            text = frames[0].decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        if text and text.isprintable():
+            return text, None, frames[1]
+        gps_info = _gps_from_frame(frames[0])
+        if gps_info is not None:
+            return None, gps_info, frames[1]
+        return frames[0].decode("utf-8", errors="replace"), None, frames[1]
+    return None, None, None
 
 
 def parse_server_pubkey(path):
@@ -222,7 +294,7 @@ def main():
     parser.add_argument("--server-key", metavar="FILE",
                         help="Server public key file for CURVE encryption")
     parser.add_argument("--gps", action="store_true",
-                        help="Write PCAP with PPI GPS headers (DLT 192)")
+                        help="Include received GPS metadata in PPI capture records")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -250,9 +322,9 @@ def main():
     pcap_file = None
     if args.write:
         pcap_file = open(args.write, "wb")
-        write_pcap_header(pcap_file, use_ppi=args.gps)
+        write_pcap_header(pcap_file)
         if not args.quiet:
-            dlt_name = "DLT 192 (PPI+GPS)" if args.gps else "DLT 256 (BLE)"
+            dlt_name = "DLT 192 (PPI, mixed BLE/Classic)"
             print(f"Writing PCAP to {args.write} ({dlt_name})", file=sys.stderr)
 
     pkt_count = 0
@@ -277,27 +349,29 @@ def main():
         except zmq.Again:
             continue
 
-        # Parse multipart: 1 frame = no GPS, 2 frames = GPS + PCAP record
-        gps_info = None
-        if len(frames) >= 2 and len(frames[0]) == ZMQ_GPS_FRAME.size:
-            lat, lon, alt = ZMQ_GPS_FRAME.unpack(frames[0])
-            gps_info = (lat, lon, alt)
-            pcap_data = frames[1]
+        # JSON topics and malformed envelopes never enter the capture path.
+        _sensor_id, gps_info, pcap_data = parse_zmq_frames(frames)
+        if pcap_data is None:
+            continue
+        parsed = parse_packet_message(pcap_data)
+        if parsed is None:
+            continue
+        pkt_type, pcap_data = parsed
+        if gps_info is not None:
             gps_pkt_count += 1
-        else:
-            pcap_data = frames[-1]
-
-        # Strip type prefix byte if present (0x00=BLE, 0x01=BT)
-        if len(pcap_data) > PCAP_REC_HDR.size and pcap_data[0] <= 0x01:
-            pcap_data = pcap_data[1:]
 
         # Write to PCAP file
         if pcap_file:
-            if args.gps:
-                write_ppi_pcap_record(pcap_file, pcap_data, gps_info)
-            else:
-                pcap_file.write(pcap_data)
-                pcap_file.flush()
+            write_ppi_pcap_record(
+                pcap_file, pcap_data, gps_info if args.gps else None,
+                DLT_BLUETOOTH_BREDR_BB if pkt_type else DLT_BLUETOOTH_LE_LL_WITH_PHDR)
+
+        if pkt_type == 1:
+            pkt_count += 1
+            if not args.quiet:
+                incl_len = PCAP_REC_HDR.unpack_from(pcap_data)[2]
+                print(f"Classic BT: {incl_len} bytes")
+            continue
 
         pkt = parse_ble_packet(pcap_data)
         if pkt is None:

@@ -432,6 +432,7 @@ def _resolve_rpa(mac_str):
 # BLE / PCAP structures (matching pcap.c / zmq_subscriber.py)
 # ---------------------------------------------------------------------------
 PCAP_GLOBAL_HDR = struct.Struct("<IHHiIII")
+PCAP_SNAPLEN = 65535
 PCAP_REC_HDR = struct.Struct("<IIII")
 BLE_RF_HDR = struct.Struct("<bbbBIH")
 ZMQ_GPS_FRAME = struct.Struct("<ddd")
@@ -2607,40 +2608,77 @@ class DashboardHandler(BaseHTTPRequestHandler):
 running = True
 
 
-def parse_zmq_frames(frames):
-    """Parse ZMQ multipart message, returning (sensor_id, gps_info, pcap_data).
+def parse_packet_message(data):
+    """Accept upstream 0x00/0x01 frames and legacy unprefixed BLE records.
 
-    Handles all frame formats:
-      1 frame:  [PCAP]                     -> (None, None, pcap)
-      2 frames: [GPS_24b] [PCAP]           -> (None, gps, pcap)   legacy
-      2 frames: [SENSOR_ID] [PCAP]         -> (id, None, pcap)    new, no GPS
-      3 frames: [SENSOR_ID] [GPS_24b] [PCAP] -> (id, gps, pcap)  new, with GPS
+    Validate the complete record before deciding a low timestamp byte is a
+    type prefix. Neither format permits private trailers outside incl_len.
     """
-    sensor_id = None
-    gps_info = None
+    def valid_record(record, minimum_header):
+        if len(record) < PCAP_REC_HDR.size:
+            return False
+        _sec, usec, incl_len, orig_len = PCAP_REC_HDR.unpack_from(record)
+        return (usec < 1_000_000 and minimum_header <= incl_len <= PCAP_SNAPLEN - PPI_GPS_SIZE
+                and incl_len <= orig_len <= 0xFFFFFFFF - PPI_GPS_SIZE
+                and len(record) == PCAP_REC_HDR.size + incl_len)
 
-    if len(frames) == 1:
-        pcap_data = frames[0]
-    elif len(frames) == 2:
-        if len(frames[0]) == ZMQ_GPS_FRAME.size:
-            lat, lon, alt = ZMQ_GPS_FRAME.unpack(frames[0])
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                gps_info = (lat, lon, alt)
-            else:
-                sensor_id = frames[0].decode("utf-8", errors="replace")
-        else:
-            sensor_id = frames[0].decode("utf-8", errors="replace")
-        pcap_data = frames[1]
-    elif len(frames) >= 3:
-        sensor_id = frames[0].decode("utf-8", errors="replace")
-        if len(frames[1]) == ZMQ_GPS_FRAME.size:
-            lat, lon, alt = ZMQ_GPS_FRAME.unpack(frames[1])
-            gps_info = (lat, lon, alt)
-        pcap_data = frames[-1]
-    else:
+    if data and data[0] in (0, 1):
+        pkt_type = data[0]
+        record = data[1:]
+        if valid_record(record, 22 if pkt_type else BLE_RF_HDR.size):
+            return pkt_type, record
+    if valid_record(data, BLE_RF_HDR.size):
+        return 0, data
+    return None
+
+
+def _is_topic_marker(frame):
+    """Colon-terminated frames reserve the multiplexed JSON topic lane."""
+    if not isinstance(frame, bytes) or not frame.endswith(b":"):
+        return False
+    try:
+        return frame.decode("utf-8").isprintable()
+    except UnicodeDecodeError:
+        return False
+
+
+def _gps_from_frame(frame):
+    if len(frame) != ZMQ_GPS_FRAME.size:
+        return None
+    lat, lon, alt = ZMQ_GPS_FRAME.unpack(frame)
+    if (all(math.isfinite(value) for value in (lat, lon, alt))
+            and -90 <= lat <= 90 and -180 <= lon <= 180
+            and 0 <= (alt + 180000.0) * 1e4 <= 0xFFFFFFFF):
+        return lat, lon, alt
+    return None
+
+
+def parse_zmq_frames(frames):
+    """Parse producer [sensor_id?][GPS?][packet] and legacy [GPS][packet].
+
+    A three-frame message always puts GPS second, regardless of sensor-ID
+    length. The legacy two-frame layout is inherently ambiguous for a 24-byte
+    ID: prefer printable UTF-8 IDs, then recognize plausible binary GPS.
+    """
+    if frames and _is_topic_marker(frames[0]):
         return None, None, None
-
-    return sensor_id, gps_info, pcap_data
+    if len(frames) == 1:
+        return None, None, frames[0]
+    if len(frames) == 3:
+        return (frames[0].decode("utf-8", errors="replace"),
+                _gps_from_frame(frames[1]), frames[2])
+    if len(frames) == 2:
+        try:
+            text = frames[0].decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        if text and text.isprintable():
+            return text, None, frames[1]
+        gps_info = _gps_from_frame(frames[0])
+        if gps_info is not None:
+            return None, gps_info, frames[1]
+        return frames[0].decode("utf-8", errors="replace"), None, frames[1]
+    return None, None, None
 
 
 def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
@@ -2652,12 +2690,10 @@ def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
     if sensor_id is None:
         sensor_id = fallback_sensor_id
 
-    # Detect type prefix byte (new format: 0x00=BLE, 0x01=BT)
-    pkt_type = ZMQ_PKT_TYPE_BLE
-    raw_pcap = pcap_data
-    if len(pcap_data) > PCAP_REC_HDR.size and pcap_data[0] <= ZMQ_PKT_TYPE_BT:
-        pkt_type = pcap_data[0]
-        raw_pcap = pcap_data[1:]
+    parsed = parse_packet_message(pcap_data)
+    if parsed is None:
+        return
+    pkt_type, raw_pcap = parsed
 
     # Write PCAP if requested (always PPI-wrapped for mixed BLE/BT support)
     if pcap_file:
@@ -2669,7 +2705,7 @@ def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
         else:
             ppi_hdr = build_ppi_passthrough_header(dlt=pkt_dlt)
         new_len = len(ppi_hdr) + len(payload)
-        pcap_file.write(PCAP_REC_HDR.pack(ts_sec, ts_usec, new_len, new_len))
+        pcap_file.write(PCAP_REC_HDR.pack(ts_sec, ts_usec, new_len, orig_len + len(ppi_hdr)))
         pcap_file.write(ppi_hdr)
         pcap_file.write(payload)
         pcap_file.flush()
@@ -4270,8 +4306,7 @@ def main():
     if args.write:
         pcap_file = open(args.write, "wb")
         # Always PPI (DLT 192) to support mixed BLE + Classic BT per-packet DLT
-        snaplen = PPI_GPS_SIZE + 4 + 2 + 255 + 3
-        pcap_file.write(PCAP_GLOBAL_HDR.pack(0xA1B2C3D4, 2, 4, 0, 0, snaplen, DLT_PPI))
+        pcap_file.write(PCAP_GLOBAL_HDR.pack(0xA1B2C3D4, 2, 4, 0, 0, PCAP_SNAPLEN, DLT_PPI))
         pcap_file.flush()
 
     # Start ZMQ receiver thread (always binds, sensors connect to us)

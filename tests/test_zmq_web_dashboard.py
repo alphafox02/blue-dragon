@@ -4,6 +4,8 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+import types
+from unittest import mock
 from pathlib import Path
 
 
@@ -11,7 +13,8 @@ MODULE_PATH = Path(__file__).parents[1] / "tools" / "zmq_web_dashboard.py"
 SPEC = importlib.util.spec_from_file_location("zmq_web_dashboard", MODULE_PATH)
 dashboard = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = dashboard
-SPEC.loader.exec_module(dashboard)
+with mock.patch.dict(sys.modules, {"zmq": types.ModuleType("zmq")}):
+    SPEC.loader.exec_module(dashboard)
 
 
 # Produced by bd_output::pcap::zmq_build_bt. The Rust test pins the same bytes.

@@ -29,10 +29,41 @@
   - BLE + BT packets decoded, 86% CRC from ci16 file
 
 ### PCAP Output
+- [x] Sensor file-header snaplen: `cargo test --lib --no-default-features -p bd-output`
+  - 9 passed; snaplen is 65,535. Collector header paths pass in the Python tests below.
 - [x] Write PCAP: `-w output.pcap`, open in Wireshark
   - Packets from file and live capture. tshark decodes BLE + BT correctly
 - [ ] PCAP with GPS: `--gpsd`, verify GPS coordinates in PPI headers
 - [ ] PCAP error logging: fill disk, verify error message on stderr
+
+### ZMQ Capture Validation
+
+- [x] Collector unit tests: `python3 -m unittest discover -s tests -p 'test_zmq*.py' -v`
+  - 21 passed on macOS and Linux: mocked loops reject JSON and malformed records, preserve BLE/Classic
+    bytes and all four layouts, and apply default/`--gps` PPI policy. Both collectors' `main()` header
+    paths are unit tested.
+- [x] Rust publisher API to both collectors (temporary test program, not committed).
+  - Linux loopback ZMQ carried eight synthetic BLE/Classic records in each of two cases: subscriber
+    default and subscriber `--gps`. Record bytes matched `PcapWriter` output under each collector's GPS
+    policy, across all four layouts including 24-byte IDs. Dashboard GPS display stayed off.
+- [x] Synthetic VITA 49 capture through both collectors,
+  native debug build with `--no-default-features --features zmq`:
+  ```sh
+  blue-dragon -l -i vita49:127.0.0.1:PORT -C 4 -c 2426 --no-gpu --check-crc \
+    --stats --zmq tcp://127.0.0.1:PUBLISH_PORT --sensor-id SENSOR_ID -w sensor.pcap
+  ```
+  - 12/12 BLE packets passed CRC with no input overflow. A transparent test relay forwarded unchanged
+    multipart frames; sensor records equal both collectors' records byte-for-byte. The VITA 49 sender,
+    synthetic IQ generator and relay were temporary helpers, not committed.
+  - Both loopback checks used the standalone subscriber and dashboard receiver loop. The harness supplied
+    the dashboard global header; its `main() -w` header creation was only unit tested. These synthetic
+    checks qualify application/transport paths and leave the general VITA 49 UDP-input check above open.
+- [x] Capture inspection with tshark 4.6.9 on macOS, using copies of the Linux captures.
+  - Nine files: sensor and both collectors for each of the default, subscriber `--gps` and synthetic-IQ
+    cases. Field assertions checked BLE/Classic inner DLT 256/255, protocol names, RF channels and literal
+    GPS coordinates. Default subscriber output omitted GPS; `--gps` preserved it.
+- [ ] Real-radio sensor capture and cross-host ZMQ; loss-free operation under load.
+  - GPSD acquisition and disk-full handling remain separate checks above.
 
 ### Wireshark Extcap
 - [ ] `blue-dragon --extcap-interfaces` lists available SDRs

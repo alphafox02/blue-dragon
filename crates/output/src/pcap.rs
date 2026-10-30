@@ -194,7 +194,7 @@ impl<W: Write> PcapWriter<W> {
         writer.write_u16::<LittleEndian>(4)?; // version_minor
         writer.write_i32::<LittleEndian>(0)?; // thiszone
         writer.write_u32::<LittleEndian>(0)?; // sigfigs
-        let snaplen = PPI_GPS_SIZE as u32 + 4 + 2 + 255 + 3;
+        let snaplen = 65_535;
         writer.write_u32::<LittleEndian>(snaplen)?; // snaplen
         writer.write_u32::<LittleEndian>(DLT_PPI)?; // network
         writer.flush()?;
@@ -478,6 +478,7 @@ mod tests {
         // Version 2.4
         assert_eq!(buf[4..6], [2, 0]);
         assert_eq!(buf[6..8], [4, 0]);
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 65_535);
         // DLT_PPI = 192
         assert_eq!(buf[20..24], [192, 0, 0, 0]);
     }
