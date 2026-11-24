@@ -3524,39 +3524,43 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
         )
     });
 
-    // GPU path
+    // GPU path; drop to CPU if the GPU can't be opened (e.g. no render node access)
     #[cfg(feature = "gpu")]
     if use_gpu {
-        return run_live_gpu_loop(
-            sdr,
-            &running,
-            num_channels,
-            semi_len,
-            &prototype,
-            fft_scale,
-            channel_gain_max,
-            channel_gain_enabled,
-            burst_catchers,
-            fsk,
-            aa_correlator,
-            aa_correlator_2m,
-            syndrome_map,
-            conn_table,
-            classic_uaps.to_vec(),
-            classic_alias_channels,
-            pcap_writer,
-            burst_writer,
-            check_crc,
-            print_stats,
-            gain_pending.clone(),
-            squelch_pending.clone(),
-            #[cfg(feature = "zmq")]
-            zmq_config,
-            #[cfg(feature = "zmq")]
-            hb_state_for_decode,
-            #[cfg(feature = "gps")]
-            gps_client,
-        );
+        match bd_gpu::GpuChannelizer::new(num_channels, semi_len, &prototype, GPU_BATCH_SIZE) {
+            Ok(gpu) => {
+                return run_live_gpu_loop(
+                    gpu,
+                    sdr,
+                    &running,
+                    num_channels,
+                    fft_scale,
+                    channel_gain_max,
+                    channel_gain_enabled,
+                    burst_catchers,
+                    fsk,
+                    aa_correlator,
+                    aa_correlator_2m,
+                    syndrome_map,
+                    conn_table,
+                    classic_uaps.to_vec(),
+                    classic_alias_channels,
+                    pcap_writer,
+                    burst_writer,
+                    check_crc,
+                    print_stats,
+                    gain_pending.clone(),
+                    squelch_pending.clone(),
+                    #[cfg(feature = "zmq")]
+                    zmq_config,
+                    #[cfg(feature = "zmq")]
+                    hb_state_for_decode,
+                    #[cfg(feature = "gps")]
+                    gps_client,
+                );
+            }
+            Err(e) => eprintln!("{}; falling back to CPU", e),
+        }
     }
 
     #[cfg(not(feature = "gpu"))]
@@ -3785,15 +3789,17 @@ pub fn run_live(cfg: LiveConfig<'_>) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "gpu")]
+const GPU_BATCH_SIZE: usize = 4096;
+
 /// GPU-accelerated live capture processing loop with recv threading.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn run_live_gpu_loop(
+    mut gpu: bd_gpu::GpuChannelizer,
     sdr: SdrHandle,
     running: &Arc<AtomicBool>,
     num_channels: usize,
-    semi_len: usize,
-    prototype: &[f32],
     fft_scale: f32,
     channel_gain_max: f32,
     channel_gain_enabled: bool,
@@ -3819,12 +3825,8 @@ fn run_live_gpu_loop(
 ) -> Result<(), String> {
     use std::sync::atomic::AtomicU64;
 
-    const GPU_BATCH_SIZE: usize = 4096;
-
     let sdr = sdr;
     let max_samps = sdr.max_samps();
-
-    let mut gpu = bd_gpu::GpuChannelizer::new(num_channels, semi_len, prototype, GPU_BATCH_SIZE)?;
 
     let buffer_len = gpu.buffer_len();
     eprintln!(
